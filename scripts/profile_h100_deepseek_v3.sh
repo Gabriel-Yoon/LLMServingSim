@@ -13,8 +13,8 @@ export HF_HUB_CACHE=$HF_HOME/hub
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-python3 -m profiler profile "Qwen/Qwen3-235B-A22B" \
-  --hardware "H200" \
+python3 -m profiler profile "deepseek-ai/DeepSeek-V3" \
+  --hardware "H100" \
   --tp "1,2" \
   --max-num-batched-tokens 2048 \
   --max-num-seqs 256 \
