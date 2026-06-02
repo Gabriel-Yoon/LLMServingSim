@@ -19,3 +19,12 @@ bench/results/
 .copilot/
 .aider*
 .continue/
+
+# Simulation outputs
+outputs/
+
+# Profiler performance data (large binary/csv files)
+profiler/perf/
+
+# Backup files
+profiler/profile.sh.orig

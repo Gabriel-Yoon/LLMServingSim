@@ -24,11 +24,11 @@ set -euo pipefail
 # The profiler reads model_type from that config to pick an
 # architecture yaml under profiler/models/.
 # MODEL="meta-llama/Llama-3.1-8B"
-MODEL="Qwen/Qwen3-32B"
+MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 # GPU identifier used as an output folder name under ``perf/``.
 # Free-form — pick something meaningful for your hardware.
-HARDWARE="RTXPRO6000"
+HARDWARE="H100"
 
 # =============================================================================
 # EDIT THESE (OPTIONAL — uncomment and adjust as needed)
@@ -36,7 +36,7 @@ HARDWARE="RTXPRO6000"
 
 # --- TP sweep ---------------------------------------------------------------
 # Comma-separated list; must include 1.
-TP_DEGREES="1,2"
+TP_DEGREES="1,2,4"
 
 # --- Engine kwargs ----------------------------------------------------------
 # DTYPE is normally inferred from the model config's ``torch_dtype``
