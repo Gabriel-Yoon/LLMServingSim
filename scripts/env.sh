@@ -1,0 +1,12 @@
+export LLMSIM_REPO="/storage/scratch1/8/syoon351/repos/LLMServingSim"
+export REPOS_ROOT="/storage/scratch1/8/syoon351/repos"
+export SCRATCH="/storage/home/hcoda1/8/syoon351/scratch"
+export IMAGE="/storage/project/r-syu334-0/shared/images/astra-sim_latest.sif"
+export VENV="$SCRATCH/deps/llmservingsim_astra_venv"
+
+export APPTAINER_CACHEDIR="$SCRATCH/apptainer_cache"
+export APPTAINER_TMPDIR="$SCRATCH/apptainer_tmp"
+export PIP_CACHE_DIR="$SCRATCH/deps/pip_cache"
+export HF_HOME="$SCRATCH/hf_cache"
+export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
