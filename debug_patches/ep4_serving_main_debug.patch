@@ -1,0 +1,24 @@
+diff --git a/serving/__main__.py b/serving/__main__.py
+index 40d8176..d4ce151 100755
+--- a/serving/__main__.py
++++ b/serving/__main__.py
+@@ -399,7 +399,10 @@ def main():
+         args.append("--end-npu-ids="+end_npu_ids)
+     if network_backend == 'ns3':
+         args.append("--logical-topology-configuration="+astra_sim+"/inputs/logical_topology/logical_8nodes_1D.json")
+-    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
++    os.makedirs("/tmp/astra_logs", exist_ok=True)
++    astra_stderr_log = open("/tmp/astra_logs/astra_stderr.log", "a")
++    print("[DEBUG] ASTRA args:", " ".join(args), flush=True)
++    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=astra_stderr_log, universal_newlines=True)
+ 
+     # DP group synchronization: defer trace generation until all members have scheduled
+     # dp_groups maps dp_group_name -> list of instance_ids
+@@ -590,6 +593,7 @@ def main():
+                         workload = get_workload(new_req, instance["hardware"], instance_id,
+                                                 workload_name=dp_workload_name)
+                         controller.write_flush(p, workload)
++                        responded = True
+                     else:
+                         # Waiting for other DP members — send pass
+                         controller.write_flush(p, "pass")

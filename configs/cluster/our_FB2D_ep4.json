@@ -69,5 +69,9 @@
         }
       ]
     }
+  ],
+  "network_topology": [
+    "FullyConnected",
+    "FlattenedButterfly"
   ]
 }

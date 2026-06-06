@@ -12,19 +12,12 @@ class Controller():
 
     def read_wait(self, p):
         out = [""]
-        print("[DEBUG_READ_WAIT] enter", flush=True)
         while "Waiting" not in out[-1] and out[-1] != "Checking Non-Exited Systems ...\n":
             line = p.stdout.readline()
-            if line == "":
-                print(f"[DEBUG_READ_WAIT] EOF returncode={p.poll()}", flush=True)
-                break
-            print(f"[ASTRA_STDOUT] {line.rstrip()}", flush=True)
-            with open("/tmp/astra_logs/astra_stdout.log", "a") as f:
-                f.write(line)
-                f.flush()
+            # For debugging
+            # print(line, end='')
             out.append(line)
             p.stdout.flush()
-        print(f"[DEBUG_READ_WAIT] exit last={out[-1].rstrip()}", flush=True)
         return out
 
     def check_end(self, p):

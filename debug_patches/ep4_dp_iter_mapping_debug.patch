@@ -1,0 +1,178 @@
+diff --git a/serving/__main__.py b/serving/__main__.py
+index 40d8176..c853962 100755
+--- a/serving/__main__.py
++++ b/serving/__main__.py
+@@ -399,7 +399,10 @@ def main():
+         args.append("--end-npu-ids="+end_npu_ids)
+     if network_backend == 'ns3':
+         args.append("--logical-topology-configuration="+astra_sim+"/inputs/logical_topology/logical_8nodes_1D.json")
+-    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
++    os.makedirs("/tmp/astra_logs", exist_ok=True)
++    astra_stderr_log = open("/tmp/astra_logs/astra_stderr.log", "a")
++    print("[DEBUG] ASTRA args:", " ".join(args), flush=True)
++    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=astra_stderr_log, universal_newlines=True)
+ 
+     # DP group synchronization: defer trace generation until all members have scheduled
+     # dp_groups maps dp_group_name -> list of instance_ids
+@@ -417,6 +420,10 @@ def main():
+     dp_pending = {dg: {} for dg in dp_groups}  # dp_group -> {instance_id: (new_req, sys)}
+     # Pre-generated workloads ready to submit on next "Waiting"
+     dp_ready_workloads = {}  # instance_id -> workload_path
++    # EP=4+ fix: monotonic shared iteration ID per DP group (never mutate batch.batch_id)
++    dp_shared_iter_counter = {dg: 0 for dg in dp_groups}
++    # (dg, shared_iter_id, inst_id) -> local_batch_id
++    dp_shared_to_local = {}
+ 
+     # ----------------------------------- Start simulation loop ------------------------------------
+     # Starting simulation, one while loop processes one iteration
+@@ -451,7 +458,16 @@ def main():
+             waiting_request[instance_id] = True
+ 
+         # check request is done
+-        prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(id, sys, current)
++        # EP=4+ fix: DP group instances use shared ASTRA iter id; translate to local batch id
++        _dg_for_done = inst_dp_group.get(instance_id)
++        if _dg_for_done is not None:
++            _local_id = dp_shared_to_local.get((_dg_for_done, id, instance_id), id)
++            logger.debug("[DP_ID_MAP] dg=%s astra_id=%d inst=%d -> local_id=%d inflight=%s",
++                         _dg_for_done, id, instance_id, _local_id,
++                         [b.batch_id for b in schedulers[instance_id].inflight])
++        else:
++            _local_id = id
++        prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(_local_id, sys, current)
+         # add tokens in throughput
+         prompt_th += prompt_t
+         total_prompt += prompt_t
+@@ -508,10 +524,19 @@ def main():
+                     # "× group_size" we used previously stacked the two errors.
+                     sum_total_len = max_total_len
+ 
+-                    # Shared workload folder for all DP members
++                    # EP=4+ fix: issue shared_iter_id WITHOUT mutating batch.batch_id.
++                    # batch.batch_id stays unchanged in scheduler.inflight.
++                    # dp_shared_to_local maps (dg, shared_iter_id, inst_id) -> local_batch_id.
+                     first_inst_id = dp_groups[dg][0]
+-                    first_batch = dp_pending[dg][first_inst_id][0]
+-                    dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
++                    shared_iter_id = dp_shared_iter_counter[dg]
++                    dp_shared_iter_counter[dg] += 1
++                    for _iid in dp_groups[dg]:
++                        _local_bid = dp_pending[dg][_iid][0].batch_id
++                        dp_shared_to_local[(dg, shared_iter_id, _iid)] = _local_bid
++                        logger.debug("[DP_SHARED] dg=%s shared_iter=%d inst=%d local_batch=%d",
++                                     dg, shared_iter_id, _iid, _local_bid)
++
++                    dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_iter{shared_iter_id}'
+ 
+                     for inst_id in dp_groups[dg]:
+                         batch, nid = dp_pending[dg][inst_id]
+@@ -563,10 +588,19 @@ def main():
+                         # (no group-size multiplier).
+                         sum_total_len = max_total_len
+ 
+-                        # Shared workload folder for all DP members
++                        # EP=4+ fix: issue shared_iter_id WITHOUT mutating batch.batch_id.
++                        # batch.batch_id stays unchanged in scheduler.inflight.
++                        # dp_shared_to_local maps (dg, shared_iter_id, inst_id) -> local_batch_id.
+                         first_inst_id = dp_groups[dg][0]
+-                        first_batch = dp_pending[dg][first_inst_id][0]
+-                        dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
++                        shared_iter_id = dp_shared_iter_counter[dg]
++                        dp_shared_iter_counter[dg] += 1
++                        for _iid in dp_groups[dg]:
++                            _local_bid = dp_pending[dg][_iid][0].batch_id
++                            dp_shared_to_local[(dg, shared_iter_id, _iid)] = _local_bid
++                            logger.debug("[DP_SHARED] dg=%s shared_iter=%d inst=%d local_batch=%d",
++                                         dg, shared_iter_id, _iid, _local_bid)
++
++                        dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_iter{shared_iter_id}'
+ 
+                         for inst_id in dp_groups[dg]:
+                             batch, nid = dp_pending[dg][inst_id]
+@@ -590,6 +624,7 @@ def main():
+                         workload = get_workload(new_req, instance["hardware"], instance_id,
+                                                 workload_name=dp_workload_name)
+                         controller.write_flush(p, workload)
++                        responded = True
+                     else:
+                         # Waiting for other DP members — send pass
+                         controller.write_flush(p, "pass")
+diff --git a/serving/core/controller.py b/serving/core/controller.py
+index 199594e..4f0605d 100644
+--- a/serving/core/controller.py
++++ b/serving/core/controller.py
+@@ -12,12 +12,19 @@ class Controller():
+ 
+     def read_wait(self, p):
+         out = [""]
++        print("[DEBUG_READ_WAIT] enter", flush=True)
+         while "Waiting" not in out[-1] and out[-1] != "Checking Non-Exited Systems ...\n":
+             line = p.stdout.readline()
+-            # For debugging
+-            # print(line, end='')
++            if line == "":
++                print(f"[DEBUG_READ_WAIT] EOF returncode={p.poll()}", flush=True)
++                break
++            print(f"[ASTRA_STDOUT] {line.rstrip()}", flush=True)
++            with open("/tmp/astra_logs/astra_stdout.log", "a") as f:
++                f.write(line)
++                f.flush()
+             out.append(line)
+             p.stdout.flush()
++        print(f"[DEBUG_READ_WAIT] exit last={out[-1].rstrip()}", flush=True)
+         return out
+ 
+     def check_end(self, p):
+diff --git a/serving/core/scheduler.py b/serving/core/scheduler.py
+index a26531c..58ed292 100755
+--- a/serving/core/scheduler.py
++++ b/serving/core/scheduler.py
+@@ -651,21 +651,27 @@ class Scheduler:
+         prompt_t = 0
+         gen_t = 0
+         end_reqs = []
++        raw_id = id
+         if len(self.inflight) == 0:
++            print(f"[DEBUG_ADD_DONE] sys={sys} raw_id={raw_id} finish={finish} inflight_empty", flush=True)
+             return prompt_t, gen_t, end_reqs
+         batch = None
+         # find batch
+-        id -= 1
++        # DEBUG EP4: do not subtract 1; ASTRA raw iteration appears to match scheduler batch_id
++        # id -= 1
+         idx = 0
++        inflight_ids = [b.batch_id for b in self.inflight]
+         for i, b in enumerate(self.inflight):
+             if b.batch_id == id:
+                 batch = b
+                 idx = i
+         # no batch return
+         if batch == None:
++            print(f"[DEBUG_ADD_DONE] sys={sys} raw_id={raw_id} mapped_id={id} finish={finish} batch_not_found inflight={inflight_ids}", flush=True)
+             return prompt_t, gen_t, end_reqs
+         # already done
+         if sys in batch.end:
++            print(f"[DEBUG_ADD_DONE] sys={sys} raw_id={raw_id} mapped_id={id} finish={finish} already_done batch_end={batch.end} inflight={inflight_ids}", flush=True)
+             return prompt_t, gen_t, end_reqs
+         else:
+             # add to done system
+@@ -795,7 +801,19 @@ class Scheduler:
+             self.request = self._merge_by_arrival_id(pool, self.request)
+         else:
+             self.request = pool + self.request
++        print(
++            f"[DEBUG_ADD_DONE_SUCCESS] sys={sys} raw_id={raw_id} mapped_id={id} "
++            f"finish={finish} deleting_batch={batch.batch_id} "
++            f"batch_end={batch.end} pool_reqs={len(pool)} finished_reqs={len(end_reqs)} "
++            f"inflight_before={[b.batch_id for b in self.inflight]}",
++            flush=True
++        )
+         del self.inflight[idx]
++        print(
++            f"[DEBUG_ADD_DONE_SUCCESS] sys={sys} raw_id={raw_id} "
++            f"inflight_after={[b.batch_id for b in self.inflight]}",
++            flush=True
++        )
+         del batch
+ 
+         return prompt_t, gen_t, end_reqs

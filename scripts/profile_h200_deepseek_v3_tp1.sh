@@ -15,6 +15,7 @@ cd "$REPO_ROOT"
 
 python3 -m profiler profile "deepseek-ai/DeepSeek-V3" \
   --hardware "H200" --tp "1" \
+  --hf-overrides '{"first_k_dense_replace": 0}' \
   --max-num-batched-tokens 8192 --max-num-seqs 256 \
   --attention-max-kv 16384 --attention-chunk-factor 2.0 \
   --attention-kv-factor 2.0 --measurement-iterations 3 \

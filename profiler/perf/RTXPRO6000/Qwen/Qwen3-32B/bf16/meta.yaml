@@ -1,9 +1,9 @@
 profiler_version: 1.0.0
 vllm_version: 0.19.0
-cuda_version: '13.0'
-gpu: NVIDIA RTX PRO 6000 Blackwell Server Edition
+cuda_version: '12.8'
+gpu: NVIDIA H100 80GB HBM3
 hardware: RTXPRO6000
-profiled_at: '2026-04-24T12:35:08+00:00'
+profiled_at: '2026-06-02T04:25:15+00:00'
 architecture: qwen3
 architecture_sha256: c0557f326f38c70b46b5841c90d3447863d653dc9a228019db74eec591c2bf78
 model: Qwen/Qwen3-32B
@@ -26,8 +26,8 @@ engine_effective:
     num_attention_heads: 32
     num_key_value_heads: 4
     vocab_size: 75968
-  worker_extension_cls: profiler.hooks.extension.Extension
-  model: /tmp/profiler_model_dnlix5xf
+  worker_extension_cls: profiler.core.hooks.extension.Extension
+  model: /tmp/profiler_model_bqpo9tl2
 attention_grid:
   max_kv: 16384
   chunk_factor: 2.0

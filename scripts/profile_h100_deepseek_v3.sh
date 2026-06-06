@@ -15,6 +15,7 @@ cd "$REPO_ROOT"
 
 python3 -m profiler profile "deepseek-ai/DeepSeek-V3" \
   --hardware "H100" \
+  --hf-overrides '{"first_k_dense_replace": 0}' \
   --tp "1,2" \
   --max-num-batched-tokens 2048 \
   --max-num-seqs 256 \

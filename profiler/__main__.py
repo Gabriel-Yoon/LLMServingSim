@@ -158,6 +158,14 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
                         "the uniform sweep is already done and you want "
                         "to add (or refresh) skew.csv without redoing "
                         "the rest.")
+    p.add_argument(
+        "--hf-overrides",
+        type=__import__("json").loads,
+        default=None,
+        dest="hf_overrides",
+        metavar="JSON",
+        help="Extra HF config overrides as JSON (e.g. '{\"first_k_dense_replace\": 0}').",
+    )
     p.add_argument("--force", action="store_true", default=False,
                    dest="force",
                    help="Wipe existing CSVs and re-profile from scratch. "
@@ -332,7 +340,7 @@ def _build_profile_args(
         skew_kvs_factor=getattr(ns, "skew_kvs_factor", 2.0),
         only_skew=getattr(ns, "only_skew", False),
         force=getattr(ns, "force", False),
-        hf_overrides=None,
+        hf_overrides=getattr(ns, "hf_overrides", None),
         model_config=model_config,
     )
 

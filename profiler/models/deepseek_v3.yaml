@@ -1,13 +1,8 @@
 # DeepSeek-V3 family — class catalog (mixture-of-experts decoder-only LLMs).
 #
-# Covers DeepSeek-V3 (256 routed experts, top-8, first_k_dense_replace=3).
 # Uses Multi-head Latent Attention (MLA) instead of standard MHA.
 # The first 3 layers are dense MLP; remaining layers use MoE.
-#
-# Canonical layer names mirror vLLM's deepseek_v2.py attribute names.
-#
-# TP ALLREDUCE (after o_proj / down_proj) and EP ALLTOALL (around moe)
-# are attached by the simulator from cluster config — not listed here.
+# MoE block uses SharedFusedMoE (vLLM's fused implementation).
 
 sequence:
   prologue:  [embedding]
@@ -49,4 +44,4 @@ catalog:
       vllm: Attention
   moe:
     moe:
-      vllm: DeepseekV2MoE
+      vllm: SharedFusedMoE

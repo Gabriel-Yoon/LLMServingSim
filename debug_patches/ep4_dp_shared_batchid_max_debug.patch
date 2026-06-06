@@ -1,0 +1,141 @@
+diff --git a/serving/__main__.py b/serving/__main__.py
+index 40d8176..2e275a0 100755
+--- a/serving/__main__.py
++++ b/serving/__main__.py
+@@ -399,7 +399,10 @@ def main():
+         args.append("--end-npu-ids="+end_npu_ids)
+     if network_backend == 'ns3':
+         args.append("--logical-topology-configuration="+astra_sim+"/inputs/logical_topology/logical_8nodes_1D.json")
+-    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
++    os.makedirs("/tmp/astra_logs", exist_ok=True)
++    astra_stderr_log = open("/tmp/astra_logs/astra_stderr.log", "a")
++    print("[DEBUG] ASTRA args:", " ".join(args), flush=True)
++    p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=astra_stderr_log, universal_newlines=True)
+ 
+     # DP group synchronization: defer trace generation until all members have scheduled
+     # dp_groups maps dp_group_name -> list of instance_ids
+@@ -511,7 +514,17 @@ def main():
+                     # Shared workload folder for all DP members
+                     first_inst_id = dp_groups[dg][0]
+                     first_batch = dp_pending[dg][first_inst_id][0]
+-                    dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
++                    # Use the latest scheduler id as the shared ASTRA id.
++                    # first_inst_id may hold a dummy/older batch, so using first_batch.batch_id
++                    # can rewrite a real batch id backwards.
++                    shared_batch_id = max(b.batch_id for b, _ in dp_pending[dg].values())
++
++                    # DP members share one ASTRA workload/iteration id.
++                    # Force scheduler-side batch ids to match the shared ASTRA id.
++                    for b, _ in dp_pending[dg].values():
++                        b.batch_id = shared_batch_id
++
++                    dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{shared_batch_id}'
+ 
+                     for inst_id in dp_groups[dg]:
+                         batch, nid = dp_pending[dg][inst_id]
+@@ -566,7 +579,17 @@ def main():
+                         # Shared workload folder for all DP members
+                         first_inst_id = dp_groups[dg][0]
+                         first_batch = dp_pending[dg][first_inst_id][0]
+-                        dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
++                        # Use the latest scheduler id as the shared ASTRA id.
++                        # first_inst_id may hold a dummy/older batch, so using first_batch.batch_id
++                        # can rewrite a real batch id backwards.
++                        shared_batch_id = max(b.batch_id for b, _ in dp_pending[dg].values())
++
++                        # DP members share one ASTRA workload/iteration id.
++                        # Force scheduler-side batch ids to match the shared ASTRA id.
++                        for b, _ in dp_pending[dg].values():
++                            b.batch_id = shared_batch_id
++
++                        dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{shared_batch_id}'
+ 
+                         for inst_id in dp_groups[dg]:
+                             batch, nid = dp_pending[dg][inst_id]
+@@ -590,6 +613,7 @@ def main():
+                         workload = get_workload(new_req, instance["hardware"], instance_id,
+                                                 workload_name=dp_workload_name)
+                         controller.write_flush(p, workload)
++                        responded = True
+                     else:
+                         # Waiting for other DP members — send pass
+                         controller.write_flush(p, "pass")
+diff --git a/serving/core/controller.py b/serving/core/controller.py
+index 199594e..4f0605d 100644
+--- a/serving/core/controller.py
++++ b/serving/core/controller.py
+@@ -12,12 +12,19 @@ class Controller():
+ 
+     def read_wait(self, p):
+         out = [""]
++        print("[DEBUG_READ_WAIT] enter", flush=True)
+         while "Waiting" not in out[-1] and out[-1] != "Checking Non-Exited Systems ...\n":
+             line = p.stdout.readline()
+-            # For debugging
+-            # print(line, end='')
++            if line == "":
++                print(f"[DEBUG_READ_WAIT] EOF returncode={p.poll()}", flush=True)
++                break
++            print(f"[ASTRA_STDOUT] {line.rstrip()}", flush=True)
++            with open("/tmp/astra_logs/astra_stdout.log", "a") as f:
++                f.write(line)
++                f.flush()
+             out.append(line)
+             p.stdout.flush()
++        print(f"[DEBUG_READ_WAIT] exit last={out[-1].rstrip()}", flush=True)
+         return out
+ 
+     def check_end(self, p):
+diff --git a/serving/core/scheduler.py b/serving/core/scheduler.py
+index a26531c..58ed292 100755
+--- a/serving/core/scheduler.py
++++ b/serving/core/scheduler.py
+@@ -651,21 +651,27 @@ class Scheduler:
+         prompt_t = 0
+         gen_t = 0
+         end_reqs = []
++        raw_id = id
+         if len(self.inflight) == 0:
++            print(f"[DEBUG_ADD_DONE] sys={sys} raw_id={raw_id} finish={finish} inflight_empty", flush=True)
+             return prompt_t, gen_t, end_reqs
+         batch = None
+         # find batch
+-        id -= 1
++        # DEBUG EP4: do not subtract 1; ASTRA raw iteration appears to match scheduler batch_id
++        # id -= 1
+         idx = 0
++        inflight_ids = [b.batch_id for b in self.inflight]
+         for i, b in enumerate(self.inflight):
+             if b.batch_id == id:
+                 batch = b
+                 idx = i
+         # no batch return
+         if batch == None:
++            print(f"[DEBUG_ADD_DONE] sys={sys} raw_id={raw_id} mapped_id={id} finish={finish} batch_not_found inflight={inflight_ids}", flush=True)
+             return prompt_t, gen_t, end_reqs
+         # already done
+         if sys in batch.end:
++            print(f"[DEBUG_ADD_DONE] sys={sys} raw_id={raw_id} mapped_id={id} finish={finish} already_done batch_end={batch.end} inflight={inflight_ids}", flush=True)
+             return prompt_t, gen_t, end_reqs
+         else:
+             # add to done system
+@@ -795,7 +801,19 @@ class Scheduler:
+             self.request = self._merge_by_arrival_id(pool, self.request)
+         else:
+             self.request = pool + self.request
++        print(
++            f"[DEBUG_ADD_DONE_SUCCESS] sys={sys} raw_id={raw_id} mapped_id={id} "
++            f"finish={finish} deleting_batch={batch.batch_id} "
++            f"batch_end={batch.end} pool_reqs={len(pool)} finished_reqs={len(end_reqs)} "
++            f"inflight_before={[b.batch_id for b in self.inflight]}",
++            flush=True
++        )
+         del self.inflight[idx]
++        print(
++            f"[DEBUG_ADD_DONE_SUCCESS] sys={sys} raw_id={raw_id} "
++            f"inflight_after={[b.batch_id for b in self.inflight]}",
++            flush=True
++        )
+         del batch
+ 
+         return prompt_t, gen_t, end_reqs
