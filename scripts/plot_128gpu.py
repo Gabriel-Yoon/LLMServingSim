@@ -128,9 +128,6 @@ def plot_graph_A(df, wg_ref, outdir):
             "  EP=32\n  6×6-4c panel\n  boundary", color="tab:blue",
             fontsize=8.5, va="top", ha="left")
 
-    # 6x6 panel only supports EP≤16 for single-panel
-    ax.axvline(16, color="tab:purple", ls=":", lw=1.5, alpha=0.5)
-
     # NVL72 cliff: between EP=64 and EP=128
     ax.axvline(NVL72_CLIFF_EP, color="tab:red", ls=":", lw=2, alpha=0.5)
     ax.text(NVL72_CLIFF_EP, ax.get_ylim()[0] if ax.get_ylim()[0] > 0 else 0,
