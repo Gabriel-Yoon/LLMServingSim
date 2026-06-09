@@ -420,10 +420,6 @@ def main():
     dp_pending = {dg: {} for dg in dp_groups}  # dp_group -> {instance_id: (new_req, sys)}
     # Pre-generated workloads ready to submit on next "Waiting"
     dp_ready_workloads = {}  # instance_id -> workload_path
-    # EP=4+ fix: monotonic shared iteration ID per DP group (never mutate batch.batch_id)
-    dp_shared_iter_counter = {dg: 0 for dg in dp_groups}
-    # (dg, shared_iter_id, inst_id) -> local_batch_id
-    dp_shared_to_local = {}
 
     # ----------------------------------- Start simulation loop ------------------------------------
     # Starting simulation, one while loop processes one iteration
@@ -458,16 +454,7 @@ def main():
             waiting_request[instance_id] = True
 
         # check request is done
-        # EP=4+ fix: DP group instances use shared ASTRA iter id; translate to local batch id
-        _dg_for_done = inst_dp_group.get(instance_id)
-        if _dg_for_done is not None:
-            _local_id = dp_shared_to_local.get((_dg_for_done, id, instance_id), id)
-            logger.debug("[DP_ID_MAP] dg=%s astra_id=%d inst=%d -> local_id=%d inflight=%s",
-                         _dg_for_done, id, instance_id, _local_id,
-                         [b.batch_id for b in schedulers[instance_id].inflight])
-        else:
-            _local_id = id
-        prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(_local_id, sys, current)
+        prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(id, sys, current)
         # add tokens in throughput
         prompt_th += prompt_t
         total_prompt += prompt_t
@@ -496,7 +483,7 @@ def main():
         # DP group: truly idle instance (no inflight batch) — create dummy batch so ALLTOALL syncs
         elif new_req is None and instance_id in inst_dp_group and sys == inst2npu_mapping[instance_id] and len(schedulers[instance_id].inflight) == 0:
             dg = inst_dp_group[instance_id]
-            if dp_pending[dg]:
+            if dp_pending[dg] and instance_id not in dp_pending[dg]:
                 # Emit a 1-token dummy; the uniform pad-to-max pass below
                 # brings it (and any undersized real peers) up to the
                 # group's max_total_len, matching vLLM's CUDA-graph DP padding.
@@ -524,19 +511,9 @@ def main():
                     # "× group_size" we used previously stacked the two errors.
                     sum_total_len = max_total_len
 
-                    # EP=4+ fix: issue shared_iter_id WITHOUT mutating batch.batch_id.
-                    # batch.batch_id stays unchanged in scheduler.inflight.
-                    # dp_shared_to_local maps (dg, shared_iter_id, inst_id) -> local_batch_id.
                     first_inst_id = dp_groups[dg][0]
-                    shared_iter_id = dp_shared_iter_counter[dg]
-                    dp_shared_iter_counter[dg] += 1
-                    for _iid in dp_groups[dg]:
-                        _local_bid = dp_pending[dg][_iid][0].batch_id
-                        dp_shared_to_local[(dg, shared_iter_id, _iid)] = _local_bid
-                        logger.debug("[DP_SHARED] dg=%s shared_iter=%d inst=%d local_batch=%d",
-                                     dg, shared_iter_id, _iid, _local_bid)
-
-                    dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_iter{shared_iter_id}'
+                    first_batch = dp_pending[dg][first_inst_id][0]
+                    dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
 
                     for inst_id in dp_groups[dg]:
                         batch, nid = dp_pending[dg][inst_id]
@@ -588,19 +565,9 @@ def main():
                         # (no group-size multiplier).
                         sum_total_len = max_total_len
 
-                        # EP=4+ fix: issue shared_iter_id WITHOUT mutating batch.batch_id.
-                        # batch.batch_id stays unchanged in scheduler.inflight.
-                        # dp_shared_to_local maps (dg, shared_iter_id, inst_id) -> local_batch_id.
                         first_inst_id = dp_groups[dg][0]
-                        shared_iter_id = dp_shared_iter_counter[dg]
-                        dp_shared_iter_counter[dg] += 1
-                        for _iid in dp_groups[dg]:
-                            _local_bid = dp_pending[dg][_iid][0].batch_id
-                            dp_shared_to_local[(dg, shared_iter_id, _iid)] = _local_bid
-                            logger.debug("[DP_SHARED] dg=%s shared_iter=%d inst=%d local_batch=%d",
-                                         dg, shared_iter_id, _iid, _local_bid)
-
-                        dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_iter{shared_iter_id}'
+                        first_batch = dp_pending[dg][first_inst_id][0]
+                        dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
 
                         for inst_id in dp_groups[dg]:
                             batch, nid = dp_pending[dg][inst_id]
@@ -772,7 +739,6 @@ def main():
                     # Other DP members still have work — keep this instance alive for dummy waves
                     if not responded:
                         controller.write_flush(p, "pass")
-                    flush.stdout.flush()
                     continue
 
             if sys not in done_inst_npus[instance_id]:

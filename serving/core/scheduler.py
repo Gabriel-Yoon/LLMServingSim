@@ -651,27 +651,19 @@ class Scheduler:
         prompt_t = 0
         gen_t = 0
         end_reqs = []
-        raw_id = id
         if len(self.inflight) == 0:
-            print(f"[DEBUG_ADD_DONE] sys={sys} raw_id={raw_id} finish={finish} inflight_empty", flush=True)
             return prompt_t, gen_t, end_reqs
         batch = None
         # find batch
-        # DEBUG EP4: do not subtract 1; ASTRA raw iteration appears to match scheduler batch_id
-        # id -= 1
+        id -= 1
         idx = 0
-        inflight_ids = [b.batch_id for b in self.inflight]
         for i, b in enumerate(self.inflight):
             if b.batch_id == id:
                 batch = b
                 idx = i
-        # no batch return
         if batch == None:
-            print(f"[DEBUG_ADD_DONE] sys={sys} raw_id={raw_id} mapped_id={id} finish={finish} batch_not_found inflight={inflight_ids}", flush=True)
             return prompt_t, gen_t, end_reqs
-        # already done
         if sys in batch.end:
-            print(f"[DEBUG_ADD_DONE] sys={sys} raw_id={raw_id} mapped_id={id} finish={finish} already_done batch_end={batch.end} inflight={inflight_ids}", flush=True)
             return prompt_t, gen_t, end_reqs
         else:
             # add to done system
@@ -801,19 +793,7 @@ class Scheduler:
             self.request = self._merge_by_arrival_id(pool, self.request)
         else:
             self.request = pool + self.request
-        print(
-            f"[DEBUG_ADD_DONE_SUCCESS] sys={sys} raw_id={raw_id} mapped_id={id} "
-            f"finish={finish} deleting_batch={batch.batch_id} "
-            f"batch_end={batch.end} pool_reqs={len(pool)} finished_reqs={len(end_reqs)} "
-            f"inflight_before={[b.batch_id for b in self.inflight]}",
-            flush=True
-        )
         del self.inflight[idx]
-        print(
-            f"[DEBUG_ADD_DONE_SUCCESS] sys={sys} raw_id={raw_id} "
-            f"inflight_after={[b.batch_id for b in self.inflight]}",
-            flush=True
-        )
         del batch
 
         return prompt_t, gen_t, end_reqs

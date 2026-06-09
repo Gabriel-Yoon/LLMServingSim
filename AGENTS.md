@@ -541,3 +541,45 @@ No dedicated unit-test suite. Validate by:
   `--enable-local-offloading` is used; weight loads from LOCAL go through compute time, not memory
 - **`config_builder.py` regenerates ASTRA-Sim inputs on every run** — don't manually edit
   `astra-sim/inputs/` files expecting them to persist
+
+## 실행 환경 (Local Mac + Docker)
+
+Claude Code는 Mac 파일시스템에서 파일을 직접 수정하고,
+명령어 실행은 아래 형식으로 Docker 컨테이너 안에서 수행한다.
+
+```bash
+docker exec servingsim_docker bash -c "cd /app/LLMServingSim && <명령어>"
+```
+
+### 테스트 커맨드
+
+EP=2 smoke test (항상 먼저 실행, 통과해야 함):
+```bash
+docker exec servingsim_docker bash -c "cd /app/LLMServingSim && python -m serving --cluster-config configs/cluster/single_node_moe_dp_ep_instance.json --dtype bfloat16 --block-size 16 --dataset workloads/example_trace.jsonl --output outputs/test_ep2.csv --num-req 10 --log-level INFO"
+```
+
+EP=4 FC test (수정 후 검증 목표):
+```bash
+docker exec servingsim_docker bash -c "cd /app/LLMServingSim && python -m serving --cluster-config configs/cluster/nvl72_ep4.json --dtype bfloat16 --block-size 16 --dataset workloads/example_trace.jsonl --output outputs/test_ep4.csv --num-req 10 --log-level INFO"
+```
+
+## 현재 진행 중인 작업: EP=4 Deadlock 수정
+
+### 문제
+EP=4에서 ASTRA-Sim이 "Waiting" 메시지를 반환하지 않아 hang 발생.
+
+### 원인
+serving/__main__.py의 dp_group 동기화 로직에서
+각 인스턴스가 chakra converter를 --num-npus 1 --npu-offset N 으로 따로 호출함.
+4개 et 파일이 따로 생성되고 ASTRA-Sim에 동시에 전달되는 구조가 불안정함.
+
+### 제안된 수정 방향
+serving/core/graph_generator.py 수정:
+- 현재: 인스턴스마다 chakra --num-npus 1 --npu-offset N 호출
+- 변경: EP 전체를 한 번에 chakra --num-npus EP --npu-offset 0 으로 호출
+- 효과: dp_group 동기화 로직 제거 가능, ASTRA-Sim 호출 단순화
+
+### 수정 파일 우선순위
+1. serving/core/graph_generator.py  ← 핵심
+2. serving/__main__.py              ← dp_group sync 단순화
+3. serving/core/trace_generator.py  ← 필요 시 AllToAll 크기 재계산
