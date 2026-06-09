@@ -94,8 +94,10 @@ def _resolve_parallelism(instance, model_config):
     return num_npus, tp_size, pp_size, ep_size, dp_group
 
 
-def _resolve_dp_groups(all_instances):
+def _resolve_dp_groups(all_instances, topology_config=None):
     """Validate DP groups and compute dp_group_size and ep_total for each instance."""
+    is_fb = topology_config is not None and topology_config.get("type") == "hierarchical_fb"
+
     dp_groups = {}
     for inst in all_instances:
         dg = inst.get("dp_group")
@@ -103,7 +105,6 @@ def _resolve_dp_groups(all_instances):
             dp_groups.setdefault(dg, []).append(inst)
 
     for group_name, members in dp_groups.items():
-        # All members must have same tp_size and ep_size
         tp0 = members[0]["tp_size"]
         ep0 = members[0]["ep_size"]
         for m in members[1:]:
@@ -113,22 +114,31 @@ def _resolve_dp_groups(all_instances):
                 raise ValueError(f"DP group '{group_name}': ep_size mismatch ({ep0} vs {m['ep_size']})")
 
         dp_size = len(members)
-        ep_total = ep0  # ep_size in config is the total EP degree across DP group
+        ep_total = ep0
         local_ep = ep_total // dp_size
         if ep_total % dp_size != 0:
             raise ValueError(f"DP group '{group_name}': ep_size ({ep_total}) not divisible by dp_group_size ({dp_size})")
         if local_ep > tp0:
             raise ValueError(f"DP group '{group_name}': local_ep ({local_ep}) > tp_size ({tp0})")
 
-        # Topology dimensions for DP group: dim 0 = TP (intra-instance), dim 1 = DP (cross-instance)
-        # ALLREDUCE (TP): dim 0 only. ALLTOALL (EP): dim 1 (or both if EP spans TP+DP).
-        tp_dim = [True, False]  # ALLREDUCE on dim 0 only
-        if ep_total <= tp0:
-            # EP fits within TP dimension (no cross-instance ALLTOALL)
-            ep_dim = [True, False]
+        if is_fb:
+            # Hierarchical FB: up to 3 topology dims (elec / intra-opt / inter-panel).
+            # ep_dim=[True,True,True] is set maximally here; _fixup_collective_dims trims
+            # it to match the actual number of dims after trailing-1 removal.
+            tile_size = topology_config.get("tile_size", topology_config["panel_size"])
+            if dp_size % tile_size != 0:
+                raise ValueError(
+                    f"DP group '{group_name}': dp_group_size ({dp_size}) not divisible by "
+                    f"topology_config.tile_size ({tile_size})"
+                )
+            tp_dim = [True, False, False]   # TP ALLREDUCE on dim 0 (electrical) only
+            ep_dim = [True, True, True]     # EP ALLTOALL across all levels; trimmed later
         else:
-            # EP spans both dimensions (cross-instance ALLTOALL)
-            ep_dim = [True, True] if tp0 > 1 else [False, True]
+            tp_dim = [True, False]
+            if ep_total <= tp0:
+                ep_dim = [True, False]
+            else:
+                ep_dim = [True, True] if tp0 > 1 else [False, True]
 
         for m in members:
             m["dp_group_size"] = dp_size
@@ -137,7 +147,6 @@ def _resolve_dp_groups(all_instances):
             m["tp_dim"] = tp_dim
             m["ep_dim"] = ep_dim
 
-    # Non-DP instances
     for inst in all_instances:
         if inst.get("dp_group") is None:
             inst["dp_group_size"] = 1
@@ -173,11 +182,19 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     if len(nodes) != num_nodes:
         raise ValueError(f"Number of nodes ({len(nodes)}) does not match 'num_nodes' ({num_nodes}).")
 
-    if cluster_config.get("link_bw") is None or cluster_config.get("link_latency") is None:
-        raise KeyError("Both 'link_bw' and 'link_latency' must be specified in the cluster configuration.")
-    
-    link_bw = cluster_config["link_bw"]
-    link_latency = cluster_config["link_latency"]
+    topology_config = cluster_config.get("topology_config")
+    is_fb = topology_config is not None and topology_config.get("type") == "hierarchical_fb"
+
+    if is_fb:
+        # For hierarchical FB topology, link_bw/link_latency default to intra-panel values
+        link_bw = cluster_config.get("link_bw", topology_config.get("intra_bw", 0))
+        link_latency = cluster_config.get("link_latency", topology_config.get("intra_latency", 0))
+        _validate_fb_topology_config(topology_config)
+    else:
+        if cluster_config.get("link_bw") is None or cluster_config.get("link_latency") is None:
+            raise KeyError("Both 'link_bw' and 'link_latency' must be specified in the cluster configuration.")
+        link_bw = cluster_config["link_bw"]
+        link_latency = cluster_config["link_latency"]
 
     # Memory required keys
     mem_required_keys = ["mem_size", "mem_bw", "mem_latency"]
@@ -395,10 +412,21 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                 # sync local-mem-bw in system config with npu_mem bw
                 system_config["local-mem-bw"] = int(npu_mem["mem_bw"])
 
-                # Match collective implementation entries to topology dimensions
-                # (ASTRA-Sim creates one topology per implementation entry)
+                # Match collective implementation entries to topology dimensions.
+                # Must equal len(dims) in the final network.yml (after trailing-1 trim).
                 has_dp = any(inst.get("dp_group") for inst in instances)
-                num_dims = 2 if has_dp else 1
+                if is_fb and has_dp:
+                    dp_groups_here = {}
+                    for inst_ in instances:
+                        dg = inst_.get("dp_group")
+                        if dg is not None:
+                            dp_groups_here.setdefault(dg, 0)
+                            dp_groups_here[dg] += 1
+                    max_dp = max(dp_groups_here.values()) if dp_groups_here else 1
+                    dims_here, _, _ = _compute_fb_dims(max_dp, topology_config)
+                    num_dims = len(dims_here)
+                else:
+                    num_dims = 2 if has_dp else 1
                 for key in ["all-reduce-implementation", "all-gather-implementation",
                             "reduce-scatter-implementation", "all-to-all-implementation"]:
                     system_config[key] = ["ring"] * num_dims
@@ -506,10 +534,13 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         total_npu = sum(inst["num_npus"] if inst["pd_type"] != "prefill" else inst["num_npus"] * 2 for inst in total_instances)
 
         # Resolve DP groups across all instances
-        _resolve_dp_groups(total_instances)
+        _resolve_dp_groups(total_instances, topology_config=topology_config)
 
-        # create network config file
-        _create_network_config(network_config_path, total_instances, link_bw, link_latency)
+        # create network config file; returns final topology dims after trailing-1 trimming
+        final_dims = _create_network_config(network_config_path, total_instances, link_bw, link_latency,
+                                            topology_config=topology_config)
+        # Trim ep_dim/tp_dim to match actual topology dimensionality
+        _fixup_collective_dims(total_instances, final_dims)
 
         # generate memory config file
         with open(memory_config_path, "w", encoding="utf-8") as f:
@@ -540,62 +571,163 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         "pim_models": pim_models,
         "link_bw": link_bw,
         "link_latency": link_latency,
+        "topology_config": topology_config,
     }
     # print("Current cluster : {}".format(cluster))
                 
     return cluster
 
+def _validate_fb_topology_config(tc):
+    if tc.get("panel_size", 0) < 2:
+        raise ValueError(f"topology_config.panel_size must be >= 2, got {tc.get('panel_size')}")
+    # Accept both old single-intra format and new 3-level format
+    has_old = "intra_bw" in tc and "inter_bw" in tc
+    has_new = "elec_bw" in tc
+    if not (has_old or has_new):
+        raise KeyError(
+            "topology_config for hierarchical_fb must have either "
+            "'intra_bw'+'inter_bw' (2-level) or 'elec_bw' (3-level)"
+        )
+
+
+def _compute_fb_dims(dp_size, topology_config):
+    """Compute ASTRA-Sim topology dims, bandwidths, and latencies for hierarchical FB.
+
+    Three-level model:
+      dim 0 — electrical  (intra-tile, neighboring GPUs)
+      dim 1 — optical     (intra-panel, non-neighboring within one glass panel)
+      dim 2 — inter-panel (optical I/O between panels)
+
+    If topology_config has only 'intra_bw' (legacy 2-level), electrical and
+    optical-intra are merged into a single 'intra' level.
+
+    Returns (dims, bandwidths, latencies) with trailing 1s removed.
+    """
+    panel_size = topology_config["panel_size"]
+    tile_size  = topology_config.get("tile_size", panel_size)
+
+    if "elec_bw" in topology_config:
+        # 3-level format
+        elec_bw       = float(topology_config["elec_bw"])
+        intra_opt_bw  = float(topology_config.get("intra_opt_bw", elec_bw))
+        elec_lat      = float(topology_config.get("elec_latency", 100.0))
+        intra_opt_lat = float(topology_config.get("intra_opt_latency", 300.0))
+    else:
+        # Legacy 2-level: merge electrical + optical-intra into single intra level
+        elec_bw       = float(topology_config["intra_bw"])
+        intra_opt_bw  = float(topology_config["intra_bw"])
+        elec_lat      = float(topology_config.get("intra_latency", 300.0))
+        intra_opt_lat = float(topology_config.get("intra_latency", 300.0))
+        tile_size     = panel_size  # no tile subdivision in legacy mode
+
+    inter_bw  = float(topology_config.get("inter_bw", 0.0))
+    inter_lat = float(topology_config.get("inter_latency", 2000.0))
+
+    panel_tiles = panel_size // tile_size  # number of optical groups per panel
+
+    if dp_size <= tile_size:
+        # All GPUs within one electrical tile
+        dims = [dp_size]
+        bws  = [elec_bw]
+        lats = [elec_lat]
+    elif dp_size <= panel_size:
+        # Within one panel, spanning multiple tiles
+        tiles_used = dp_size // tile_size
+        dims = [tile_size, tiles_used]
+        bws  = [elec_bw, intra_opt_bw]
+        lats = [elec_lat, intra_opt_lat]
+    else:
+        # Across multiple panels
+        if dp_size % panel_size != 0:
+            raise ValueError(
+                f"dp_group_size ({dp_size}) not divisible by panel_size ({panel_size})"
+            )
+        num_panels = dp_size // panel_size
+        dims = [tile_size, panel_tiles, num_panels]
+        bws  = [elec_bw, intra_opt_bw, inter_bw]
+        lats = [elec_lat, intra_opt_lat, inter_lat]
+
+    # Remove trailing 1s
+    while len(dims) > 1 and dims[-1] == 1:
+        dims.pop(); bws.pop(); lats.pop()
+
+    return dims, bws, lats
+
+
 # generates topology according to the input arguments
-def _create_network_config(network_config_path, instances, link_bw, link_latency):
+def _create_network_config(network_config_path, instances, link_bw, link_latency, topology_config=None):
     """Create ASTRA-Sim network topology config.
 
-    Topology dimensions:
+    Standard topology dimensions:
       - For DP groups: [tp_size, dp_group_size] — dim 0 for TP ALLREDUCE, dim 1 for EP ALLTOALL
       - For independent instances: [tp_size, num_groups] — dim 0 for TP, dim 1 for PP/instances
       - Single GPU instances: [1]
+
+    Hierarchical FB topology (topology_config.type == "hierarchical_fb"):
+      - Up to 3 dims: [tile_size, panel_tiles, num_panels]
+      - Per-dim bandwidth and latency from topology_config
     """
-    # Check for DP groups
     dp_groups = {}
     for inst in instances:
         dg = inst.get("dp_group")
         if dg is not None:
             dp_groups.setdefault(dg, []).append(inst)
 
-    if dp_groups:
-        # DP group mode: topology = [tp_size, dp_group_size]
-        # All instances in DP group must have same tp_size (validated by _resolve_dp_groups)
+    is_fb = topology_config is not None and topology_config.get("type") == "hierarchical_fb"
+
+    if is_fb and dp_groups:
+        first_group = next(iter(dp_groups.values()))
+        dp_size = len(first_group)
+        dims, bandwidths, latencies = _compute_fb_dims(dp_size, topology_config)
+    elif dp_groups:
         first_group = next(iter(dp_groups.values()))
         tp_size = first_group[0]["tp_size"]
         dp_size = len(first_group)
         dims = [tp_size, dp_size]
+        bandwidths = [float(link_bw)] * 2
+        latencies  = [float(link_latency)] * 2
+        while len(dims) > 1 and dims[-1] == 1:
+            dims.pop(); bandwidths.pop(); latencies.pop()
     else:
-        # Independent instances: standard topology
         total_npu = sum(inst["num_npus"] if inst.get("pd_type") != "prefill" else inst["num_npus"] * 2 for inst in instances)
-        total_pp = sum(inst["pp_size"] if inst.get("pd_type") != "prefill" else inst["pp_size"] * 2 for inst in instances)
+        total_pp  = sum(inst["pp_size"]  if inst.get("pd_type") != "prefill" else inst["pp_size"]  * 2 for inst in instances)
         num_instances = len(instances) + sum(1 for inst in instances if inst.get("pd_type") == "prefill")
         if total_npu == total_pp:
-            npus_per_group = total_npu // num_instances
-            dims = [npus_per_group, num_instances]
+            dims = [total_npu // num_instances, num_instances]
         else:
-            npus_per_group = total_npu // total_pp
-            dims = [npus_per_group, total_pp]
-
-    # Remove trailing 1s (single-element dimensions are unnecessary)
-    while len(dims) > 1 and dims[-1] == 1:
-        dims.pop()
+            dims = [total_npu // total_pp, total_pp]
+        bandwidths = [float(link_bw)] * len(dims)
+        latencies  = [float(link_latency)] * len(dims)
+        while len(dims) > 1 and dims[-1] == 1:
+            dims.pop(); bandwidths.pop(); latencies.pop()
 
     num_dims = len(dims)
     topology_data = {
-        "topology": FlowStyleList(["FullyConnected"] * num_dims),
+        "topology":  FlowStyleList(["FullyConnected"] * num_dims),
         "npus_count": FlowStyleList(dims),
-        "bandwidth": FlowStyleList([float(link_bw)] * num_dims),
-        "latency": FlowStyleList([float(link_latency)] * num_dims),
+        "bandwidth":  FlowStyleList(bandwidths),
+        "latency":    FlowStyleList(latencies),
     }
 
     with open(network_config_path, 'w') as yaml_file:
         yaml.dump(topology_data, yaml_file, default_flow_style=False, sort_keys=False)
 
-    return
+    return dims  # caller uses final dims to fix up ep_dim/tp_dim on instances
+
+def _fixup_collective_dims(instances, final_dims):
+    """Trim ep_dim/tp_dim on each instance to match the actual number of topology dimensions.
+
+    _resolve_dp_groups may set ep_dim=[True, True] for hierarchical FB, but if
+    trailing-1 trimming reduces the topology to 1D (e.g., EP == panel_size → single panel),
+    the dim list must shrink to match so Chakra encodes the correct involved_dim BoolList.
+    """
+    ndims = len(final_dims)
+    for inst in instances:
+        for attr in ("ep_dim", "tp_dim"):
+            v = inst.get(attr)
+            if isinstance(v, list) and len(v) > ndims:
+                inst[attr] = v[:ndims]
+
 
 # Validate memory configuration against placement settings
 def _validate_memory_config(memory_config_path, placement, enable_local_offloading):
