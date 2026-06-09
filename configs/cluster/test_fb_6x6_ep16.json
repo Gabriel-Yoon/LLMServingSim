@@ -1,0 +1,248 @@
+{
+  "num_nodes": 1,
+  "topology_config": {
+    "type": "fb_2d",
+    "panel_rows": 6,
+    "panel_cols": 6,
+    "intra_bw": 512.0,
+    "intra_lat": 300.0,
+    "inter_bw": 512.0,
+    "inter_lat": 5000.0
+  },
+  "nodes": [
+    {
+      "num_instances": 16,
+      "cpu_mem": {
+        "mem_size": 1024,
+        "mem_bw": 512,
+        "mem_latency": 0
+      },
+      "instances": [
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        },
+        {
+          "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+          "hardware": "H100",
+          "npu_mem": {
+            "mem_size": 80,
+            "mem_bw": 3350,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "ep_size": 16,
+          "dp_group": "A",
+          "pd_type": null
+        }
+      ]
+    }
+  ]
+}

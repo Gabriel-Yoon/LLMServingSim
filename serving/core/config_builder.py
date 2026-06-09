@@ -96,7 +96,8 @@ def _resolve_parallelism(instance, model_config):
 
 def _resolve_dp_groups(all_instances, topology_config=None):
     """Validate DP groups and compute dp_group_size and ep_total for each instance."""
-    is_fb = topology_config is not None and topology_config.get("type") == "hierarchical_fb"
+    tc_type = topology_config.get("type") if topology_config else None
+    is_fb = tc_type in ("hierarchical_fb", "fb_2d")
 
     dp_groups = {}
     for inst in all_instances:
@@ -122,16 +123,18 @@ def _resolve_dp_groups(all_instances, topology_config=None):
             raise ValueError(f"DP group '{group_name}': local_ep ({local_ep}) > tp_size ({tp0})")
 
         if is_fb:
-            # Hierarchical FB: up to 3 topology dims (elec / intra-opt / inter-panel).
+            # Hierarchical FB (hierarchical_fb or fb_2d): up to 3 topology dims.
             # ep_dim=[True,True,True] is set maximally here; _fixup_collective_dims trims
             # it to match the actual number of dims after trailing-1 removal.
-            tile_size = topology_config.get("tile_size", topology_config["panel_size"])
-            if dp_size % tile_size != 0:
-                raise ValueError(
-                    f"DP group '{group_name}': dp_group_size ({dp_size}) not divisible by "
-                    f"topology_config.tile_size ({tile_size})"
-                )
-            tp_dim = [True, False, False]   # TP ALLREDUCE on dim 0 (electrical) only
+            if tc_type == "hierarchical_fb":
+                tile_size = topology_config.get("tile_size", topology_config["panel_size"])
+                # Divisibility check only needed when spanning multiple tiles
+                if dp_size > tile_size and dp_size % tile_size != 0:
+                    raise ValueError(
+                        f"DP group '{group_name}': dp_group_size ({dp_size}) not divisible by "
+                        f"topology_config.tile_size ({tile_size})"
+                    )
+            tp_dim = [True, False, False]   # TP ALLREDUCE on dim 0 only
             ep_dim = [True, True, True]     # EP ALLTOALL across all levels; trimmed later
         else:
             tp_dim = [True, False]
@@ -183,12 +186,17 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         raise ValueError(f"Number of nodes ({len(nodes)}) does not match 'num_nodes' ({num_nodes}).")
 
     topology_config = cluster_config.get("topology_config")
-    is_fb = topology_config is not None and topology_config.get("type") == "hierarchical_fb"
+    tc_type = topology_config.get("type") if topology_config else None
+    is_fb = tc_type in ("hierarchical_fb", "fb_2d")
 
     if is_fb:
-        # For hierarchical FB topology, link_bw/link_latency default to intra-panel values
-        link_bw = cluster_config.get("link_bw", topology_config.get("intra_bw", 0))
-        link_latency = cluster_config.get("link_latency", topology_config.get("intra_latency", 0))
+        # For FB topology, link_bw/link_latency default to intra-panel values
+        if tc_type == "fb_2d":
+            link_bw = cluster_config.get("link_bw", topology_config.get("intra_bw", 0))
+            link_latency = cluster_config.get("link_latency", topology_config.get("intra_lat", 0))
+        else:
+            link_bw = cluster_config.get("link_bw", topology_config.get("intra_bw", 0))
+            link_latency = cluster_config.get("link_latency", topology_config.get("intra_latency", 0))
         _validate_fb_topology_config(topology_config)
     else:
         if cluster_config.get("link_bw") is None or cluster_config.get("link_latency") is None:
@@ -425,6 +433,8 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                     max_dp = max(dp_groups_here.values()) if dp_groups_here else 1
                     dims_here, _, _ = _compute_fb_dims(max_dp, topology_config)
                     num_dims = len(dims_here)
+                    # Note: topology_config type (hierarchical_fb or fb_2d) is handled
+                    # inside _compute_fb_dims via dispatch
                 else:
                     num_dims = 2 if has_dp else 1
                 for key in ["all-reduce-implementation", "all-gather-implementation",
@@ -578,6 +588,14 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     return cluster
 
 def _validate_fb_topology_config(tc):
+    tc_type = tc.get("type", "hierarchical_fb")
+    if tc_type == "fb_2d":
+        if tc.get("panel_rows", 0) < 2 or tc.get("panel_cols", 0) < 2:
+            raise ValueError(f"fb_2d topology_config requires panel_rows>=2 and panel_cols>=2")
+        if "intra_bw" not in tc:
+            raise KeyError("fb_2d topology_config must have 'intra_bw'")
+        return
+    # hierarchical_fb validation
     if tc.get("panel_size", 0) < 2:
         raise ValueError(f"topology_config.panel_size must be >= 2, got {tc.get('panel_size')}")
     # Accept both old single-intra format and new 3-level format
@@ -590,10 +608,98 @@ def _validate_fb_topology_config(tc):
         )
 
 
+def _fb2d_fb_rows(dp_size, panel_rows, panel_cols):
+    """Compute FlattenedButterfly fb_rows for dp_size nodes on a panel_rows×panel_cols grid.
+
+    Prefers the "full-column" layout: rows = dp_size / panel_cols when divisible.
+    This respects the physical panel geometry (rows of panel_cols GPUs share row-direction
+    waveguides; columns of panel_rows GPUs share column-direction waveguides).
+    For dp_size <= panel_cols: all nodes fit in one row → fb_rows=1.
+    Falls back to most-square factorization within panel bounds when not divisible.
+    """
+    if dp_size <= panel_cols:
+        return 1, dp_size
+    # Prefer full-column layout: dp_size / panel_cols complete rows, each panel_cols wide.
+    # This matches the physical panel geometry (e.g., EP=16 on 4×8 panel → 2×8, not 4×4).
+    if dp_size % panel_cols == 0:
+        r = dp_size // panel_cols
+        if r <= panel_rows:
+            return r, panel_cols
+    # Fall back to most-square factorization within panel bounds
+    best = None
+    for r in range(1, panel_rows + 1):
+        if dp_size % r == 0:
+            c = dp_size // r
+            if c <= panel_cols:
+                if best is None or abs(r - c) < abs(best[0] - best[1]):
+                    best = (r, c)
+    if best is None:
+        # Build hint: list valid EP sizes for this panel
+        valid = sorted({r * c for r in range(1, panel_rows + 1)
+                        for c in range(1, panel_cols + 1)} | {i for i in range(1, panel_cols + 1)})
+        valid_str = ", ".join(str(v) for v in valid if v <= panel_rows * panel_cols)
+        raise ValueError(
+            f"EP={dp_size} cannot be arranged as a sub-grid within a "
+            f"{panel_rows}×{panel_cols} panel (panel_size={panel_rows * panel_cols}). "
+            f"No r×c factorization exists with r≤{panel_rows} and c≤{panel_cols}. "
+            f"Valid single-panel EP sizes: {valid_str}"
+        )
+    return best
+
+
+def _compute_fb2d_dims(dp_size, topology_config):
+    """Compute ASTRA-Sim dims for fb_2d topology using FlattenedButterfly.
+
+    Each glass panel is modeled as a single FlattenedButterfly dimension:
+      - Same row or same col within the panel  → 1 hop
+      - Cross (different row AND col)           → 2 hops
+    Multi-panel configurations add a Ring dimension for inter-panel links.
+
+    Returns (dims, bandwidths, latencies, topologies, fb_rows) with trailing 1s removed.
+    Raises ValueError if dp_size cannot be mapped.
+    """
+    rows = int(topology_config["panel_rows"])
+    cols = int(topology_config["panel_cols"])
+    panel_size = rows * cols
+    intra_bw = float(topology_config["intra_bw"])
+    intra_lat = float(topology_config.get("intra_lat", 300.0))
+    inter_bw  = float(topology_config.get("inter_bw", 0.0))
+    inter_lat = float(topology_config.get("inter_lat", 5000.0))
+
+    if dp_size <= panel_size:
+        # Entire EP fits on one panel: single FlattenedButterfly dimension
+        fb_r, _ = _fb2d_fb_rows(dp_size, rows, cols)
+        dims = [dp_size]
+        bws  = [intra_bw]
+        lats = [intra_lat]
+        topos   = ["FlattenedButterfly"]
+        fb_rows = [fb_r]
+    elif dp_size % panel_size == 0:
+        # Multi-panel: FlattenedButterfly for intra-panel + Ring for inter-panel
+        n_panels = dp_size // panel_size
+        dims = [panel_size, n_panels]
+        bws  = [intra_bw, inter_bw]
+        lats = [intra_lat, inter_lat]
+        topos   = ["FlattenedButterfly", "Ring"]
+        fb_rows = [rows, 0]  # 0 = not applicable for Ring dim
+    else:
+        raise ValueError(
+            f"EP={dp_size} is not a multiple of panel_size={panel_size} ({rows}×{cols}) "
+            f"and cannot fit on a single panel"
+        )
+
+    while len(dims) > 1 and dims[-1] == 1:
+        dims.pop(); bws.pop(); lats.pop(); topos.pop(); fb_rows.pop()
+    return dims, bws, lats, topos, fb_rows
+
+
 def _compute_fb_dims(dp_size, topology_config):
     """Compute ASTRA-Sim topology dims, bandwidths, and latencies for hierarchical FB.
 
-    Three-level model:
+    Dispatches to _compute_fb2d_dims for type='fb_2d' (returns 5-tuple with topologies
+    and fb_rows); callers that only need the first 3 values work unchanged.
+
+    Three-level model (hierarchical_fb):
       dim 0 — electrical  (intra-tile, neighboring GPUs)
       dim 1 — optical     (intra-panel, non-neighboring within one glass panel)
       dim 2 — inter-panel (optical I/O between panels)
@@ -602,7 +708,13 @@ def _compute_fb_dims(dp_size, topology_config):
     optical-intra are merged into a single 'intra' level.
 
     Returns (dims, bandwidths, latencies) with trailing 1s removed.
+    For fb_2d, also returns topologies and fb_rows (5-tuple), but callers that
+    only unpack 3 values still work because Python tuple unpacking is positional.
     """
+    if topology_config.get("type") == "fb_2d":
+        dims, bws, lats, _topos, _fb_rows = _compute_fb2d_dims(dp_size, topology_config)
+        return dims, bws, lats
+
     panel_size = topology_config["panel_size"]
     tile_size  = topology_config.get("tile_size", panel_size)
 
@@ -673,12 +785,19 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
         if dg is not None:
             dp_groups.setdefault(dg, []).append(inst)
 
-    is_fb = topology_config is not None and topology_config.get("type") == "hierarchical_fb"
+    is_fb = topology_config is not None and topology_config.get("type") in ("hierarchical_fb", "fb_2d")
 
     if is_fb and dp_groups:
         first_group = next(iter(dp_groups.values()))
         dp_size = len(first_group)
-        dims, bandwidths, latencies = _compute_fb_dims(dp_size, topology_config)
+        tc_type = topology_config.get("type")
+        if tc_type == "fb_2d":
+            dims, bandwidths, latencies, topology_names, fb_rows_list = \
+                _compute_fb2d_dims(dp_size, topology_config)
+        else:
+            dims, bandwidths, latencies = _compute_fb_dims(dp_size, topology_config)
+            topology_names = None
+            fb_rows_list = None
     elif dp_groups:
         first_group = next(iter(dp_groups.values()))
         tp_size = first_group[0]["tp_size"]
@@ -686,6 +805,8 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
         dims = [tp_size, dp_size]
         bandwidths = [float(link_bw)] * 2
         latencies  = [float(link_latency)] * 2
+        topology_names = None
+        fb_rows_list = None
         while len(dims) > 1 and dims[-1] == 1:
             dims.pop(); bandwidths.pop(); latencies.pop()
     else:
@@ -698,16 +819,23 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
             dims = [total_npu // total_pp, total_pp]
         bandwidths = [float(link_bw)] * len(dims)
         latencies  = [float(link_latency)] * len(dims)
+        topology_names = None
+        fb_rows_list = None
         while len(dims) > 1 and dims[-1] == 1:
             dims.pop(); bandwidths.pop(); latencies.pop()
 
     num_dims = len(dims)
+    # Use explicit topology names for fb_2d (FlattenedButterfly); default to FullyConnected
+    final_topo_names = topology_names if topology_names is not None else ["FullyConnected"] * num_dims
     topology_data = {
-        "topology":  FlowStyleList(["FullyConnected"] * num_dims),
+        "topology":   FlowStyleList(final_topo_names),
         "npus_count": FlowStyleList(dims),
         "bandwidth":  FlowStyleList(bandwidths),
         "latency":    FlowStyleList(latencies),
     }
+    # Write fb_rows when any dimension is FlattenedButterfly
+    if fb_rows_list is not None and any(t == "FlattenedButterfly" for t in final_topo_names):
+        topology_data["fb_rows"] = FlowStyleList(fb_rows_list)
 
     with open(network_config_path, 'w') as yaml_file:
         yaml.dump(topology_data, yaml_file, default_flow_style=False, sort_keys=False)
