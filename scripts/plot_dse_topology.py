@@ -103,27 +103,68 @@ def draw_edge(ax, x0, y0, x1, y1, color, lw=1.2, alpha=0.5):
     ax.plot([x0, x1], [y0, y1], color=color, linewidth=lw, alpha=alpha, zorder=2)
 
 
+def draw_edge_arc(ax, x0, y0, x1, y1, color, lw=1.0, alpha=0.45, rad=0.3):
+    """Draw a curved arc between two points using FancyArrowPatch.
+
+    rad > 0: arcs counter-clockwise from (x0,y0)→(x1,y1).
+    For left→right row edges: bows upward.
+    For top→bottom col edges: bows to the right.
+    """
+    from matplotlib.patches import FancyArrowPatch
+    patch = FancyArrowPatch(
+        posA=(x0, y0), posB=(x1, y1),
+        connectionstyle=f"arc3,rad={rad}",
+        color=color, linewidth=lw, alpha=alpha,
+        arrowstyle="-", zorder=2,
+    )
+    ax.add_patch(patch)
+
+
 # ── layout helpers ──────────────────────────────────────────────────────────────
 def draw_fb_panel(ax, rows, cols, color, title, show_bw=None, step=1.3):
-    """Draw a FlattenedButterfly panel on ax."""
+    """Draw a FlattenedButterfly panel on ax.
+
+    Adjacent same-row/col pairs: straight lines (clearly visible as nearest-neighbor links).
+    Non-adjacent same-row/col pairs: curved arcs bowing outside the grid so every
+    long-range optical connection is visually distinct and not hidden behind shorter lines.
+      - Row arcs bow upward  (above the grid).
+      - Col arcs bow to the right (right of the grid).
+    Arc curvature scales with node distance so overlapping arcs at different radii
+    separate cleanly.
+    """
     n = rows * cols
     pos = [grid_pos(i, cols, step) for i in range(n)]
-    re, ce = fb_edges(n, rows, cols)
     C_ROW = "#5B9BD5"
     C_COL = "#70AD47"
 
-    for u, v in re:
-        x0, y0 = pos[u]; x1, y1 = pos[v]
-        draw_edge(ax, x0, y0, x1, y1, C_ROW, lw=0.9, alpha=0.3)
-    for u, v in ce:
-        x0, y0 = pos[u]; x1, y1 = pos[v]
-        draw_edge(ax, x0, y0, x1, y1, C_COL, lw=0.9, alpha=0.3)
+    for u in range(n):
+        for v in range(u + 1, n):
+            ru, cu = divmod(u, cols)
+            rv, cv = divmod(v, cols)
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            if ru == rv:  # same row — bow upward
+                dist = abs(cv - cu)
+                if dist == 1:
+                    draw_edge(ax, x0, y0, x1, y1, C_ROW, lw=1.1, alpha=0.65)
+                else:
+                    rad = 0.18 * math.log2(dist + 1)
+                    draw_edge_arc(ax, x0, y0, x1, y1, C_ROW,
+                                  lw=0.85, alpha=max(0.22, 0.52 - dist * 0.05), rad=rad)
+            elif cu == cv:  # same col — bow to the right
+                dist = abs(rv - ru)
+                if dist == 1:
+                    draw_edge(ax, x0, y0, x1, y1, C_COL, lw=1.1, alpha=0.65)
+                else:
+                    rad = 0.18 * math.log2(dist + 1)
+                    draw_edge_arc(ax, x0, y0, x1, y1, C_COL,
+                                  lw=0.85, alpha=max(0.22, 0.52 - dist * 0.05), rad=rad)
+
     for i in range(n):
         x, y = pos[i]
         draw_node(ax, x, y, i, color=color, r=NODE_R * 0.85, fs=5.5 if n > 16 else 6.0)
 
     one, two, pct1 = fb_hop_stats(n, rows, cols)
-    total = one + two
     bw_note = f"\nIntra BW: {show_bw}" if show_bw else ""
     ax.set_title(
         f"{title}\n"
@@ -131,9 +172,15 @@ def draw_fb_panel(ax, rows, cols, color, title, show_bw=None, step=1.3):
         fontsize=8.0, color=color, fontweight="bold", pad=3)
     ax.set_aspect("equal")
     ax.axis("off")
-    pad = 0.7
-    ax.set_xlim(-pad, (cols - 1) * step + pad)
-    ax.set_ylim(-(rows - 1) * step - pad, pad + 0.5)
+
+    # Expand limits to accommodate outward-bowing arcs.
+    # Max arc bulge ≈ rad * chord_length / 2  (arc3 midpoint displacement formula).
+    max_row_arc = 0.18 * math.log2(cols) * (cols - 1) * step / 2 if cols > 2 else 0.3
+    max_col_arc = 0.18 * math.log2(rows) * (rows - 1) * step / 2 if rows > 2 else 0.3
+    pad_x = 0.5
+    pad_y = 0.5
+    ax.set_xlim(-pad_x, (cols - 1) * step + max_col_arc + pad_x)
+    ax.set_ylim(-(rows - 1) * step - pad_y, max_row_arc + pad_y + 0.4)
 
 
 def draw_nvl72_tile(ax, tile_size=8, color=C_NVL):
@@ -208,12 +255,15 @@ def fig10_topology_overview():
                   step=1.1)
 
     # shared legend
+    from matplotlib.lines import Line2D
     leg = [
-        mpatches.Patch(color="#5B9BD5", label="Same-row link (1 hop)"),
-        mpatches.Patch(color="#70AD47", label="Same-col link (1 hop)"),
-        mpatches.Patch(color="#AAAAAA", label="2-hop (diff row & col)"),
+        Line2D([0], [0], color="#5B9BD5", lw=1.8, label="Same-row link, adj (1 hop, straight)"),
+        Line2D([0], [0], color="#5B9BD5", lw=1.4, ls="--", label="Same-row link, long-range (1 hop, arc)"),
+        Line2D([0], [0], color="#70AD47", lw=1.8, label="Same-col link, adj (1 hop, straight)"),
+        Line2D([0], [0], color="#70AD47", lw=1.4, ls="--", label="Same-col link, long-range (1 hop, arc)"),
+        mpatches.Patch(color="#AAAAAA", label="2-hop (diff row & col, no direct link)"),
     ]
-    fig.legend(handles=leg, loc="lower center", ncol=3, fontsize=9,
+    fig.legend(handles=leg, loc="lower center", ncol=5, fontsize=8,
                framealpha=0.9, edgecolor="#BBBBBB", bbox_to_anchor=(0.5, -0.04))
 
     plt.tight_layout(rect=[0, 0.04, 1, 0.97])
