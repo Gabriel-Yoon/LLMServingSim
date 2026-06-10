@@ -1,0 +1,65 @@
+# Nemotron-3 family — class catalog (dense decoder-only LLMs).
+#
+# Covers nvidia/Nemotron-3-8B, 22B, 120B and similar checkpoints.
+# model_type: "nemotron" in the HF config.
+#
+# Key architectural differences from LLaMA:
+#   LayerNorm: NemotronLayerNorm1P (weight_offset=+1, NOT RMSNorm)
+#   MLP: 2-linear (up_proj + down_proj, NO gate projection)
+#   Activation: SquaredReLU (x * relu(x), NOT SiluAndMul)
+#   Rotary: RotaryEmbedding with partial_rotary_factor < 1.0
+#
+# vLLM classes (NemotronForCausalLM from
+# vllm/model_executor/models/nemotron.py):
+#   NemotronForCausalLM, NemotronModel, NemotronDecoderLayer
+#   NemotronAttention, NemotronMLP, NemotronLayerNorm1P
+#
+# MLP trace note: the simulator emits ALLREDUCE after down_proj (TP>1),
+# same as LLaMA. up_proj is ColumnParallelLinear (no gate merge), so
+# it is cataloged as "up_proj" not "gate_up_proj". The simulator's
+# mlp_dense sequence must list "up_proj" to match what is profiled.
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, qkv_proj, rotary_emb, attention]
+  post_attn: [o_proj, layernorm]
+  mlp_dense: [up_proj, act_fn, down_proj]    # no gate; 2-linear MLP
+  mlp_moe:   []
+  head:      [final_layernorm, lm_head, sampler]
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: NemotronLayerNorm1P
+      within: NemotronDecoderLayer
+      tp_stable: true
+    qkv_proj:
+      vllm: QKVParallelLinear
+    rotary_emb:
+      vllm: RotaryEmbedding
+    o_proj:
+      vllm: RowParallelLinear
+      within: NemotronAttention
+    up_proj:
+      vllm: ColumnParallelLinear
+      within: NemotronMLP
+    act_fn:
+      vllm: SquaredReLU
+    down_proj:
+      vllm: RowParallelLinear
+      within: NemotronMLP
+    final_layernorm:
+      vllm: NemotronLayerNorm1P
+      within: NemotronForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: Attention
