@@ -2,7 +2,8 @@ export LLMSIM_REPO="/storage/scratch1/8/syoon351/repos/LLMServingSim"
 export REPOS_ROOT="/storage/scratch1/8/syoon351/repos"
 export SCRATCH="/storage/home/hcoda1/8/syoon351/scratch"
 export IMAGE="/storage/project/r-syu334-0/shared/images/astra-sim_latest.sif"
-export VENV="$SCRATCH/deps/llmservingsim_astra_venv"
+export VENV="$SCRATCH/deps/llmservingsim_astra_venv"      # simulator venv (Apptainer)
+export VLLM_VENV="$SCRATCH/deps/vllm_venv"                # profiler/bench venv (bare-metal)
 
 export APPTAINER_CACHEDIR="$SCRATCH/apptainer_cache"
 export APPTAINER_TMPDIR="$SCRATCH/apptainer_tmp"
