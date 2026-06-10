@@ -158,6 +158,15 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
     if args.hf_overrides:
         hf_overrides = _deep_merge(hf_overrides, args.hf_overrides)
 
+    # Models like DeepSeek V3 have first_k_dense_replace > 0: the first N
+    # decoder layers are dense (no MoE). With num_hidden_layers=1 the single
+    # layer is layer 0 — always dense — so ExpertCategory would find no
+    # FusedMoE and raise. Override to 0 so the 1-layer profile model is
+    # always a MoE layer. CLI hf_overrides can still override this.
+    first_k_dense = int(args.model_config.get("first_k_dense_replace", 0))
+    if first_k_dense > 0 and "first_k_dense_replace" not in hf_overrides:
+        hf_overrides["first_k_dense_replace"] = 0
+
     # 4. TP sharding uses the model config directly. The written
     # config.json will have SHARD_FIELDS divided by tp via hf_overrides,
     # so vLLM's ColumnParallelLinear / RowParallelLinear see the

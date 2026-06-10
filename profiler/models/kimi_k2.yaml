@@ -1,0 +1,58 @@
+# Kimi K2 (moonshotai/Kimi-K2-Instruct) — class catalog.
+#
+# Architecture: DeepseekV3ForCausalLM (same vLLM implementation as DeepSeek V3).
+# model_type: "kimi_k2"  (HF config field; maps to this yaml by filename convention).
+#
+# Key differences from DeepSeek V3:
+#   n_routed_experts: 384  (vs 256 for V3)
+#   num_attention_heads: 64  (vs 128 for V3)
+#   num_key_value_heads: 64  (MLA, same compression structure)
+#   first_k_dense_replace: 1  (only layer 0 is dense; rest are MoE)
+#   num_nextn_predict_layers: 0  (no speculative decoding extension)
+#
+# Since the vLLM implementation is shared with DeepSeek V3, all catalog
+# entries (class names, within scopes) are identical. See deepseek_v3.yaml
+# for full design rationale.
+#
+# MLA attention: full block (Q/KV LoRA + RoPE + flash-attn + o_proj) is
+# profiled as a single 4D-parameterized unit (DeepseekV2MLAAttention).
+# o_proj is additionally profiled in the dense category for TP ALLREDUCE.
+#
+# first_k_dense_replace=1 is automatically overridden to 0 by
+# engine.fuse_engine_kwargs so MoE profiling sees a MoE layer.
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, attention]        # 'attention' = full MLA block (4D sweep)
+  post_attn: [o_proj, layernorm]           # o_proj kept for TP ALLREDUCE emission
+  mlp_dense: []                            # unused: simulator always uses mlp_moe
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2DecoderLayer
+      tp_stable: true
+    o_proj:
+      vllm: RowParallelLinear
+      within: DeepseekV2MLAAttention
+    final_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV3ForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: DeepseekV2MLAAttention    # full MLA: Q/KV LoRA + RoPE + flash-attn + o_proj
+  moe:
+    moe:
+      vllm: SharedFusedMoE

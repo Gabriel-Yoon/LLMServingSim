@@ -1,14 +1,30 @@
-# DeepSeek-V3 family — class catalog (mixture-of-experts decoder-only LLMs).
+# DeepSeek-V3 / DeepSeek-R1 family — class catalog (MoE decoder-only LLMs).
 #
-# Uses Multi-head Latent Attention (MLA) instead of standard MHA.
-# The first 3 layers are dense MLP; remaining layers use MoE.
-# MoE block uses SharedFusedMoE (vLLM's fused implementation).
+# Attention: Multi-head Latent Attention (MLA). The LoRA Q/KV projections,
+# RoPE, flash-attention kernel, and o_proj are all fused inside
+# DeepseekV2MLAAttention. We therefore profile the full MLA block via the
+# 4D attention sweep (prefill_chunk × kv_prefill × n_decode × kv_decode).
+# o_proj is additionally profiled as a standalone dense layer so the
+# simulator can emit the TP ALLREDUCE after it; this causes a minor
+# double-count (~15-20% of MLA time) which is acceptable for topology DSE.
+#
+# Dense vs MoE layers: the first first_k_dense_replace (=3) layers use
+# DeepseekV2MLP instead of SharedFusedMoE. The simulator always emits
+# mlp_moe (is_moe=True for any MoE model), so mlp_dense is left empty.
+# MoE profiling requires first_k_dense_replace=0 in hf_overrides; this
+# is done automatically by engine.fuse_engine_kwargs when the field is
+# detected in the model config.
+#
+# Routing: SharedFusedMoE contains a FusedMoE sub-module (routed experts)
+# plus shared expert MLPs. The moe_hook patches FusedMoE.forward_native
+# inside SharedFusedMoE, which is correct — shared experts always receive
+# all tokens and are not subject to routing control.
 
 sequence:
   prologue:  [embedding]
-  pre_attn:  [layernorm, qkv_proj, rotary_emb, attention]
-  post_attn: [o_proj, layernorm]
-  mlp_dense: [mlp]
+  pre_attn:  [layernorm, attention]        # 'attention' = full MLA block (4D sweep)
+  post_attn: [o_proj, layernorm]           # o_proj kept for TP ALLREDUCE emission
+  mlp_dense: []                            # unused: simulator always uses mlp_moe
   mlp_moe:   [moe]
   head:      [final_layernorm, lm_head, sampler]
 
@@ -20,15 +36,9 @@ catalog:
       vllm: RMSNorm
       within: DeepseekV2DecoderLayer
       tp_stable: true
-    qkv_proj:
-      vllm: DeepseekV2MLAAttention
-    rotary_emb:
-      vllm: RotaryEmbedding
     o_proj:
       vllm: RowParallelLinear
       within: DeepseekV2MLAAttention
-    mlp:
-      vllm: DeepseekV2MLP
     final_layernorm:
       vllm: RMSNorm
       within: DeepseekV3ForCausalLM
@@ -41,7 +51,7 @@ catalog:
       tp_stable: true
   attention:
     attention:
-      vllm: Attention
+      vllm: DeepseekV2MLAAttention    # full MLA: Q/KV LoRA + RoPE + flash-attn + o_proj
   moe:
     moe:
       vllm: SharedFusedMoE
