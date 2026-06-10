@@ -17,11 +17,6 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-MODELS=(
-    "nvidia/GPT-OSS-120B"
-    "nvidia/Nemotron-3-120B"
-)
-
 echo "=== Fetching HF model configs ==="
 
 python3 - <<'EOF'
@@ -34,17 +29,22 @@ except ImportError:
     print("ERROR: huggingface_hub not installed. Run: pip install huggingface_hub")
     sys.exit(1)
 
+# Correct HuggingFace model IDs (org/repo) → local config path
 MODELS = [
-    "nvidia/GPT-OSS-120B",
-    "nvidia/Nemotron-3-120B",
+    # (hf_model_id,                                       local_path)
+    ("openai/gpt-oss-120b",                               "configs/model/openai/gpt-oss-120b.json"),
+    # Nemotron-3-Super-120B is a Mamba-2 + MoE hybrid (model_type: nemotron_h).
+    # The LLMServingSim profiler does NOT currently support SSM/Mamba layers.
+    # Fetching the config for reference only — do not profile until Mamba-2
+    # support is added.
+    ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",     "configs/model/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16.json"),
 ]
 
 YAML_DIR = Path("profiler/models")
 KNOWN_YAMLS = {p.stem for p in YAML_DIR.glob("*.yaml")}
 
-for model_id in MODELS:
-    org, name = model_id.split("/")
-    out_path = Path(f"configs/model/{org}/{name}.json")
+for model_id, out_str in MODELS:
+    out_path = Path(out_str)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"\nFetching: {model_id}")
@@ -56,14 +56,14 @@ for model_id in MODELS:
         with open(out_path) as f:
             cfg = json.load(f)
 
-        model_type = cfg.get("model_type", "UNKNOWN")
-        arch = cfg.get("architectures", ["UNKNOWN"])[0]
-        hidden = cfg.get("hidden_size", "?")
-        layers = cfg.get("num_hidden_layers", "?")
-        heads  = cfg.get("num_attention_heads", "?")
-        kv_heads = cfg.get("num_key_value_heads", "?")
+        model_type   = cfg.get("model_type", "UNKNOWN")
+        arch         = cfg.get("architectures", ["UNKNOWN"])[0]
+        hidden       = cfg.get("hidden_size", "?")
+        layers       = cfg.get("num_hidden_layers", "?")
+        heads        = cfg.get("num_attention_heads", "?")
+        kv_heads     = cfg.get("num_key_value_heads", "?")
         intermediate = cfg.get("intermediate_size", "?")
-        vocab = cfg.get("vocab_size", "?")
+        vocab        = cfg.get("vocab_size", "?")
 
         print(f"  model_type   : {model_type}")
         print(f"  architecture : {arch}")
@@ -76,9 +76,7 @@ for model_id in MODELS:
         if model_type in KNOWN_YAMLS:
             print(f"  ✓ profiler/models/{model_type}.yaml exists")
         else:
-            print(f"  ✗ profiler/models/{model_type}.yaml MISSING")
-            print(f"    → Create profiler/models/{model_type}.yaml before profiling.")
-            print(f"    → Use profiler/models/llama.yaml or nemotron.yaml as a template.")
+            print(f"  ✗ profiler/models/{model_type}.yaml MISSING — profiling not yet supported")
 
     except Exception as e:
         print(f"  ERROR: {e}")

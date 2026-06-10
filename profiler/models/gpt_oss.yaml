@@ -1,0 +1,57 @@
+# GPT-OSS-120B (openai/gpt-oss-120b) — class catalog.
+#
+# MoE decoder with alternating sliding-window (window=128) and full attention,
+# GQA (64 Q heads / 8 KV heads / head_dim=64), 128 experts top-4.
+# model_type: gpt_oss, architecture: GptOssForCausalLM.
+#
+# Sliding attention vs. full attention: 18 of each alternate through the 36
+# layers. Both use the same vLLM Attention kernel; the profiler averages across
+# all attention layer instances, which is an acceptable approximation for DSE.
+#
+# NOTE: vLLM class names below are inferred from standard vLLM conventions
+# for the GptOssForCausalLM family. Verify by inspecting
+#   dict(model.named_modules()).keys()
+# inside vLLM if profiling fails with a "layer not found" warning.
+#
+# Tested vLLM version: v0.19.0 (TBD — model released ~May 2025).
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, qkv_proj, rotary_emb, attention]
+  post_attn: [o_proj, layernorm]
+  mlp_dense: []
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: GptOssDecoderLayer
+      tp_stable: true
+    qkv_proj:
+      vllm: QKVParallelLinear
+    rotary_emb:
+      vllm: RotaryEmbedding
+    o_proj:
+      vllm: RowParallelLinear
+      within: GptOssAttention
+    final_layernorm:
+      vllm: RMSNorm
+      within: GptOssForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: Attention
+  moe:
+    moe:
+      vllm: GptOssMoE

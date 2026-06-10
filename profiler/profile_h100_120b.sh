@@ -2,14 +2,13 @@
 # Profile all 5 large-scale models on H100 GPUs.
 #
 # Models:
-#   Qwen/Qwen3-235B-A22B            (MoE, qwen3_moe, 128 experts) — ready
+#   Qwen/Qwen3-235B-A22B            (MoE, qwen3_moe, 128 experts)  — ready
 #   deepseek-ai/DeepSeek-V3-0324    (MoE, deepseek_v3, 256 experts) — ready
-#   nvidia/Nemotron-3-120B          (dense, nemotron) — fetch config first
-#   nvidia/GPT-OSS-120B             (dense, TBD arch) — fetch config first
+#   moonshotai/Kimi-K2-Instruct     (MoE, kimi_k2, 384 experts)    — ready
+#   openai/gpt-oss-120b             (MoE, gpt_oss, 128 experts)    — yaml ready; verify vLLM class names
 #
-# PREREQUISITE for NVIDIA gated models:
-#   1. huggingface-cli login   (one-time, saves token to ~/.cache)
-#   2. ./profiler/fetch_hf_configs.sh   (downloads configs, checks yamls)
+# NOT profileable (Mamba-2 hybrid — SSM layers unsupported):
+#   nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16  (model_type: nemotron_h)
 #
 # Usage (inside vLLM Docker at /workspace):
 #   # Profile a single model:
@@ -52,8 +51,9 @@ MODEL_FILTER="${MODEL_FILTER:-}"
 declare -A MODELS
 MODELS["qwen3_235b"]="Qwen/Qwen3-235B-A22B"
 MODELS["deepseek_v3_0324"]="deepseek-ai/DeepSeek-V3-0324"
-MODELS["nemotron3_120b"]="nvidia/Nemotron-3-120B"
-MODELS["gpt_oss_120b"]="nvidia/GPT-OSS-120B"
+MODELS["kimi_k2"]="moonshotai/Kimi-K2-Instruct"
+MODELS["gpt_oss_120b"]="openai/gpt-oss-120b"
+# nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 — Mamba-2 hybrid, profiler incompatible
 
 # =============================================================================
 # Helper
@@ -115,10 +115,10 @@ echo "Max KV   : $ATTENTION_MAX_KV"
 echo "Skip skew: ${SKIP_SKEW:-no}"
 echo ""
 
-_profile "qwen3_235b"      "Qwen/Qwen3-235B-A22B"
+_profile "qwen3_235b"       "Qwen/Qwen3-235B-A22B"
 _profile "deepseek_v3_0324" "deepseek-ai/DeepSeek-V3-0324"
-_profile "nemotron3_120b"  "nvidia/Nemotron-3-120B"
-_profile "gpt_oss_120b"    "nvidia/GPT-OSS-120B"
+_profile "kimi_k2"          "moonshotai/Kimi-K2-Instruct"
+_profile "gpt_oss_120b"     "openai/gpt-oss-120b"
 
 echo ""
 echo "=== Profile sweep complete. ==="
