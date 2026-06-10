@@ -36,6 +36,23 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Auto-activate vllm_venv if vLLM is not already importable.
+if ! python3 -c "import vllm" &>/dev/null 2>&1; then
+    ENV_SH="$REPO_ROOT/scripts/env.sh"
+    if [[ -f "$ENV_SH" ]]; then
+        source "$ENV_SH"
+        if [[ -f "${VLLM_VENV:-}/bin/activate" ]]; then
+            # shellcheck disable=SC1091
+            source "$VLLM_VENV/bin/activate"
+            echo "[env] activated $VLLM_VENV"
+        else
+            echo "ERROR: vllm_venv not found at ${VLLM_VENV:-<unset>}" >&2
+            echo "  source scripts/env.sh and check VLLM_VENV." >&2
+            exit 1
+        fi
+    fi
+fi
+
 # ─────────────────────────────────────────────────────────────
 # Settings
 # ─────────────────────────────────────────────────────────────
