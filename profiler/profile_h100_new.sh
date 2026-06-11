@@ -11,8 +11,12 @@
 # To run a single model:
 #   MODEL_FILTER=deepseek ./profiler/profile_h100_new.sh
 #
-# To skip skew profiling (faster first pass, ~1/3 of total time):
+# To skip skew profiling (faster first pass):
 #   SKIP_SKEW=1 ./profiler/profile_h100_new.sh
+#
+# To run skew profiling ONLY (when dense/attention already done):
+#   ONLY_SKEW=1 ./profiler/profile_h100_new.sh
+#   ONLY_SKEW=1 MODEL_FILTER=deepseek ./profiler/profile_h100_new.sh
 #
 # ─────────────────────────────────────────────────────────────
 # Status as of 2026-06-10 (H100):
@@ -64,6 +68,7 @@ ATTENTION_CHUNK_FACTOR="${ATTENTION_CHUNK_FACTOR:-2.0}"
 ATTENTION_KV_FACTOR="${ATTENTION_KV_FACTOR:-2.0}"
 MEASUREMENT_ITERATIONS="${MEASUREMENT_ITERATIONS:-3}"
 SKIP_SKEW="${SKIP_SKEW:-}"
+ONLY_SKEW="${ONLY_SKEW:-}"
 MODEL_FILTER="${MODEL_FILTER:-}"
 
 PERF_ROOT="profiler/perf/$HARDWARE"
@@ -114,10 +119,21 @@ _profile() {
     cmd+=(--attention-chunk-factor "$ATTENTION_CHUNK_FACTOR")
     cmd+=(--attention-kv-factor "$ATTENTION_KV_FACTOR")
     cmd+=(--measurement-iterations "$MEASUREMENT_ITERATIONS")
-    [[ -n "$SKIP_SKEW" ]] && cmd+=(--skip-skew)
+    [[ -n "$SKIP_SKEW"  ]] && cmd+=(--skip-skew)
+    [[ -n "$ONLY_SKEW"  ]] && cmd+=(--only-skew)
 
     echo "CMD: ${cmd[*]}"
     "${cmd[@]}"
+}
+
+# _profile_supplement: Phase 2 helper — skips models in ONLY_SKEW mode because
+# supplement runs use tp=2,4 (no TP=1) which the profiler rejects with --only-skew.
+_profile_supplement() {
+    if [[ -n "$ONLY_SKEW" ]]; then
+        echo "[SKIP] $1 tp=$2 — ONLY_SKEW mode requires TP=1; re-run with ONLY_SKEW=1 TP_DEGREES=1,2,4 to include supplement models"
+        return
+    fi
+    _profile "$1" "$2"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -129,6 +145,7 @@ echo "TP sweep : $TP_DEGREES"
 echo "MNBT/MSQ : $MAX_NUM_BATCHED_TOKENS / $MAX_NUM_SEQS"
 echo "Max KV   : $ATTENTION_MAX_KV"
 echo "Skip skew: ${SKIP_SKEW:-no (full profile)}"
+echo "Only skew: ${ONLY_SKEW:-no}"
 echo ""
 echo "Existing H100 profiles:"
 for meta in $(find "$PERF_ROOT" -name "meta.yaml" 2>/dev/null | sort); do
@@ -157,7 +174,7 @@ echo "--- Phase 2: Qwen3-235B-A22B — supplement tp2, tp4 (tp1 exists, skip) --
 
 # Only run tp2 and tp4; tp1 CSV already complete.
 # Resume mode ensures tp1 data is untouched even if re-listed.
-_profile "Qwen/Qwen3-235B-A22B" "2,4"
+_profile_supplement "Qwen/Qwen3-235B-A22B" "2,4"
 
 # ─────────────────────────────────────────────────────────────
 # Phase 3: NVIDIA gated models (need fetch first)

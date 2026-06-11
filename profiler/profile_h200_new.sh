@@ -14,6 +14,10 @@
 # Skip skew (faster first pass):
 #   SKIP_SKEW=1 ./profiler/profile_h200_new.sh
 #
+# Run skew ONLY (when dense/attention already done):
+#   ONLY_SKEW=1 ./profiler/profile_h200_new.sh
+#   ONLY_SKEW=1 MODEL_FILTER=deepseek ./profiler/profile_h200_new.sh
+#
 # ─────────────────────────────────────────────────────────────
 # H200 status as of 2026-06-10:
 #
@@ -65,6 +69,7 @@ ATTENTION_CHUNK_FACTOR="${ATTENTION_CHUNK_FACTOR:-2.0}"
 ATTENTION_KV_FACTOR="${ATTENTION_KV_FACTOR:-2.0}"
 MEASUREMENT_ITERATIONS="${MEASUREMENT_ITERATIONS:-3}"
 SKIP_SKEW="${SKIP_SKEW:-}"
+ONLY_SKEW="${ONLY_SKEW:-}"
 MODEL_FILTER="${MODEL_FILTER:-}"
 
 PERF_ROOT="profiler/perf/$HARDWARE"
@@ -109,10 +114,21 @@ _profile() {
     cmd+=(--attention-chunk-factor "$ATTENTION_CHUNK_FACTOR")
     cmd+=(--attention-kv-factor "$ATTENTION_KV_FACTOR")
     cmd+=(--measurement-iterations "$MEASUREMENT_ITERATIONS")
-    [[ -n "$SKIP_SKEW" ]] && cmd+=(--skip-skew)
+    [[ -n "$SKIP_SKEW"  ]] && cmd+=(--skip-skew)
+    [[ -n "$ONLY_SKEW"  ]] && cmd+=(--only-skew)
 
     echo "CMD: ${cmd[*]}"
     "${cmd[@]}"
+}
+
+# _profile_supplement: Phase 2 helper — skips models in ONLY_SKEW mode because
+# supplement runs use tp=2,4 (no TP=1) which the profiler rejects with --only-skew.
+_profile_supplement() {
+    if [[ -n "$ONLY_SKEW" ]]; then
+        echo "[SKIP] $1 tp=$2 — ONLY_SKEW mode requires TP=1; re-run with ONLY_SKEW=1 TP_DEGREES=1,2,4 to include supplement models"
+        return
+    fi
+    _profile "$1" "$2"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -124,6 +140,7 @@ echo "TP sweep : $TP_DEGREES"
 echo "MNBT/MSQ : $MAX_NUM_BATCHED_TOKENS / $MAX_NUM_SEQS"
 echo "Max KV   : $ATTENTION_MAX_KV"
 echo "Skip skew: ${SKIP_SKEW:-no (full profile)}"
+echo "Only skew: ${ONLY_SKEW:-no}"
 echo ""
 echo "Existing $HARDWARE profiles:"
 for meta in $(find "$PERF_ROOT" -name "meta.yaml" 2>/dev/null | sort); do
@@ -147,11 +164,11 @@ _profile "moonshotai/Kimi-K2-Instruct"  "$TP_DEGREES"
 echo ""
 echo "--- Phase 2: Supplement existing H200 profiles (tp2, tp4) ---"
 
-_profile "deepseek-ai/DeepSeek-V3"          "2,4"
-_profile "Qwen/Qwen3-235B-A22B"             "2,4"
-_profile "Qwen/Qwen3-30B-A3B-Instruct-2507" "4"       # tp1,tp2 exist; add tp4
-_profile "mistralai/Mixtral-8x7B-v0.1"     "2"        # tp1 exists; add tp2
-_profile "mistralai/Mixtral-8x22B-v0.1"    "2,4"
+_profile_supplement "deepseek-ai/DeepSeek-V3"          "2,4"
+_profile_supplement "Qwen/Qwen3-235B-A22B"             "2,4"
+_profile_supplement "Qwen/Qwen3-30B-A3B-Instruct-2507" "4"
+_profile_supplement "mistralai/Mixtral-8x7B-v0.1"     "2"
+_profile_supplement "mistralai/Mixtral-8x22B-v0.1"    "2,4"
 
 # ─────────────────────────────────────────────────────────────
 # Phase 3: GPT-OSS-120B (verify vLLM class names first)

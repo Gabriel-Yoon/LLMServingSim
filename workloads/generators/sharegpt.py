@@ -111,10 +111,16 @@ def register_args(p: argparse.ArgumentParser) -> None:
                         "of parsing real conversations.")
     p.add_argument("--fix-input-length", type=int, default=128,
                    dest="fix_input_length",
-                   help="(--fix-len) input length. Default 128.")
+                   help="(--fix-len) input length (excluding prefix). Default 128.")
     p.add_argument("--fix-output-length", type=int, default=512,
                    dest="fix_output_length",
                    help="(--fix-len) output length. Default 512.")
+    p.add_argument("--prefix-length", type=int, default=0,
+                   dest="prefix_length",
+                   help="(--fix-len) shared prefix length prepended to every "
+                        "request's input. All requests use identical prefix "
+                        "token IDs so prefix caching yields 100%% hit rate "
+                        "after the first request. Default 0 (no prefix).")
 
     # ---- Pulse mode -------------------------------------------------------
     p.add_argument("--pulse", action="store_true", default=False,
@@ -342,10 +348,15 @@ def _gen_fixed_length(
     args: argparse.Namespace, tok
 ) -> Iterator[tuple[list[int], list[int]]]:
     vocab_size = getattr(tok, "vocab_size", 32000)
+    # Build a shared prefix once (same token IDs for all requests → 100% cache hit).
+    prefix_ids: list[int] = []
+    if getattr(args, "prefix_length", 0) > 0:
+        rng = random.Random(args.seed)
+        prefix_ids = [rng.randint(0, vocab_size - 1) for _ in range(args.prefix_length)]
     for _ in range(args.num_reqs):
-        in_ids = [random.randint(0, vocab_size - 1) for _ in range(args.fix_input_length)]
+        isl_ids = [random.randint(0, vocab_size - 1) for _ in range(args.fix_input_length)]
         out_ids = [random.randint(0, vocab_size - 1) for _ in range(args.fix_output_length)]
-        yield in_ids, out_ids
+        yield prefix_ids + isl_ids, out_ids
 
 
 # ---------------------------------------------------------------------------

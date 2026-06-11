@@ -322,7 +322,7 @@ def plot_graph_E(df, wg_ref, outdir):
 # ─────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Plot 128-GPU EP sweep results")
-    parser.add_argument("--results",  default="outputs/dse_128gpu_4x4_vs_6x6.csv")
+    parser.add_argument("--results",  default="results/exp_topology_fb4x4_vs_nvl72_ep8to128.csv")
     parser.add_argument("--out-dir",  default=OUTDIR)
     parser.add_argument("--wg-ref",   type=int, default=6,
                         help="Fixed WG count for Graphs A, D, E (default: 6)")
