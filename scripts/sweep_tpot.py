@@ -72,7 +72,11 @@ TPOT_SLO_MS = 15.0
 
 # ─── Workload generation ─────────────────────────────────────────────────────
 def _make_workload(n: int, isl: int, osl: int, seed: int = 0) -> str:
-    """Write a temp JSONL with N requests all arriving at t=0."""
+    """Write JSONL with N requests arriving 1ms apart.
+
+    Returns a path RELATIVE to REPO_ROOT so the simulator (cwd=astra-sim/)
+    resolves it correctly via its internal '../' prefix.
+    """
     rng = random.Random(seed)
     lines = []
     for i in range(n):
@@ -81,16 +85,16 @@ def _make_workload(n: int, isl: int, osl: int, seed: int = 0) -> str:
         lines.append(json.dumps({
             "input_toks": isl,
             "output_toks": osl,
-            "arrival_time_ns": i * 1_000_000,  # 1 ms stagger to avoid exact collision
+            "arrival_time_ns": i * 1_000_000,  # 1 ms stagger
             "input_tok_ids": inp,
             "output_tok_ids": out,
         }))
-    # write to outputs dir so it's accessible inside Docker/Apptainer
-    wl_path = os.path.join(OUTPUT_DIR, f"wl_n{n}_isl{isl}_osl{osl}.jsonl")
+    abs_path = os.path.join(OUTPUT_DIR, f"wl_n{n}_isl{isl}_osl{osl}.jsonl")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(wl_path, "w") as f:
+    with open(abs_path, "w") as f:
         f.write("\n".join(lines) + "\n")
-    return wl_path
+    # return relative to REPO_ROOT (simulator prefixes ../ internally)
+    return os.path.relpath(abs_path, REPO_ROOT)
 
 
 # ─── Results helpers ─────────────────────────────────────────────────────────
@@ -155,17 +159,20 @@ def _parse_output(out_csv: str, n: int, osl: int):
 def run_sim(label, config_path, workload_path, n, run_dir,
             dry_run=False, timeout=7200):
     os.makedirs(run_dir, exist_ok=True)
-    out_csv = os.path.join(run_dir, f"{label}.csv")
+    # Absolute path for local file-existence checks; relative for subprocess args.
+    # config_builder, router, and scheduler all prepend '../' internally (cwd=astra-sim/).
+    out_csv_abs = os.path.join(run_dir, f"{label}.csv")
+    out_csv_rel = os.path.relpath(out_csv_abs, REPO_ROOT)
 
     cmd = [
         "python", "-m", "serving",
-        "--cluster-config", config_path,
+        "--cluster-config", config_path,    # relative to REPO_ROOT
         "--dtype", "bfloat16",
         "--block-size", str(BLOCK_SIZE),
         "--max-num-seqs", "128",
         "--max-num-batched-tokens", "2048",
-        "--dataset", workload_path,
-        "--output", out_csv,
+        "--dataset", workload_path,          # relative to REPO_ROOT
+        "--output", out_csv_rel,             # relative to REPO_ROOT
         "--num-req", str(n),
         "--skip-prefill",
         "--log-level", LOG_LEVEL,
@@ -190,7 +197,7 @@ def run_sim(label, config_path, workload_path, n, run_dir,
                     **{f: 0 for f in CSV_FIELDS
                        if f not in ("label","status","topology","n_requests",
                                     "isl","osl","elapsed_s","error")}}
-        metrics = _parse_output(out_csv, n, OSL) or {}
+        metrics = _parse_output(out_csv_abs, n, OSL) or {}
         return {"status": "ok", "elapsed_s": elapsed, "error": "", **metrics}
     except subprocess.TimeoutExpired:
         return {"status": "timeout", "elapsed_s": timeout,
@@ -234,7 +241,7 @@ def main():
           f"(interactivity > {1000/TPOT_SLO_MS:.1f} tokens/s/user)\n")
 
     for topo in topo_list:
-        config_path = os.path.join(REPO_ROOT, TOPOLOGIES[topo])
+        config_path = TOPOLOGIES[topo]  # relative to REPO_ROOT; simulator prefixes ../ internally
         for n in n_values:
             label = f"{topo}_ep32_n{n:03d}"
             if label in done:
