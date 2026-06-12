@@ -1,6 +1,4 @@
 import os
-import subprocess
-from time import time
 from .request import *
 from .logger import get_logger
 
@@ -23,18 +21,15 @@ def generate_graph(batch, hardware, num_npus, node_id=0, instance_id=0, npu_offs
     workload_dir = f'../../../inputs/workload/{output_name}'
     os.makedirs(workload_dir, exist_ok=True)
 
-    cmd = f'python -m chakra.src.converter.converter LLM ' \
-            f'--input ../../../inputs/trace/{file_name}.txt ' \
-            f'--output ../../../inputs/workload/{output_name}/llm ' \
-            f'--num-npus {num_npus} ' \
-            f'--npu-offset {npu_offset}'
+    input_path  = f'../../../inputs/trace/{file_name}.txt'
+    output_path = f'../../../inputs/workload/{output_name}/llm'
 
-    if enable_local_offloading:
-        cmd += ' --local-offloading'
+    logger.debug("Generating graph: input=%s output=%s num_npus=%d npu_offset=%d",
+                 input_path, output_path, num_npus, npu_offset,
+                 extra={"node_id": node_id, "instance_id": instance_id})
 
-    logger.debug("Generating graph with command: %s", cmd, extra={"node_id": node_id, "instance_id": instance_id})
+    from chakra.src.converter.llm_converter import LLMConverter
+    converter = LLMConverter(input_path, output_path, num_npus, npu_offset, enable_local_offloading)
+    converter.convert()
 
-    cmd = cmd.split()
-    subprocess.run(cmd, text=True)    
     os.chdir(cwd)
-    return
