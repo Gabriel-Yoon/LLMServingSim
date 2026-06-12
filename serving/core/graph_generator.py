@@ -1,6 +1,7 @@
 import os
 import sys
 from .request import *
+from .utils import _TMP_DIR
 from .logger import get_logger
 
 logger = get_logger("GraphGenerator")
@@ -19,14 +20,16 @@ def generate_graph(batch, hardware, num_npus, node_id=0, instance_id=0, npu_offs
     else:
         file_name = f'{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}'
 
-    # For DP groups, all instances write .et files to a shared workload folder
+    # For DP groups, all instances write .et files to a shared workload folder.
+    # All intermediate files go to _TMP_DIR (node-local storage) to avoid
+    # Lustre I/O latency on per-wave trace + protobuf writes.
     output_name = workload_name if workload_name else file_name
 
-    workload_dir = os.path.join(cwd, 'inputs', 'workload', output_name)
+    workload_dir = os.path.join(_TMP_DIR, 'workload', output_name)
     os.makedirs(workload_dir, exist_ok=True)
 
-    input_path  = os.path.join(cwd, 'inputs', 'trace', f'{file_name}.txt')
-    output_path = os.path.join(cwd, 'inputs', 'workload', output_name, 'llm')
+    input_path  = os.path.join(_TMP_DIR, 'trace', f'{file_name}.txt')
+    output_path = os.path.join(_TMP_DIR, 'workload', output_name, 'llm')
 
     logger.debug("Generating graph: input=%s output=%s num_npus=%d npu_offset=%d",
                  input_path, output_path, num_npus, npu_offset,

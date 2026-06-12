@@ -1,6 +1,15 @@
 import os
+import tempfile
 from time import time
 import json
+
+# Intermediate files (trace .txt and Chakra .et) are written here.
+# Defaults to a per-process sub-dir of $TMPDIR (node-local storage on HPC,
+# /tmp on workstations) so Lustre I/O latency does not dominate per-wave cost.
+_TMP_DIR = os.path.join(
+    os.environ.get('TMPDIR', tempfile.gettempdir()),
+    f'llmservingsim_{os.getpid()}',
+)
 
 
 # Formatting string for a trace file's per-layer row. Kept in this
@@ -30,8 +39,7 @@ def get_workload(batch, hardware, instance_id=0, event=False, workload_name=None
     else:
         file_name = f'{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}'
 
-    cwd = os.getcwd()
-    return cwd + f"/inputs/workload/{file_name}/llm"
+    return os.path.join(_TMP_DIR, 'workload', file_name, 'llm')
 
 
 def header():

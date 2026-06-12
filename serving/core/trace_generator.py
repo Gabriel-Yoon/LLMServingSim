@@ -2,6 +2,7 @@ import os
 import re
 from .request import *
 from .utils import *
+from .utils import _TMP_DIR
 import pandas as pd
 import yaml
 from .memory_model import calculate_sizes
@@ -1460,7 +1461,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     load_size = batch.load
     evict_size = batch.evict
 
-    output_path = f"inputs/trace/{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}.txt"
+    output_path = os.path.join(_TMP_DIR, 'trace', hardware, batch.model,
+                               f'instance{instance_id}_batch{batch.batch_id}.txt')
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # make trace — accept either the Mistral-style ``num_local_experts``
@@ -1578,7 +1580,8 @@ def generate_event(alarm):
     result.append([layer_name, comp_time, input_loc, input_size, weight_loc, weight_size, output_loc, output_size, comm_type, comm_size, misc])
 
     # write to the text file
-    output_path = f"inputs/trace/event_handler.txt"
+    output_path = os.path.join(_TMP_DIR, 'trace', 'event_handler.txt')
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
         f.write(f"EVENT\n")
         f.write(f'{len(result)}'+'\n') # length of the text is 1
