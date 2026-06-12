@@ -12,6 +12,7 @@ import argparse
 import json
 from time import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 from serving.core.scheduler import *
 from serving.core.request import *
@@ -524,7 +525,7 @@ def main():
                     first_batch = dp_pending[dg][first_inst_id][0]
                     dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
 
-                    for inst_id in dp_groups[dg]:
+                    def _gen_dummy(inst_id):
                         batch, nid = dp_pending[dg][inst_id]
                         inst = instances[inst_id]
                         generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
@@ -538,6 +539,12 @@ def main():
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id], enable_local_offloading,
                                        workload_name=dp_workload_name)
+
+                    with ThreadPoolExecutor(max_workers=len(dp_groups[dg])) as _pool:
+                        list(_pool.map(_gen_dummy, dp_groups[dg]))
+
+                    for inst_id in dp_groups[dg]:
+                        batch, nid = dp_pending[dg][inst_id]
                         if inst_id != instance_id:
                             dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
                                                                     workload_name=dp_workload_name)
@@ -578,7 +585,7 @@ def main():
                         first_batch = dp_pending[dg][first_inst_id][0]
                         dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
 
-                        for inst_id in dp_groups[dg]:
+                        def _gen_real(inst_id):
                             batch, nid = dp_pending[dg][inst_id]
                             inst = instances[inst_id]
                             generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
@@ -592,6 +599,12 @@ def main():
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id], enable_local_offloading,
                                            workload_name=dp_workload_name)
+
+                        with ThreadPoolExecutor(max_workers=len(dp_groups[dg])) as _pool:
+                            list(_pool.map(_gen_real, dp_groups[dg]))
+
+                        for inst_id in dp_groups[dg]:
+                            batch, nid = dp_pending[dg][inst_id]
                             if inst_id != instance_id:
                                 dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
                                                                         workload_name=dp_workload_name)
