@@ -4,7 +4,7 @@ ASP-DAC 2027 paper experiment sweep.
 CONTROLLED COMPARISON CONTRACT
   Same model:    Qwen/Qwen3-30B-A3B-Instruct-2507  (H100 compute profile)
   Same dtype:    bfloat16
-  Same ISL/OSL:  512 / 50 tokens  (chat-like)
+  Same ISL/OSL:  512 / 256 tokens  (Chat use case)
   Same scheduler: max_num_seqs=128, max_num_batched_tokens=2048
   Same workload: deterministic JSONL (seed=0), arrivals 1ms apart
   Only variable: topology config (→ interconnect BW + latency)
@@ -52,7 +52,7 @@ TPOT_SLO_MS            = 15.0      # goodput boundary
 MAX_NUM_SEQS           = 128
 MAX_NUM_BATCHED_TOKENS = 2048
 ISL                    = 512
-OSL                    = 10     # 10 decode steps is enough for TPOT; reduces HPC wall time ~5x
+OSL                    = 256    # Chat use case: enough for steady-state TPOT with staggered arrivals
 
 REPO_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(REPO_ROOT, "outputs", "paper_sweep")
