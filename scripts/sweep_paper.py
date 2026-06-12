@@ -201,52 +201,66 @@ def _parse_output(out_csv_abs: str, n: int):
 
 
 # ─── Simulation runner ────────────────────────────────────────────────────────
+_ZERO_METRICS = {
+    "tpot_avg_ms": 0, "tpot_p50_ms": 0, "tpot_p99_ms": 0,
+    "throughput_toks_per_s": 0, "interactivity_toks_per_s_per_user": 0,
+    "goodput_toks_per_s": 0, "within_slo": 0, "n_completed": 0,
+}
+
 def _run_one(label, config_path, workload_path, n, run_dir,
-             dry_run=False, timeout=14400):
+             dry_run=False, timeout=14400, debug=False):
     os.makedirs(run_dir, exist_ok=True)
     out_csv_abs = os.path.join(run_dir, f"{label}.csv")
     out_csv_rel = os.path.relpath(out_csv_abs, REPO_ROOT)
 
     cmd = [
         "python", "-m", "serving",
-        "--cluster-config", config_path,   # relative to REPO_ROOT
+        "--cluster-config", config_path,
         "--dtype", "bfloat16",
         "--block-size", str(BLOCK_SIZE),
         "--max-num-seqs", str(MAX_NUM_SEQS),
         "--max-num-batched-tokens", str(MAX_NUM_BATCHED_TOKENS),
-        "--dataset", workload_path,        # relative to REPO_ROOT
-        "--output", out_csv_rel,           # relative to REPO_ROOT
+        "--dataset", workload_path,
+        "--output", out_csv_rel,
         "--num-req", str(n),
         "--skip-prefill",
-        "--log-level", LOG_LEVEL,
+        "--log-level", "INFO" if debug else LOG_LEVEL,
     ]
 
     if dry_run:
         print(f"    [dry] n={n:<4d}  cfg={os.path.basename(config_path)}")
         return {"status": "dry", "error": ""}
 
+    if debug:
+        print(f"\n[DEBUG] $ {' '.join(cmd)}\n", flush=True)
+
     t0 = time.time()
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=REPO_ROOT, timeout=timeout,
-        )
-        elapsed = time.time() - t0
-        if proc.returncode != 0:
-            stderr_tail = proc.stderr.strip()[-1200:]
-            stdout_tail = proc.stdout.strip()[-600:]
-            combined = (stderr_tail + "\n---stdout---\n" + stdout_tail).strip()[-1200:]
-            return {"status": "error", "elapsed_s": elapsed, "error": combined,
-                    "tpot_avg_ms": 0, "tpot_p50_ms": 0, "tpot_p99_ms": 0,
-                    "throughput_toks_per_s": 0, "interactivity_toks_per_s_per_user": 0,
-                    "goodput_toks_per_s": 0, "within_slo": 0, "n_completed": 0}
+        if debug:
+            # Stream stdout/stderr directly to terminal — no capture
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, timeout=timeout)
+            elapsed = time.time() - t0
+            if proc.returncode != 0:
+                return {"status": "error", "elapsed_s": elapsed,
+                        "error": f"exit code {proc.returncode} (see streamed output above)",
+                        **_ZERO_METRICS}
+        else:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, cwd=REPO_ROOT, timeout=timeout,
+            )
+            elapsed = time.time() - t0
+            if proc.returncode != 0:
+                stderr_tail = proc.stderr.strip()[-1200:]
+                stdout_tail = proc.stdout.strip()[-600:]
+                combined = (stderr_tail + "\n---stdout---\n" + stdout_tail).strip()[-1200:]
+                return {"status": "error", "elapsed_s": elapsed, "error": combined,
+                        **_ZERO_METRICS}
+
         metrics = _parse_output(out_csv_abs, n) or {}
         return {"status": "ok", "elapsed_s": elapsed, "error": "", **metrics}
     except subprocess.TimeoutExpired:
         return {"status": "timeout", "elapsed_s": timeout,
-                "error": f"timeout>{timeout}s",
-                "tpot_avg_ms": 0, "tpot_p50_ms": 0, "tpot_p99_ms": 0,
-                "throughput_toks_per_s": 0, "interactivity_toks_per_s_per_user": 0,
-                "goodput_toks_per_s": 0, "within_slo": 0, "n_completed": 0}
+                "error": f"timeout>{timeout}s", **_ZERO_METRICS}
 
 
 # ─── EP extraction ────────────────────────────────────────────────────────────
@@ -258,7 +272,7 @@ def _ep_from_name(topo_name: str) -> int:
 
 
 # ─── Run one experiment ───────────────────────────────────────────────────────
-def run_experiment(exp_id: str, dry_run: bool = False):
+def run_experiment(exp_id: str, dry_run: bool = False, debug: bool = False):
     exp = EXPERIMENTS[exp_id]
     results_csv = os.path.join(REPO_ROOT, exp["results_csv"])
     os.makedirs(os.path.dirname(results_csv), exist_ok=True)
@@ -275,6 +289,8 @@ def run_experiment(exp_id: str, dry_run: bool = False):
     print(f"  SLO        : TPOT ≤ {TPOT_SLO_MS} ms")
     print(f"  Results    : {results_csv}")
     print(f"  Already done: {len(done)} runs")
+    if debug:
+        print(f"  [DEBUG] streaming mode — log_level=INFO, output not captured")
 
     for topo_name, config_path in exp["topologies"].items():
         ep = _ep_from_name(topo_name)
@@ -291,7 +307,7 @@ def run_experiment(exp_id: str, dry_run: bool = False):
 
             wl_path  = _make_workload(n, isl, osl)
             run_dir  = os.path.join(OUTPUT_DIR, f"exp{exp_id}", topo_name)
-            print(f"  [RUN ] {label}", end="", flush=True)
+            print(f"  [RUN ] {label}", flush=True)
 
             result = _run_one(
                 label=label,
@@ -299,6 +315,7 @@ def run_experiment(exp_id: str, dry_run: bool = False):
                 workload_path=wl_path,
                 n=n, run_dir=run_dir,
                 dry_run=dry_run,
+                debug=debug,
             )
 
             row = {
@@ -373,6 +390,9 @@ def main():
     ap.add_argument("--exp",      nargs="+", choices=list(EXPERIMENTS.keys()) + ["all"],
                     default=["all"], help="Which experiments to run (default: all)")
     ap.add_argument("--dry-run",  action="store_true")
+    ap.add_argument("--debug",    action="store_true",
+                    help="Stream simulation stdout/stderr to terminal (log_level=INFO). "
+                         "Use with --exp 1 to monitor a single experiment.")
     ap.add_argument("--summary",  action="store_true",
                     help="Print summary table for completed experiments and exit")
     args = ap.parse_args()
@@ -388,7 +408,7 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     for eid in exp_ids:
-        run_experiment(eid, dry_run=args.dry_run)
+        run_experiment(eid, dry_run=args.dry_run, debug=args.debug)
 
     print("\n=== All requested experiments complete ===")
     for eid in exp_ids:
