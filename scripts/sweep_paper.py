@@ -52,7 +52,7 @@ TPOT_SLO_MS            = 15.0      # goodput boundary
 MAX_NUM_SEQS           = 128
 MAX_NUM_BATCHED_TOKENS = 2048
 ISL                    = 512
-OSL                    = 50
+OSL                    = 10     # 10 decode steps is enough for TPOT; reduces HPC wall time ~5x
 
 REPO_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(REPO_ROOT, "outputs", "paper_sweep")
@@ -202,7 +202,7 @@ def _parse_output(out_csv_abs: str, n: int):
 
 # ─── Simulation runner ────────────────────────────────────────────────────────
 def _run_one(label, config_path, workload_path, n, run_dir,
-             dry_run=False, timeout=7200):
+             dry_run=False, timeout=14400):
     os.makedirs(run_dir, exist_ok=True)
     out_csv_abs = os.path.join(run_dir, f"{label}.csv")
     out_csv_rel = os.path.relpath(out_csv_abs, REPO_ROOT)
