@@ -424,7 +424,6 @@ def main():
     # ----------------------------------- Start simulation loop ------------------------------------
     # Starting simulation, one while loop processes one iteration
     while True:
-        
         out = controller.read_wait(p)
         out_dict = controller.parse_output(out[-2])
         
@@ -483,7 +482,12 @@ def main():
         # DP group: truly idle instance (no inflight batch) — create dummy batch so ALLTOALL syncs
         elif new_req is None and instance_id in inst_dp_group and sys == inst2npu_mapping[instance_id] and len(schedulers[instance_id].inflight) == 0:
             dg = inst_dp_group[instance_id]
-            if dp_pending[dg] and instance_id not in dp_pending[dg]:
+            any_dp_active = any(
+                not (schedulers[mid].is_request_empty() and len(schedulers[mid].inflight) == 0)
+                for mid in dp_groups[dg]
+                if mid != instance_id
+            )
+            if (dp_pending[dg] or any_dp_active) and instance_id not in dp_pending[dg]:
                 # Emit a 1-token dummy; the uniform pad-to-max pass below
                 # brings it (and any undersized real peers) up to the
                 # group's max_total_len, matching vLLM's CUDA-graph DP padding.

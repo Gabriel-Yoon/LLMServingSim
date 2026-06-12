@@ -316,7 +316,7 @@ def run_experiment(exp_id: str, dry_run: bool = False):
             elif st == "dry":
                 print()
             else:
-                print(f"  → [{st}] {result.get('error','')[:80]}")
+                print(f"  → [{st}] {result.get('error','')[-300:]}")
 
     if not dry_run:
         print(f"\n  ✓ Saved: {results_csv}")
