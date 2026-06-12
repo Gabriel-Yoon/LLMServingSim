@@ -233,7 +233,9 @@ def _run_one(label, config_path, workload_path, n, run_dir,
         elapsed = time.time() - t0
         if proc.returncode != 0:
             stderr_tail = proc.stderr.strip()[-1200:]
-            return {"status": "error", "elapsed_s": elapsed, "error": stderr_tail,
+            stdout_tail = proc.stdout.strip()[-600:]
+            combined = (stderr_tail + "\n---stdout---\n" + stdout_tail).strip()[-1200:]
+            return {"status": "error", "elapsed_s": elapsed, "error": combined,
                     "tpot_avg_ms": 0, "tpot_p50_ms": 0, "tpot_p99_ms": 0,
                     "throughput_toks_per_s": 0, "interactivity_toks_per_s_per_user": 0,
                     "goodput_toks_per_s": 0, "within_slo": 0, "n_completed": 0}
