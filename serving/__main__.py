@@ -425,6 +425,11 @@ def main():
     # Starting simulation, one while loop processes one iteration
     while True:
         out = controller.read_wait(p)
+        if len(out) < 2:
+            raise RuntimeError(
+                "ASTRA-Sim closed stdout unexpectedly — the process likely crashed. "
+                "Check that the binary is built for this platform and the config is valid."
+            )
         out_dict = controller.parse_output(out[-2])
         
         if out_dict != None:
