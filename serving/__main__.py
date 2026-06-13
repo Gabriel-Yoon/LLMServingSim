@@ -566,6 +566,15 @@ def main():
 
                 if dg is not None:
                     # DP group: defer trace generation until all members scheduled
+
+                    # Late-arriving request: a previous barrier already counted this
+                    # instance using a dummy. Flush that dummy trace to ASTRA now so
+                    # the iteration counter stays in sync before registering the real
+                    # batch for the next barrier.
+                    if instance_id in dp_ready_workloads:
+                        controller.write_flush(p, dp_ready_workloads.pop(instance_id))
+                        responded = True
+
                     dp_pending[dg][instance_id] = (new_req, node_id)
 
                     if len(dp_pending[dg]) == len(dp_groups[dg]):
@@ -612,11 +621,17 @@ def main():
                         dp_pending[dg].clear()
                         workload = get_workload(new_req, instance["hardware"], instance_id,
                                                 workload_name=dp_workload_name)
-                        controller.write_flush(p, workload)
-                        responded = True
+                        if responded:
+                            # Old dp_ready was already flushed to ASTRA; queue the new
+                            # workload so it is consumed on the next re-check.
+                            dp_ready_workloads[instance_id] = workload
+                        else:
+                            controller.write_flush(p, workload)
+                            responded = True
                     else:
-                        # Waiting for other DP members — send pass
-                        controller.write_flush(p, "pass")
+                        # Waiting for other DP members — send pass (only if not already sent)
+                        if not responded:
+                            controller.write_flush(p, "pass")
                         responded = True
                 else:
                     # Independent instance: generate trace immediately

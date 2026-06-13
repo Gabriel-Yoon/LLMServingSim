@@ -653,16 +653,12 @@ class Scheduler:
         end_reqs = []
         if len(self.inflight) == 0:
             return prompt_t, gen_t, end_reqs
-        batch = None
-        # find batch
-        id -= 1
+        # FIFO: the oldest inflight batch is always the one ASTRA just completed.
+        # A fixed id-1 offset breaks for instances that ran dummy traces before
+        # their first real batch (the dummy iterations shift the ASTRA counter
+        # without adding to inflight, causing a permanent id/batch_id mismatch).
+        batch = self.inflight[0]
         idx = 0
-        for i, b in enumerate(self.inflight):
-            if b.batch_id == id:
-                batch = b
-                idx = i
-        if batch == None:
-            return prompt_t, gen_t, end_reqs
         if sys in batch.end:
             return prompt_t, gen_t, end_reqs
         else:
