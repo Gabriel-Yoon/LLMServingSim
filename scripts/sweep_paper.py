@@ -31,8 +31,8 @@ Docker:
   docker exec servingsim_docker bash -c \\
     "cd /app/LLMServingSim && python scripts/sweep_paper.py --exp 1"
 
-HPC:
-  sbatch scripts/slurm_paper_sweep.sh
+HPC (inside Apptainer with venv activated):
+  python scripts/sweep_paper.py --exp 1
 """
 
 import argparse
