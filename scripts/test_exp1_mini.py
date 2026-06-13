@@ -1,19 +1,16 @@
 """
 Minimal one-run sanity test for Exp 1 (sweep_paper.py) on HPC / Docker.
 
-Runs a single simulation with:
-  - topology : h100_ep32.json  (NVL72-like, EP=32)
-  - N=1 request, ISL=10, OSL=5  (5 decode steps → ~22s on HPC, ~4 min in Docker)
-  - --skip-prefill
+Default: topology=nvl72_ep8, ISL=10, OSL=5, N=1 (fast smoke test).
 
-Pass: simulator exits 0, outputs/test_exp1_mini.csv written, TPOT printed.
+To reproduce the exact sweep_paper.py exp1 N=16 scenario on HPC:
+  python scripts/test_exp1_mini.py --topo fb --num-req 16 --isl 512 --osl 5 --skip-prefill
+
+Pass: simulator exits 0, output CSV written, TPOT printed.
 Fail: non-zero exit or missing CSV.
 
 Usage (inside Apptainer or Docker, from repo root):
-  python scripts/test_exp1_mini.py
-
-Optional: test FB 4x4 topology instead of NVL72
-  python scripts/test_exp1_mini.py --topo fb
+  python scripts/test_exp1_mini.py [--topo TOPO] [--num-req N] [--isl ISL] [--osl OSL] [--skip-prefill]
 """
 
 import argparse
@@ -29,43 +26,44 @@ REPO_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VOCAB_SIZE = 151936
 
 TOPOLOGIES = {
-    "nvl72":      "configs/cluster/h100_ep32.json",
-    "fb":         "configs/cluster/h100_fb_4x4_ep32.json",
-    "nvl72_ep8":  "configs/cluster/h100_ep8.json",
-    "nvl72_ep16": "configs/cluster/h100_ep16.json",
-    "nvl72_ep32": "configs/cluster/h100_ep32.json",
-    "nvl72_ep64": "configs/cluster/h100_ep64.json",
+    "nvl72":       "configs/cluster/h100_ep32.json",
+    "fb":          "configs/cluster/h100_fb_4x4_ep32.json",
+    "nvl72_ep8":   "configs/cluster/h100_ep8.json",
+    "nvl72_ep16":  "configs/cluster/h100_ep16.json",
+    "nvl72_ep32":  "configs/cluster/h100_ep32.json",
+    "nvl72_ep64":  "configs/cluster/h100_ep64.json",
     "nvl72_ep128": "configs/cluster/h100_ep128.json",
 }
 
-ISL = 10
-OSL = 5
-N   = 1
 
-
-def make_workload() -> str:
+def make_workload(n: int, isl: int, osl: int) -> str:
     rng   = random.Random(42)
-    inp   = [rng.randint(0, VOCAB_SIZE - 1) for _ in range(ISL)]
-    out   = [rng.randint(0, VOCAB_SIZE - 1) for _ in range(OSL)]
-    entry = {"input_toks": ISL, "output_toks": OSL,
-             "arrival_time_ns": 0,
-             "input_tok_ids": inp, "output_tok_ids": out}
-    wl_path = os.path.join(REPO_ROOT, "outputs", "test_exp1_mini_workload.jsonl")
+    lines = []
+    for i in range(n):
+        inp = [rng.randint(0, VOCAB_SIZE - 1) for _ in range(isl)]
+        out = [rng.randint(0, VOCAB_SIZE - 1) for _ in range(osl)]
+        lines.append(json.dumps({
+            "input_toks": isl, "output_toks": osl,
+            "arrival_time_ns": i * 1_000_000,
+            "input_tok_ids": inp, "output_tok_ids": out,
+        }))
+    wl_path = os.path.join(REPO_ROOT, "outputs", f"test_mini_n{n}_isl{isl}_osl{osl}.jsonl")
     os.makedirs(os.path.dirname(wl_path), exist_ok=True)
     with open(wl_path, "w") as f:
-        f.write(json.dumps(entry) + "\n")
+        f.write("\n".join(lines) + "\n")
     return os.path.relpath(wl_path, REPO_ROOT)
 
 
-def run(topo_name: str):
+def run(topo_name: str, n: int, isl: int, osl: int, skip_prefill: bool):
     config_path = TOPOLOGIES[topo_name]
     config_full = os.path.join(REPO_ROOT, config_path)
     if not os.path.exists(config_full):
         print(f"[FAIL] Config not found: {config_full}")
         sys.exit(1)
 
-    wl_rel  = make_workload()
-    out_csv = os.path.join(REPO_ROOT, "outputs", "test_exp1_mini.csv")
+    wl_rel  = make_workload(n, isl, osl)
+    tag     = f"test_mini_{topo_name}_n{n}_isl{isl}_osl{osl}{'_skip' if skip_prefill else ''}"
+    out_csv = os.path.join(REPO_ROOT, "outputs", f"{tag}.csv")
     out_rel = os.path.relpath(out_csv, REPO_ROOT)
 
     cmd = [
@@ -77,13 +75,17 @@ def run(topo_name: str):
         "--max-num-batched-tokens", "2048",
         "--dataset", wl_rel,
         "--output", out_rel,
-        "--num-req", str(N),
+        "--num-req", str(n),
         "--log-level", "INFO",
     ]
+    if skip_prefill:
+        cmd.append("--skip-prefill")
 
-    print(f"Topology : {topo_name}  ({config_path})")
-    print(f"Workload : ISL={ISL}, OSL={OSL}, N={N}  → 1 prefill + {OSL} decode steps")
-    print(f"Command  : {' '.join(cmd)}")
+    mode = "--skip-prefill (decode only)" if skip_prefill else "prefill + decode"
+    print(f"Topology     : {topo_name}  ({config_path})")
+    print(f"Workload     : ISL={isl}, OSL={osl}, N={n}  mode={mode}")
+    print(f"Decode steps : {osl} × {n} requests")
+    print(f"Command      : {' '.join(cmd)}")
     print()
 
     t0   = time.time()
@@ -111,12 +113,21 @@ def run(topo_name: str):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--topo", choices=["nvl72", "fb", "nvl72_ep8", "nvl72_ep16",
-                                       "nvl72_ep32", "nvl72_ep64", "nvl72_ep128"], default="nvl72_ep8",
+    ap = argparse.ArgumentParser(
+        description="Minimal serving sanity test. Default: nvl72_ep8, ISL=10, OSL=5, N=1."
+    )
+    ap.add_argument("--topo", choices=list(TOPOLOGIES.keys()), default="nvl72_ep8",
                     help="Topology to test (default: nvl72_ep8)")
+    ap.add_argument("--num-req", type=int, default=1,
+                    help="Number of requests (default: 1)")
+    ap.add_argument("--isl", type=int, default=10,
+                    help="Input sequence length (default: 10)")
+    ap.add_argument("--osl", type=int, default=5,
+                    help="Output sequence length (default: 5)")
+    ap.add_argument("--skip-prefill", action="store_true",
+                    help="Pass --skip-prefill to the simulator (matches sweep_paper.py)")
     args = ap.parse_args()
-    run(args.topo)
+    run(args.topo, args.num_req, args.isl, args.osl, args.skip_prefill)
 
 
 if __name__ == "__main__":
