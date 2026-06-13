@@ -785,7 +785,8 @@ def main():
                 print_markup("[sim.heading]▶ Exiting simulation...[/]\n")
                 controller.write_flush(p, "exit")
                 break
-            controller.write_flush(p, "done") # make done instances to sleep
+            if not responded:
+                controller.write_flush(p, "done") # make done instances to sleep
         elif new_req == None and not responded:
             # If all instances are idle but deferred sessions have pending
             # requests with future arrival times (tool calls still running),
