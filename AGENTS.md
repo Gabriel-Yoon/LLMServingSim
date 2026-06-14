@@ -483,6 +483,81 @@ These must match the C++ enum in `astra-sim/astra-sim/system/AstraMemoryAPI.hh`.
   - Mounts the repo root at `/app/LLMServingSim`; ASTRA-Sim + Chakra are
     built inside via `scripts/compile.sh` on first use
 
+## Physical Design Constants (Glass-Photonic FB) — 확정값
+
+### Waveguide bandwidth (단방향 기준)
+- 1 WG = 32 λ × 32 Gb/s/λ = 1.024 Tb/s = 128 GB/s (unidirectional)
+- WG는 단방향 매체. 양방향은 TX WG + RX WG 별도 필요.
+- bundle 해석: x6 = 6 WG total = 3 TX + 3 RX
+  - per-pair unidirectional = 3 × 128 = 384 GB/s
+  - per-pair bidirectional  = 768 GB/s
+
+### Micro-bump 제약 (WG 수 상한 결정 근거 — CRITICAL)
+- 1 WG = 32 λ → 32 data micro-bumps 필요 (single-ended)
+- PanelScale 실측 밀도: 832 bumps / 768 mm² = 1.083 bumps/mm²
+- 우리 타일 면적: 1600 mm² (2 × 800 mm² dies)
+- available micro-bumps = 1600 × 1.083 ≈ 1733 data bumps
+- per-GPU 최대 WG = 1733 / 32 ≈ 54 WG
+- FB degree 10 → per-pair 최대 WG = 54 / 10 ≈ 5.4 WG/pair
+
+### WG 수 결정 (역산 결과)
+- **x5 = micro-bump-safe 상한** (50 WG/GPU, 1600 bumps, 제약 내 ✓)
+- **x6 = aggressive variant** (60 WG/GPU, 1920 bumps, 1733 대비 11% 초과)
+  - 정당화: 우리 타일이 PanelScale XPU(768mm²)보다 2배 큼
+    → bump 밀도를 1.08 → ~1.2 bumps/mm² 로 올리면 가능
+- 논문 제시: x5 = feasible 상한, x6 = 면적으로 정당화되는 확장
+
+### Power
+- energy efficiency = 1.15 pJ/bit (PanelScale Table 1)
+- interconnect_power = total_WG × 1.024e12 bit/s × 1.15e-12 J/bit
+- x5: 50 WG → 59 W (5.9% of 1 kW TDP)
+- x6: 60 WG → 71 W (7% of 1 kW TDP)
+
+### Optical link latency (확정 — TeraPHY 기반)
+- Reference: Wade et al., "TeraPHY: A Chiplet Technology for Low-Power,
+  High-Bandwidth In-Package Optical I/O," Hot Chips 2019 / IEEE Micro 2020
+- TeraPHY CPO 실측: ~10 ns (E/O + O/E, in-package)
+- glass WG propagation: WG_length / (c/n_glass), n_glass=1.5
+  - dist-5 (324mm): ~2 ns (거의 무시 가능)
+- latency 분해:
+  - E/O + O/E (TeraPHY):     ~10 ns
+  - glass propagation:        ~2 ns
+  - WDM mux/demux (AWG):      ~수 ns
+- **intra-panel optical latency = 100 ns (보수적 기본값)**
+  - CPO 10ns + WDM + IOX coupling + 마진
+  - NVL72(1000ns) 대비 10배 낮음 (switch hop 제거 효과)
+- ablation 대안: 30 ns (실측 기반, TeraPHY 10ns + propagation + WDM)
+- inter-panel fiber latency = 5000 ns (긴 fiber + edge connector)
+
+### Latency 비교 (시뮬레이션 입력)
+| 연결 | latency | 근거 |
+|------|---------|------|
+| NVL72 intra-rack | 1000 ns | NVSwitch hop |
+| 우리 intra-panel | 100 ns | TeraPHY CPO (switch 없음) |
+| 우리 inter-panel | 5000 ns | 긴 fiber |
+
+### BW sweep 파라미터 (확정)
+- intra-panel optical BW = N_WG × 128 GB/s (unidirectional)
+  - 단, ASTRA-Sim convention 확인 후 NVL72와 동일 적용
+- N_WG sweep = [1, 2, 3, 4, 6, 8] (N_WG=3 = x6 bundle 상한; 아래 'N_WG 정의 정정' 참조)
+- latency 고정 = 100 ns
+- 비교: NVL72 (BW=900 GB/s unidir or 1800 bidir, lat=1000 ns)
+- 결론 구조: breakeven WG < feasible 상한(x5~x6)
+  → 물리적 실현가능 + NVL72 능가 동시 증명
+
+### Convention 주의
+- 시뮬레이션 BW가 unidirectional인지 bidirectional인지 확인 필수
+- NVL72와 우리 값에 반드시 동일 convention 적용
+- 양쪽 동일하면 절대값과 무관하게 비율(4.3×)·breakeven 유지
+
+### N_WG 정의 정정 (중요)
+- **N_WG = 방향당(per-direction) WG 수**로 통일
+- intra_opt_bw = N_WG × 128 GB/s (단방향, ASTRA 입력)
+- bundle 매핑: x6 bundle = 총 6 WG = 방향당 3 = N_WG=3
+- micro-bump 상한 (방향당): per-pair 2.7 WG → N_WG 상한 ≈ 3
+- N_WG sweep = [1, 2, 3, 4, 6, 8], N_WG=3이 x6 bundle(상한)
+- N_WG ≥ 4는 micro-bump 초과(aggressive), 타일 면적으로만 정당화
+
 ## README and docs split
 
 The repo has two documentation surfaces with deliberate scope:

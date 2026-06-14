@@ -66,22 +66,31 @@ OSL        = 64    # enough decode steps to reach steady state in controlled mod
 WARMUP_TOK = 8     # ITL indices dropped before taking the steady-state median
 
 # ─────────────────────────── Link model constants ─────────────────────────────
-WG_BW          = 128.0    # GB/s per waveguide group
+# All bandwidths are UNIDIRECTIONAL (ASTRA's analytical send() serializes a
+# chunk over a link at this rate, one direction). N_WG is the per-direction
+# waveguide count: a "x6 bundle" = 6 WG total = 3 TX + 3 RX = N_WG=3.
+WG_BW          = 128.0    # GB/s per waveguide (32 λ × 32 Gb/s, unidirectional)
 ELEC_BW        = 1800.0   # GB/s electrical RDL (adjacent tiles)  — FIXED
 ELEC_LAT       = 100.0    # ns
-INTRA_OPT_LAT  = 300.0    # ns  optical waveguide latency
+INTRA_OPT_LAT  = 100.0    # ns  TeraPHY CPO (E/O+O/E ~10ns + WDM + coupling + margin)
 INTER_LAT      = 5000.0   # ns  inter-panel fiber latency
 
-# NVL72 baseline (1800 GB/s bidirectional NVLink convention).
-# Latency held at 300 ns — on par with the optical waveguide level so the
-# comparison reflects bandwidth, not a latency-assumption mismatch (real
-# NVLink latency is a few hundred ns, not the legacy 1000 ns placeholder).
-NVL72_ELEC_BW = 1800.0
+# NVL72 baseline. Switch-hop removal gives the glass panel a ~10x latency
+# advantage (1000 ns NVSwitch hop vs 100 ns CPO); since the MoE AllToAll is
+# latency-bound this is a core strength, not a neutralized axis. Bandwidth is
+# unidirectional: NVL72's 1800 GB/s is the bidirectional spec → 900 unidir,
+# matching our N_WG×128 unidirectional convention.
+NVL72_ELEC_BW = 900.0     # 1800 GB/s bidirectional → 900 unidirectional
 NVL72_IB_BW   = 50.0      # inter-rack InfiniBand (only used for EP > 64)
-NVL72_LAT     = 300.0
+NVL72_LAT     = 1000.0    # ns  NVSwitch hop
+NVL72_SWITCH_POWER = 540.0  # W/rack  (36 NVSwitch × 15 W); glass = passive WG → 0
 
 # ─────────────────────────── Sweep axes ───────────────────────────────────────
-WG_COUNTS_DEFAULT  = [1, 2, 3, 4, 6, 8, 12]
+# N_WG = per-direction waveguides; intra optical BW = N_WG × 128 GB/s.
+# x6 bundle <-> N_WG=3 (micro-bump per-direction limit, per-pair ~2.7 WG).
+# N_WG >= 4 exceeds the micro-bump budget (aggressive; justified only by the
+# larger tile area). N_WG=3 is the feasible upper bound.
+WG_COUNTS_DEFAULT  = [1, 2, 3, 4, 6, 8]
 INTER_BW_DEFAULT   = [64, 128, 256, 512, 1024]
 
 # panel_name -> (panel_rows, panel_cols)
@@ -544,7 +553,7 @@ def main():
     _wl_b = "per-run" if args.sweep in ("batch", "batch_x_ep") else args.batch_per_instance
     print(f"  workload: N=EP×{_wl_b}, ISL/OSL {args.isl}/{args.osl}, "
           f"max_tokens={args.max_tokens}, arrivals={'t=0' if args.mode=='controlled' else '1ms staggered'}")
-    print(f"  baseline: NVL72 {NVL72_ELEC_BW} GB/s bidirectional")
+    print(f"  baseline: NVL72 {NVL72_ELEC_BW} GB/s unidirectional, {NVL72_LAT:.0f} ns hop")
     print(f"  runs: {len(runs)}   results: {results_csv}")
     print(f"{'='*72}\n")
 
