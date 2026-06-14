@@ -87,10 +87,10 @@ NVL72_SWITCH_POWER = 540.0  # W/rack  (36 NVSwitch × 15 W); glass = passive WG 
 
 # ─────────────────────────── Sweep axes ───────────────────────────────────────
 # N_WG = per-direction waveguides; intra optical BW = N_WG × 128 GB/s.
-# x6 bundle <-> N_WG=3 (micro-bump per-direction limit, per-pair ~2.7 WG).
-# N_WG >= 4 exceeds the micro-bump budget (aggressive; justified only by the
-# larger tile area). N_WG=3 is the feasible upper bound.
-WG_COUNTS_DEFAULT  = [1, 2, 3, 4, 6, 8]
+# The micro-bump cap is grid-dependent (compute_nwg_cap): 4x4 (degree 6) ~ 5,
+# 6x6 (degree 10) ~ 3. The sweep spans both so each panel's cap line lands in
+# range; N_WG beyond a panel's cap is the "aggressive" region on the plot.
+WG_COUNTS_DEFAULT  = [1, 2, 3, 4, 5, 6, 8]
 INTER_BW_DEFAULT   = [64, 128, 256, 512, 1024]
 
 # panel_name -> (panel_rows, panel_cols)
@@ -99,6 +99,32 @@ PANELS = {
     "6x6_4c": (4, 8),   # 32 nodes (rectangular approx of 6×6 minus 4 corners)
     "6x6":    (6, 6),   # 36 nodes
 }
+
+
+def compute_nwg_cap(grid_rows, grid_cols, tile_area_mm2=1600, bump_density=1.083):
+    """Per-direction N_WG cap from the micro-bump budget for an (rows x cols)
+    FlattenedButterfly panel.
+
+    1 WG = 32 lambda = 32 micro-bumps (single-ended).
+    FlattenedButterfly degree = (rows-1) + (cols-1): every GPU links directly to
+    all others in its row and column. Larger grids => higher degree => each pair
+    gets thinner => lower per-pair N_WG cap.
+
+    Returns degree, WG/GPU (both directions), WG/pair (both directions), and the
+    conservative per-direction cap nwg_cap = floor(per-direction WG/pair).
+    """
+    bumps = tile_area_mm2 * bump_density        # 1600 * 1.083 = 1733
+    wg_per_gpu = bumps / 32                      # ~54 WG/GPU (both directions)
+    degree = (grid_rows - 1) + (grid_cols - 1)   # 6x6=10, 4x4=6
+    wg_per_pair_total = wg_per_gpu / degree      # both directions
+    nwg_per_dir = wg_per_pair_total / 2          # split TX/RX
+    return {
+        'degree': degree,
+        'wg_per_gpu': wg_per_gpu,
+        'wg_per_pair_total': wg_per_pair_total,
+        'nwg_per_dir': nwg_per_dir,
+        'nwg_cap': int(nwg_per_dir),   # floor (conservative cap)
+    }
 
 
 def _instance(ep):
@@ -461,7 +487,7 @@ def build_batch_x_ep_runs(panel, wg, inter_opt_bw, batch_list, ep_list, mode):
 
 
 def main():
-    global MODEL_NAME, HARDWARE, NVL72_RACK
+    global MODEL_NAME, HARDWARE, NVL72_RACK, INTER_LAT
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sweep", choices=["intra", "inter", "epscale", "batch", "batch_x_ep"],
                     required=True)
@@ -475,6 +501,9 @@ def main():
                     help="epscale: glass panel (rows cols), default 4x8=32 (6x6-4c)")
     ap.add_argument("--inter-opt-bw", type=int, default=512,
                     help="epscale: glass inter-panel optical egress BW (GB/s)")
+    ap.add_argument("--inter-lat", type=float, default=INTER_LAT,
+                    help="glass inter-panel fiber latency (ns). Default 5000 (long "
+                         "fiber); use ~500 for the co-located rack-scale ablation.")
     ap.add_argument("--nvl72-rack", type=int, default=NVL72_RACK,
                     help="NVLink domain (rack) size used as the cross-rack boundary. "
                          "Lower it (e.g. 4) so a small EP crosses into the inter-rack IB "
@@ -509,6 +538,7 @@ def main():
     HARDWARE = args.hardware
     NPU_MEM["mem_size"] = args.npu_mem_gb
     NVL72_RACK = args.nvl72_rack
+    INTER_LAT = args.inter_lat
     global _MODEL_CFG
     with open(os.path.join(REPO_ROOT, "configs", "model", MODEL_NAME + ".json")) as f:
         _MODEL_CFG = json.load(f)

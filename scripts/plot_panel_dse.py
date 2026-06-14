@@ -18,11 +18,16 @@ Usage:
 
 import argparse
 import csv
+import math
 import os
+import sys
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sweep_panel_dse import PANELS, compute_nwg_cap  # noqa: E402
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DSE_DIR   = os.path.join(REPO_ROOT, "outputs", "panel_dse")
@@ -66,7 +71,21 @@ def plot_intra(rows, metric, ylabel, title, fname):
         nv = [r for r in rows if r["topology"] == "nvl72" and r["ep"] == sub[0]["ep"]]
         if nv:
             ax.axhline(float(nv[0][metric]), color=s["color"], linestyle=":", linewidth=1.5, alpha=0.7)
+        # Per-grid micro-bump cap: vertical line at the feasible<->aggressive
+        # boundary, with the aggressive (N_WG > cap) region shaded. The cap is
+        # the per-direction WG/pair rounded up (compute_nwg_cap floors; the line
+        # marks the boundary still counted as feasible).
+        if p in PANELS:
+            cap_info = compute_nwg_cap(*PANELS[p])
+            cap = math.ceil(cap_info["nwg_per_dir"])
+            ax.axvline(cap, color=s["color"], linestyle="--", linewidth=1.4, alpha=0.8)
+            ax.axvspan(cap, max(xs), color=s["color"], alpha=0.06)
+            ax.annotate(f"{s['label']} cap N_WG={cap}\n(deg {cap_info['degree']})",
+                        xy=(cap, ax.get_ylim()[1]), xytext=(2, -4),
+                        textcoords="offset points", fontsize=7, color=s["color"],
+                        rotation=90, va="top", ha="left", alpha=0.9)
     ax.plot([], [], color="gray", linestyle=":", label="NVL72 ref (matching color)")
+    ax.plot([], [], color="gray", linestyle="--", label="micro-bump cap (feasible ↔ aggressive)")
     ax.set_xlabel("Optical waveguide groups per axis  (1 WG = 128 GB/s)", fontsize=11)
     ax.set_ylabel(ylabel, fontsize=11)
     ax.set_title(title, fontsize=11)

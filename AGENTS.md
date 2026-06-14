@@ -485,78 +485,73 @@ These must match the C++ enum in `astra-sim/astra-sim/system/AstraMemoryAPI.hh`.
 
 ## Physical Design Constants (Glass-Photonic FB) — 확정값
 
-### Waveguide bandwidth (단방향 기준)
-- 1 WG = 32 λ × 32 Gb/s/λ = 1.024 Tb/s = 128 GB/s (unidirectional)
-- WG는 단방향 매체. 양방향은 TX WG + RX WG 별도 필요.
-- bundle 해석: x6 = 6 WG total = 3 TX + 3 RX
-  - per-pair unidirectional = 3 × 128 = 384 GB/s
-  - per-pair bidirectional  = 768 GB/s
+### Waveguide bandwidth & N_WG convention
+- 1 WG = 32 λ × 32 Gb/s = 1.024 Tb/s = **128 GB/s (unidirectional)**. WG는 단방향
+  매체 → 양방향은 TX WG + RX WG 별도.
+- **N_WG = 방향당(per-direction) WG 수** (canonical 정의). ASTRA 입력은 단방향:
+  `intra_opt_bw = N_WG × 128 GB/s`.
+- bundle 매핑: x{K} bundle = K WG total = K/2 per direction.
+  예: **x6 = 6 WG total = 3 TX + 3 RX = N_WG=3** (per-pair 단방향 384 GB/s, 양방향 768).
 
-### Micro-bump 제약 (WG 수 상한 결정 근거 — CRITICAL)
-- 1 WG = 32 λ → 32 data micro-bumps 필요 (single-ended)
-- PanelScale 실측 밀도: 832 bumps / 768 mm² = 1.083 bumps/mm²
-- 우리 타일 면적: 1600 mm² (2 × 800 mm² dies)
-- available micro-bumps = 1600 × 1.083 ≈ 1733 data bumps
-- per-GPU 최대 WG = 1733 / 32 ≈ 54 WG
-- FB degree 10 → per-pair 최대 WG = 54 / 10 ≈ 5.4 WG/pair
+### Micro-bump 제약 → 격자별 N_WG 상한 (CRITICAL)
+WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 (격자별로 다름).
 
-### WG 수 결정 (역산 결과)
-- **x5 = micro-bump-safe 상한** (50 WG/GPU, 1600 bumps, 제약 내 ✓)
-- **x6 = aggressive variant** (60 WG/GPU, 1920 bumps, 1733 대비 11% 초과)
-  - 정당화: 우리 타일이 PanelScale XPU(768mm²)보다 2배 큼
-    → bump 밀도를 1.08 → ~1.2 bumps/mm² 로 올리면 가능
-- 논문 제시: x5 = feasible 상한, x6 = 면적으로 정당화되는 확장
+기본 상수:
+- 1 WG = 32 λ → 32 data micro-bumps (single-ended)
+- 타일 1600 mm² (2 × 800 mm² dies), bump 밀도 1.083 bumps/mm² (PanelScale 실측: 832/768mm²)
+- 예산 = 1600 × 1.083 ≈ 1733 bumps → **54 WG/GPU** (양방향 총합)
+
+계산: 54 WG/GPU ÷ degree[=(rows-1)+(cols-1)] = WG/pair(총) ÷ 2 = 방향당 N_WG 상한.
+
+| 격자 | degree | WG/pair(총) | N_WG/dir | cap(floor) | 그래프선(ceil) | bundle |
+|------|--------|-------------|----------|------------|----------------|--------|
+| 4×4  | 6      | 9.0         | 4.5      | 4          | 5              | x9~10  |
+| 6×6 / 6×6-4c | 10 | 5.4      | 2.7      | 2          | 3              | x6     |
+| 8×8  | 14     | 3.9         | 1.9      | 1          | 2              | x4     |
+
+- degree↑(큰 격자) → pair 많아 가늘어짐 → 상한↓; degree↓(작은 격자) → 굵어짐 → 상한↑.
+- **feasible(N_WG ≤ cap)** vs **aggressive(N_WG > cap)**: aggressive는 타일 면적 증대 /
+  bump 밀도 상향으로만 정당화 (예: 6×6 N_WG=3 = 60 WG/GPU = 1733 대비 11% 초과;
+  우리 타일이 PanelScale XPU 768mm²의 2배라 밀도 1.08→~1.2로 올리면 가능).
+- trade-off: **4×4** = pair당 BW 높음(cap 5)·제조 쉬움 / 패널당 16 GPU → inter-panel 일찍.
+  **6×6-4c** = 패널당 32 GPU(큰 EP 단일 패널) / pair당 BW 제한(cap 3).
+- 코드: `compute_nwg_cap(rows, cols)` 가 degree·상한 자동 계산. `plot_panel_dse.py`가
+  격자별 cap선(수직 점선, ceil) + aggressive 음영을 그린다.
+- **논문 결론 구조: breakeven N_WG < feasible cap → 실현가능 + NVL72 능가 동시 증명.**
 
 ### Power
 - energy efficiency = 1.15 pJ/bit (PanelScale Table 1)
 - interconnect_power = total_WG × 1.024e12 bit/s × 1.15e-12 J/bit
-- x5: 50 WG → 59 W (5.9% of 1 kW TDP)
-- x6: 60 WG → 71 W (7% of 1 kW TDP)
+- x5 (50 WG/GPU) → 59 W (5.9% TDP), x6 (60 WG/GPU) → 71 W (7% of 1 kW TDP)
+- vs NVL72 NVSwitch **540 W/rack** (36 × 15 W); 우리는 passive WG → switch 전력 0
+- per-GPU 집계 BW: 글래스 7.68 TB/s vs NVL72 1.8 TB/s = **4.3×**
 
-### Optical link latency (확정 — TeraPHY 기반)
-- Reference: Wade et al., "TeraPHY: A Chiplet Technology for Low-Power,
-  High-Bandwidth In-Package Optical I/O," Hot Chips 2019 / IEEE Micro 2020
-- TeraPHY CPO 실측: ~10 ns (E/O + O/E, in-package)
-- glass WG propagation: WG_length / (c/n_glass), n_glass=1.5
-  - dist-5 (324mm): ~2 ns (거의 무시 가능)
-- latency 분해:
-  - E/O + O/E (TeraPHY):     ~10 ns
-  - glass propagation:        ~2 ns
-  - WDM mux/demux (AWG):      ~수 ns
-- **intra-panel optical latency = 100 ns (보수적 기본값)**
-  - CPO 10ns + WDM + IOX coupling + 마진
-  - NVL72(1000ns) 대비 10배 낮음 (switch hop 제거 효과)
-- ablation 대안: 30 ns (실측 기반, TeraPHY 10ns + propagation + WDM)
-- inter-panel fiber latency = 5000 ns (긴 fiber + edge connector)
+### Optical link latency (TeraPHY 기반)
+- Ref: Wade et al., "TeraPHY: A Chiplet Technology for Low-Power, High-Bandwidth
+  In-Package Optical I/O," Hot Chips 2019 / IEEE Micro 2020
+- 분해: E/O+O/E (CPO) ~10 ns + glass propagation ~2 ns (dist-5 324mm, n=1.5)
+  + WDM mux/demux (AWG) ~수 ns
+- **intra-panel optical = 100 ns (보수적 기본값)** = CPO 10 + WDM + IOX coupling + 마진.
+  ablation 대안 30 ns (실측 기반).
+- **inter-panel fiber = 5000 ns** (긴 fiber + edge connector).
+  ⚠️ co-located(rack-scale) 패널이면 과대평가일 수 있음 → 500 ns ablation 권장.
 
 ### Latency 비교 (시뮬레이션 입력)
 | 연결 | latency | 근거 |
 |------|---------|------|
 | NVL72 intra-rack | 1000 ns | NVSwitch hop |
-| 우리 intra-panel | 100 ns | TeraPHY CPO (switch 없음) |
-| 우리 inter-panel | 5000 ns | 긴 fiber |
+| 우리 intra-panel | 100 ns | TeraPHY CPO (switch 없음, 10× 낮음) |
+| 우리 inter-panel | 5000 ns | 긴 fiber (sensitivity: ablation 500 ns) |
 
-### BW sweep 파라미터 (확정)
-- intra-panel optical BW = N_WG × 128 GB/s (unidirectional)
-  - 단, ASTRA-Sim convention 확인 후 NVL72와 동일 적용
-- N_WG sweep = [1, 2, 3, 4, 6, 8] (N_WG=3 = x6 bundle 상한; 아래 'N_WG 정의 정정' 참조)
-- latency 고정 = 100 ns
-- 비교: NVL72 (BW=900 GB/s unidir or 1800 bidir, lat=1000 ns)
-- 결론 구조: breakeven WG < feasible 상한(x5~x6)
-  → 물리적 실현가능 + NVL72 능가 동시 증명
+### Sweep & NVL72 baseline
+- **N_WG sweep = [1, 2, 3, 4, 5, 6, 8]** (각 격자 cap선 포함: 4×4→5, 6×6→3)
+- intra latency 고정 = 100 ns
+- NVL72 baseline: **BW 900 GB/s unidirectional** (1800 bidir ÷2), **latency 1000 ns**,
+  inter-rack IB 50 GB/s @EP>64
 
-### Convention 주의
-- 시뮬레이션 BW가 unidirectional인지 bidirectional인지 확인 필수
-- NVL72와 우리 값에 반드시 동일 convention 적용
-- 양쪽 동일하면 절대값과 무관하게 비율(4.3×)·breakeven 유지
-
-### N_WG 정의 정정 (중요)
-- **N_WG = 방향당(per-direction) WG 수**로 통일
-- intra_opt_bw = N_WG × 128 GB/s (단방향, ASTRA 입력)
-- bundle 매핑: x6 bundle = 총 6 WG = 방향당 3 = N_WG=3
-- micro-bump 상한 (방향당): per-pair 2.7 WG → N_WG 상한 ≈ 3
-- N_WG sweep = [1, 2, 3, 4, 6, 8], N_WG=3이 x6 bundle(상한)
-- N_WG ≥ 4는 micro-bump 초과(aggressive), 타일 면적으로만 정당화
+### Convention 주의 (uni/bi)
+- ASTRA BW 입력은 **unidirectional**. NVL72·글래스 모두 단방향으로 통일 적용.
+- 양쪽 동일 convention이면 절대값과 무관하게 비율(4.3×)·breakeven 유지.
 
 ## README and docs split
 
