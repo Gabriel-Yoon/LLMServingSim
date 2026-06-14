@@ -113,13 +113,18 @@ def make_panel_config(rows, cols, ep, wg_count, inter_bw):
     }
 
 
+NVL72_RACK = 64    # NVLink domain size used as the rack boundary (largest pow2 <=72 dividing 256/384)
+
 def make_nvl72_config(ep):
-    """NVL72 baseline: flat 1800 GB/s for EP<=64, multi-rack [64,k] for EP>64."""
+    """NVL72 baseline: a 64-GPU NVLink domain (1800 GB/s); beyond it, EP spans
+    racks over InfiniBand (~50 GB/s). EP<=64 → flat NVLink; EP>64 → [64, ep/64]
+    with the cross-rack dim at IB bandwidth. This inter-rack IB cliff is the
+    weak point large models hit, since they need EP >> 64."""
     return {
         "num_nodes": 1,
         "topology_config": {
-            "type": "hierarchical_fb", "panel_size": 128, "tile_size": 64,
-            "elec_bw": NVL72_ELEC_BW, "intra_opt_bw": NVL72_IB_BW, "inter_bw": 0.0,
+            "type": "hierarchical_fb", "panel_size": NVL72_RACK, "tile_size": NVL72_RACK,
+            "elec_bw": NVL72_ELEC_BW, "intra_opt_bw": NVL72_ELEC_BW, "inter_bw": NVL72_IB_BW,
             "elec_latency": NVL72_LAT, "intra_opt_latency": NVL72_LAT, "inter_latency": NVL72_LAT,
         },
         "nodes": [_node(ep)],
@@ -267,6 +272,29 @@ def build_intra_runs(panels, wg_counts, mode, isl, osl):
     return runs
 
 
+def build_epscale_runs(panel, wg, inter_opt_bw, ep_list, mode):
+    """EP-scaling: sweep EP, compare glass-FB (multi-panel optical) vs NVL72
+    (NVLink rack + inter-rack IB cliff). The large-model story — at EP >> 64
+    NVL72 falls to IB while the glass panel's optical inter-panel BW holds."""
+    rows, cols = panel
+    panel_size = rows * cols
+    runs = []
+    for ep in ep_list:
+        # glass FB: single panel if EP fits, else multi-panel over optical fiber
+        multi = ep > panel_size
+        cfg = make_panel_config(rows, cols, ep, wg_count=wg,
+                                inter_bw=(inter_opt_bw if multi else 0.0))
+        runs.append((f"epscale_fb_ep{ep}", cfg, ep,
+                     {"sweep": "epscale", "mode": mode, "topology": "glass_fb", "panel": panel_size,
+                      "ep": ep, "wg_count": wg, "intra_opt_bw": int(wg * WG_BW),
+                      "inter_bw": (inter_opt_bw if multi else 0)}))
+        runs.append((f"epscale_nvl72_ep{ep}", make_nvl72_config(ep), ep,
+                     {"sweep": "epscale", "mode": mode, "topology": "nvl72", "panel": NVL72_RACK,
+                      "ep": ep, "wg_count": 0, "intra_opt_bw": int(NVL72_ELEC_BW),
+                      "inter_bw": (NVL72_IB_BW if ep > NVL72_RACK else 0)}))
+    return runs
+
+
 def build_inter_runs(panels, inter_bws, fixed_wg, mode, isl, osl):
     runs = []
     for pname in panels:
@@ -292,7 +320,13 @@ def build_inter_runs(panels, inter_bws, fixed_wg, mode, isl, osl):
 def main():
     global MODEL_NAME, HARDWARE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sweep", choices=["intra", "inter"], required=True)
+    ap.add_argument("--sweep", choices=["intra", "inter", "epscale"], required=True)
+    ap.add_argument("--ep-list", nargs="+", type=int, default=[16, 32, 64, 128, 256],
+                    help="epscale: EP degrees to sweep (must divide model experts)")
+    ap.add_argument("--epscale-panel", nargs=2, type=int, default=[4, 8],
+                    help="epscale: glass panel (rows cols), default 4x8=32 (6x6-4c)")
+    ap.add_argument("--inter-opt-bw", type=int, default=512,
+                    help="epscale: glass inter-panel optical egress BW (GB/s)")
     ap.add_argument("--mode", choices=["controlled", "realistic"], default="controlled")
     ap.add_argument("--panels", nargs="+", default=["4x4", "6x6_4c", "6x6"], choices=list(PANELS))
     ap.add_argument("--wg", nargs="+", type=int, default=WG_COUNTS_DEFAULT, help="intra: WG counts")
@@ -329,14 +363,21 @@ def main():
 
     if args.sweep == "intra":
         runs = build_intra_runs(args.panels, args.wg, args.mode, args.isl, args.osl)
+    elif args.sweep == "epscale":
+        runs = build_epscale_runs(tuple(args.epscale_panel), args.fixed_wg, args.inter_opt_bw,
+                                  args.ep_list, args.mode)
     else:
         runs = build_inter_runs(args.panels, args.inter_bw, args.fixed_wg, args.mode, args.isl, args.osl)
 
     print(f"\n{'='*72}")
-    print(f"Panel DSE — sweep={args.sweep}  mode={args.mode}  panels={args.panels}")
+    print(f"Panel DSE — sweep={args.sweep}  mode={args.mode}  model={MODEL_NAME} hw={HARDWARE}")
     print(f"  electrical RDL (fixed): {ELEC_BW} GB/s / {ELEC_LAT} ns")
     if args.sweep == "intra":
         print(f"  WG counts: {args.wg}  (optical = WG×{WG_BW:.0f} GB/s)")
+    elif args.sweep == "epscale":
+        print(f"  EP list: {args.ep_list}  glass panel {args.epscale_panel} wg{args.fixed_wg}, "
+              f"inter-panel optical {args.inter_opt_bw} GB/s  vs  NVL72 (NVLink {NVL72_ELEC_BW} / "
+              f"inter-rack IB {NVL72_IB_BW} @EP>{NVL72_RACK})")
     else:
         print(f"  fixed intra WG: {args.fixed_wg} (={int(args.fixed_wg*WG_BW)} GB/s)  inter_bw sweep: {args.inter_bw}")
     print(f"  workload: N=EP×{args.batch_per_instance}, ISL/OSL {args.isl}/{args.osl}, "
