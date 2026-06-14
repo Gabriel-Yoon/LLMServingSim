@@ -10,6 +10,11 @@ class Request:
         self.is_init = is_init
         self.original_input = input
         self.num_computed_tokens = 0  # Tracks actual computed tokens (vLLM style)
+        # Prefill→decode KV-cache transfer (disaggregated serving): when a
+        # prefill instance hands a request to a decode instance, the decode
+        # cannot start until the request's KV cache has crossed the fabric.
+        # decode_ready_time (-1 = no transfer pending) gates decode scheduling.
+        self.decode_ready_time = -1
         self.evict = False
         self.end_time = -1
         self.latency = -1
@@ -42,6 +47,12 @@ class Request:
     # to print the request information
     def __str__(self):
         return str(self.__dict__) 
+
+    def ready_time(self):
+        """Earliest time this request may be scheduled. Equals arrival, unless a
+        prefill→decode KV transfer is pending (then it's the transfer-complete
+        time). Preserves the original arrival for latency/TTFT accounting."""
+        return self.arrival if self.decode_ready_time < 0 else max(self.arrival, self.decode_ready_time)
 
     def add_latency(self, end_time):
         self.end_time = end_time

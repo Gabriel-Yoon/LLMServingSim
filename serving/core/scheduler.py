@@ -70,7 +70,7 @@ class Scheduler:
                 return None
 
             # scheduling start
-            batch_req = [req for req in self.request if req.arrival <= current]
+            batch_req = [req for req in self.request if req.ready_time() <= current]
 
             # max_num_seqs limits total running requests (vLLM behavior)
             running_reqs = sum(len(b.requests) for b in self.inflight)
@@ -330,7 +330,7 @@ class Scheduler:
                 return None
 
             # scheduling start
-            batch_req = [req for req in self.request if req.arrival <= current]
+            batch_req = [req for req in self.request if req.ready_time() <= current]
 
             # max_num_seqs limits total running requests (vLLM behavior)
             running_reqs = sum(len(b.requests) for b in self.inflight)

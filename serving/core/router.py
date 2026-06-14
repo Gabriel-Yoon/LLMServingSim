@@ -10,10 +10,17 @@ class Router:
             num_instances,
             schedulers, req_num,
             routing_policy="RR",
-            seed=42
+            seed=42,
+            kv_transfer_bw=0.0,
+            kv_transfer_latency=0.0,
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
+        # Inter-pool fabric bandwidth/latency for the prefill→decode KV-cache
+        # transfer in disaggregated serving. GB/s == bytes/ns, so transfer_ns =
+        # kv_bytes / bw + latency. 0 → instantaneous (transfer not modeled).
+        self.kv_transfer_bw = float(kv_transfer_bw)
+        self.kv_transfer_latency = float(kv_transfer_latency)
         self.prefill_schedulers = [s for s in schedulers if s.pd_type != "decode"]
         self.prefill_instances = len(self.prefill_schedulers)
         self.decode_schedulers = [s for s in schedulers if s.pd_type == "decode"]
@@ -306,7 +313,22 @@ class Router:
                 scheduler.pd_type
             )
 
-    def transfer_prefill_request(self, requests):
+    def transfer_prefill_request(self, requests, current=0):
+        """Hand prefilled requests to decode instances. The request's KV cache
+        must cross the inter-pool fabric first, so decode cannot begin until
+        ``current + kv_bytes/bw + latency`` (disaggregated-serving transfer)."""
         for req in requests:
             instance_id = self._select_instance(self.decode_instances)
-            self.decode_schedulers[instance_id].add_decode(req)
+            dec = self.decode_schedulers[instance_id]
+            if self.kv_transfer_bw > 0:
+                kv_bytes = dec.memory.get_total_kv(req)
+                transfer_ns = kv_bytes / self.kv_transfer_bw + self.kv_transfer_latency
+                req.decode_ready_time = current + int(transfer_ns)
+            dec.add_decode(req)
+
+    def next_decode_ready(self, current):
+        """Smallest future decode_ready_time across decode instances (KV still
+        in flight), or None. Lets the main loop advance idle time to it."""
+        future = [r.decode_ready_time for s in self.decode_schedulers
+                  for r in s.request if r.decode_ready_time > current]
+        return min(future) if future else None

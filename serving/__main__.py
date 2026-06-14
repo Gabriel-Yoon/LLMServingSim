@@ -341,7 +341,9 @@ def main():
     # Controller for astra-sim process communication
     controller = Controller(total_npu)
     # Global Request Router
-    router = Router(num_instances, schedulers, num_req, request_routing_policy)
+    router = Router(num_instances, schedulers, num_req, request_routing_policy,
+                    kv_transfer_bw=cluster.get("link_bw", 0.0),
+                    kv_transfer_latency=cluster.get("link_latency", 0.0))
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)
@@ -475,7 +477,7 @@ def main():
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
-            router.transfer_prefill_request(finished_reqs)
+            router.transfer_prefill_request(finished_reqs, current)
 
         # schedule requests
         new_req = schedulers[instance_id].schedule(current, sys, id)
@@ -812,10 +814,20 @@ def main():
             # If all instances are idle but deferred sessions have pending
             # requests with future arrival times (tool calls still running),
             # advance current time so the next iteration can pick them up.
+            # Candidate future times to advance idle simulation to: next pending
+            # arrival (router queue / deferred agentic sessions) and the next
+            # prefill→decode KV-transfer completion (decode waiting on KV).
+            candidates = []
             if router.has_deferred_sessions() or router.has_pending_requests():
-                next_arrival = router.get_next_pending_arrival()
-                if next_arrival is not None and next_arrival > current:
-                    current = next_arrival
+                na = router.get_next_pending_arrival()
+                if na is not None:
+                    candidates.append(na)
+            kv_ready = router.next_decode_ready(current)
+            if kv_ready is not None:
+                candidates.append(kv_ready)
+            future = [t for t in candidates if t > current]
+            if future:
+                current = min(future)
             controller.write_flush(p, "pass")
         
         # flush
