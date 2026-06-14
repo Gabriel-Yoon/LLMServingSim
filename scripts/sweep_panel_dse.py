@@ -73,7 +73,9 @@ WG_BW          = 128.0    # GB/s per waveguide (32 λ × 32 Gb/s, unidirectional
 ELEC_BW        = 1800.0   # GB/s electrical RDL (adjacent tiles)  — FIXED
 ELEC_LAT       = 100.0    # ns
 INTRA_OPT_LAT  = 100.0    # ns  TeraPHY CPO (E/O+O/E ~10ns + WDM + coupling + margin)
-INTER_LAT      = 5000.0   # ns  inter-panel fiber latency
+INTER_LAT      = 500.0    # ns  inter-panel: edge transceiver (~50-200ns) + short
+                          # co-located fiber (1-2m, ~5-10ns); 5x the in-package
+                          # intra CPO. (5000ns would imply ~1km fiber — not co-located.)
 
 # NVL72 baseline. Switch-hop removal gives the glass panel a ~10x latency
 # advantage (1000 ns NVSwitch hop vs 100 ns CPO); since the MoE AllToAll is
@@ -502,8 +504,8 @@ def main():
     ap.add_argument("--inter-opt-bw", type=int, default=512,
                     help="epscale: glass inter-panel optical egress BW (GB/s)")
     ap.add_argument("--inter-lat", type=float, default=INTER_LAT,
-                    help="glass inter-panel fiber latency (ns). Default 5000 (long "
-                         "fiber); use ~500 for the co-located rack-scale ablation.")
+                    help="glass inter-panel fiber latency (ns). Default 500 (co-located: "
+                         "edge transceiver + short fiber); <1%% TPOT effect (BW-bound).")
     ap.add_argument("--nvl72-rack", type=int, default=NVL72_RACK,
                     help="NVLink domain (rack) size used as the cross-rack boundary. "
                          "Lower it (e.g. 4) so a small EP crosses into the inter-rack IB "

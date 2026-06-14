@@ -491,7 +491,8 @@ These must match the C++ enum in `astra-sim/astra-sim/system/AstraMemoryAPI.hh`.
 - **N_WG = 방향당(per-direction) WG 수** (canonical 정의). ASTRA 입력은 단방향:
   `intra_opt_bw = N_WG × 128 GB/s`.
 - bundle 매핑: x{K} bundle = K WG total = K/2 per direction.
-  예: **x6 = 6 WG total = 3 TX + 3 RX = N_WG=3** (per-pair 단방향 384 GB/s, 양방향 768).
+  예: 6×6-4c cap **x6 = 3 TX + 3 RX = N_WG=3** (단방향 384 GB/s); 4×4 cap **x10 = N_WG=5**
+  (640 GB/s). **cap은 격자마다 다르다** (아래 표) — N_WG=3은 6×6 cap이지 보편값 아님.
 
 ### Micro-bump 제약 → 격자별 N_WG 상한 (CRITICAL)
 WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 (격자별로 다름).
@@ -517,7 +518,8 @@ WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 
   **6×6-4c** = 패널당 32 GPU(큰 EP 단일 패널) / pair당 BW 제한(cap 3).
 - 코드: `compute_nwg_cap(rows, cols)` 가 degree·상한 자동 계산. `plot_panel_dse.py`가
   격자별 cap선(수직 점선, ceil) + aggressive 음영을 그린다.
-- **논문 결론 구조: breakeven N_WG < feasible cap → 실현가능 + NVL72 능가 동시 증명.**
+- **논문 결론 구조: breakeven N_WG < feasible cap → 실현가능 + NVL72 능가 동시 증명**
+  (단, 아래 'Collective topology 주의'의 inter-panel 모델 수정 후 재확인 대상).
 
 ### Power
 - energy efficiency = 1.15 pJ/bit (PanelScale Table 1)
@@ -533,18 +535,22 @@ WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 
   + WDM mux/demux (AWG) ~수 ns
 - **intra-panel optical = 100 ns (보수적 기본값)** = CPO 10 + WDM + IOX coupling + 마진.
   ablation 대안 30 ns (실측 기반).
-- **inter-panel fiber = 5000 ns** (긴 fiber + edge connector).
-  ⚠️ co-located(rack-scale) 패널이면 과대평가일 수 있음 → 500 ns ablation 권장.
+- **inter-panel fiber = 500 ns** (co-located: edge transceiver ~50-200ns + 짧은
+  fiber 1-2m ~5-10ns = intra의 5배). 5000ns는 ~1km fiber라 비현실적이라 폐기.
+  ablation: 500↔5000 ns가 TPOT <1% (BW-bound) → 값 자체는 결과에 robust.
 
 ### Latency 비교 (시뮬레이션 입력)
 | 연결 | latency | 근거 |
 |------|---------|------|
 | NVL72 intra-rack | 1000 ns | NVSwitch hop |
 | 우리 intra-panel | 100 ns | TeraPHY CPO (switch 없음, 10× 낮음) |
-| 우리 inter-panel | 5000 ns | 긴 fiber (sensitivity: ablation 500 ns) |
+| 우리 inter-panel | 500 ns | edge transceiver + 짧은 fiber (intra의 5배; <1% 영향) |
 
 ### Sweep & NVL72 baseline
 - **N_WG sweep = [1, 2, 3, 4, 5, 6, 8]** (각 격자 cap선 포함: 4×4→5, 6×6→3)
+- **epscale/headline은 각 패널을 자기 cap의 N_WG로 실행**: 4×4 → `--fixed-wg 5`,
+  6×6-4c → `--fixed-wg 3`. ⚠️ 단일 N_WG를 모든 패널에 쓰지 말 것 — 4×4를 wg3로 돌리면
+  intra optical 384 GB/s(제대로면 640)로 glass 과소provisioning.
 - intra latency 고정 = 100 ns
 - NVL72 baseline: **BW 900 GB/s unidirectional** (1800 bidir ÷2), **latency 1000 ns**,
   inter-rack IB 50 GB/s @EP>64
@@ -552,6 +558,16 @@ WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 
 ### Convention 주의 (uni/bi)
 - ASTRA BW 입력은 **unidirectional**. NVL72·글래스 모두 단방향으로 통일 적용.
 - 양쪽 동일 convention이면 절대값과 무관하게 비율(4.3×)·breakeven 유지.
+
+### Collective topology 주의 (open issue — 헤드라인 미발현 원인)
+- 현재 inter-panel을 **Ring**으로 모델 → 패널 多(4×4 8장 @ EP=128)면 ring step↑로
+  glass가 과도하게 느려 **EP>rack crossover가 미발현** (EP=128에서 NVL72 16.3 < glass 29.5).
+  PanelScale의 **optical crossbar**(≤1-2홉)를 반영하려면 `config_builder`의 inter-panel
+  dim을 Ring → Switch/FlattenedButterfly로 바꿔야 함.
+- NVL72 IB cliff도 ring 분해상 inter-rack이 1-2 step만 들어가 **과소 페널티** 의심
+  (EP=64→128에서 13.4→16.3로 거의 안 오름) — collective 분해/`involved_dim` 점검 필요.
+- 이 둘이 glass 불리·NVL72 유리로 치우쳐 reach 헤드라인이 안 나옴. latency/BW 가정이
+  아니라 **collective topology 구조 문제** → 모델 수정이 선결.
 
 ## README and docs split
 
