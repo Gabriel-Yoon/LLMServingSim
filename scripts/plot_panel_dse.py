@@ -103,6 +103,30 @@ def plot_inter(rows, fname):
     _save(fig, fname)
 
 
+def plot_epscale(rows, fname, title="EP-scaling: glass-FB vs NVL72"):
+    """TPOT vs EP, glass_fb vs nvl72. NVL72 should cliff up at EP>64 (IB)."""
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    styles = {"glass_fb": dict(color="#2ca02c", marker="o", label="Glass FB (optical inter-panel)"),
+              "nvl72": dict(color="#d62728", marker="s", label="NVL72 (NVLink + inter-rack IB)")}
+    for topo, s in styles.items():
+        sub = sorted([r for r in rows if r["topology"] == topo], key=lambda r: int(r["ep"]))
+        if not sub:
+            continue
+        xs = [int(r["ep"]) for r in sub]
+        ys = [float(r["tpot_steady_ms"]) for r in sub]
+        ax.plot(xs, ys, lw=2.5, markersize=7, **s)
+    ax.axvline(64, color="gray", ls=":", alpha=0.6)
+    ax.text(64, ax.get_ylim()[0], " NVL72 rack=64", color="gray", fontsize=8, va="bottom")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("Expert-parallel degree EP", fontsize=11)
+    ax.set_ylabel("TPOT [ms]  (decode; lower = better)", fontsize=11)
+    ax.set_title(title, fontsize=11)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, which="both")
+    ax.set_ylim(bottom=0)
+    _save(fig, fname)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="controlled", choices=["controlled", "realistic"])
@@ -110,6 +134,15 @@ def main():
 
     intra = load(os.path.join(DSE_DIR, f"dse_intra_{args.mode}.csv"))
     inter = load(os.path.join(DSE_DIR, f"dse_inter_{args.mode}.csv"))
+
+    import glob
+    for ep_csv in glob.glob(os.path.join(DSE_DIR, "dse_epscale*.csv")):
+        rows = load(ep_csv)
+        if rows:
+            tag = os.path.basename(ep_csv).replace("dse_epscale_", "").replace(".csv", "")
+            print(f"epscale[{tag}]: {len(rows)} ok rows")
+            plot_epscale(rows, f"epscale_tpot_vs_ep_{tag}.png",
+                         title=f"EP-scaling ({tag}): glass-FB vs NVL72 (IB cliff at EP>64)")
 
     if intra:
         print(f"intra: {len(intra)} ok rows")
