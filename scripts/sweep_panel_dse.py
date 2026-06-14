@@ -40,6 +40,7 @@ import csv
 import json
 import os
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -47,6 +48,9 @@ import time
 
 REPO_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VOCAB_SIZE = 151936
+
+# Loaded in main() from configs/model/<model>.json — used by analytical_estimates.
+_MODEL_CFG = {}
 
 # ─────────────────────────── Fixed hardware / model ───────────────────────────
 MODEL_NAME = "Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -195,14 +199,93 @@ def parse_metrics(out_csv_abs):
     }
 
 
+# ─────────────────────────── Exposed-communication parse ──────────────────────
+_EXPOSED_RE = re.compile(
+    r"NPU\[(\d+)\] iteration (\d+) finished, (\d+) cycles, "
+    r"exposed communication (\d+) cycles")
+
+
+def parse_exposed_log(text):
+    """Pull ASTRA's per-NPU 'exposed communication' from the controller INFO log.
+
+    The value is CUMULATIVE (curr_tick - accumulated gpu-op ticks), so the last
+    iteration per NPU holds the run total. We average total/exposed across NPUs.
+    Returns total_cycles, exposed_cycles, compute_cycles (= total - exposed,
+    i.e. the overlapped GPU-op time), and exposed_frac (exposed / total).
+    """
+    last = {}  # sys -> (iteration, total_cycles, exposed_cycles)
+    for m in _EXPOSED_RE.finditer(text or ""):
+        sysid, it, cyc, exc = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+        if sysid not in last or it > last[sysid][0]:
+            last[sysid] = (it, cyc, exc)
+    if not last:
+        return None
+    tot = [v[1] for v in last.values()]
+    exp = [v[2] for v in last.values()]
+    total_cycles = sum(tot) / len(tot)
+    exposed_cycles = sum(exp) / len(exp)
+    compute_cycles = max(0.0, total_cycles - exposed_cycles)
+    return {
+        "total_cycles": total_cycles,
+        "exposed_cycles": exposed_cycles,
+        "compute_cycles": compute_cycles,
+        "exposed_frac": (exposed_cycles / total_cycles) if total_cycles > 0 else 0.0,
+    }
+
+
+def analytical_estimates(model_cfg, ep, batch_per_inst, inter_bw, intra_bw, fp_bytes=2):
+    """Analytical companions to the logged exposed metric (for interpretation only).
+
+    all_to_all_us : raw per-iteration AG+RS time if fully serialized on the
+                    inter-GPU link (dispatch local chunk + combine total buffer),
+                    summed over MoE layers. This is the comm BEFORE compute overlap.
+    weight_load_us: per-rank expert-weight HBM load time per iteration — the
+                    decode bottleneck that determines how much of all_to_all_us
+                    is hidden. experts shrink as 1/EP, so this falls with EP.
+    """
+    hidden = model_cfg["hidden_size"]
+    n_layers = model_cfg["num_hidden_layers"]
+    n_experts = model_cfg.get("num_local_experts") or model_cfg.get("n_routed_experts") or 0
+    k = model_cfg.get("num_experts_per_tok", 1)
+    moe_ffn = model_cfg.get("moe_intermediate_size", model_cfg.get("intermediate_size", hidden))
+    mem_bw = NPU_MEM["mem_bw"]  # GB/s
+
+    # decode total_len per instance ~ batch_per_inst (controlled accumulation).
+    total_len = max(1, batch_per_inst)
+    # AG dispatch local chunk + RS combine total buffer (mirrors trace_generator).
+    eff_comm_tok = total_len  # dp_sum anchoring not applied in this single-instance estimate
+    dispatch_bytes = max(1, eff_comm_tok // max(ep, 1)) * (hidden + n_experts) * fp_bytes
+    combine_bytes = eff_comm_tok * hidden * fp_bytes
+    link_bw_Bpns = max(inter_bw, 1e-9)  # GB/s == B/ns
+    a2a_us_per_layer = (dispatch_bytes + combine_bytes) / link_bw_Bpns / 1000.0
+    all_to_all_us = a2a_us_per_layer * n_layers
+
+    # per-rank expert weights: experts_per_rank * (gate_up + down) bytes.
+    experts_per_rank = max(1, n_experts // max(ep, 1))
+    per_expert_bytes = 3 * hidden * moe_ffn * fp_bytes  # gate_up (2x) + down
+    weight_bytes = experts_per_rank * per_expert_bytes
+    weight_load_us = (weight_bytes / (mem_bw)) / 1000.0 * n_layers
+
+    return {"all_to_all_us": all_to_all_us, "weight_load_us": weight_load_us}
+
+
 # ─────────────────────────── Run one config ───────────────────────────────────
-CSV_FIELDS = ["label", "sweep", "mode", "topology", "panel", "ep", "wg_count",
-              "intra_opt_bw", "inter_bw", "status", "ttft_ms", "e2e_latency_ms",
-              "tpot_avg_ms", "tpot_steady_ms", "interactivity_tok_s_user",
-              "n_completed", "elapsed_s", "error"]
+CSV_FIELDS = ["label", "sweep", "mode", "topology", "fabric", "panel", "ep",
+              "per_device_batch", "wg_count", "intra_opt_bw", "inter_bw", "status",
+              "ttft_ms", "e2e_latency_ms", "tpot_avg_ms", "tpot_steady_ms",
+              "interactivity_tok_s_user", "n_completed",
+              "total_cycles", "exposed_cycles", "compute_cycles", "exposed_frac",
+              "all_to_all_us", "weight_load_us",
+              "elapsed_s", "error"]
 
 
 def run_one(label, cfg, ep, meta, mode, isl, osl, max_tokens, batch_per_inst, out_dir, dry_run, timeout):
+    # Per-run batch (batch sweeps vary it per config); fall back to the CLI value.
+    batch_per_inst = int(meta.get("per_device_batch", batch_per_inst))
+    meta.setdefault("per_device_batch", batch_per_inst)
+    # fabric is the coarse FB-vs-NVL72 label (topology carries the panel name).
+    meta.setdefault("fabric", "nvl72" if meta.get("topology") == "nvl72" else "glass_fb")
+
     cfg_path = os.path.join(out_dir, "configs", f"{label}.json")
     os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
     with open(cfg_path, "w") as f:
@@ -213,20 +296,22 @@ def run_one(label, cfg, ep, meta, mode, isl, osl, max_tokens, batch_per_inst, ou
     out_rel = os.path.relpath(out_csv, REPO_ROOT)
     wl_rel, n_req = make_workload(ep, batch_per_inst, mode, isl, osl)
 
+    # max_num_seqs must admit the requested per-device batch so that
+    # batch_per_inst requests actually decode concurrently (drives total_len,
+    # and thus the exposed MoE all-to-all message).
+    max_seqs = max(MAX_SEQS, batch_per_inst)
+
     # Prefill is INCLUDED (no --skip-prefill): the prefill MoE all-gather /
-    # reduce-scatter moves ~MB-scale messages, making the run bandwidth-bound so
-    # the optical WG-count sweep is meaningful. TTFT captures the
-    # bandwidth-sensitive prefill cost; TPOT is the (latency-bound) decode.
-    # ``max_tokens`` (--max-tokens) sets how many tokens a prefill step batches:
-    # larger value → larger per-collective MoE message → more bandwidth-bound,
-    # which is what makes the FlattenedButterfly bandwidth advantage visible.
+    # reduce-scatter moves ~MB-scale messages, making the run bandwidth-bound.
+    # --log-level INFO is required so the controller emits the per-iteration
+    # 'exposed communication' lines we parse for the mechanism columns.
     cmd = ["python", "-m", "serving", "--cluster-config", cfg_rel, "--dtype", "bfloat16",
-           "--block-size", str(BLOCK_SIZE), "--max-num-seqs", str(MAX_SEQS),
+           "--block-size", str(BLOCK_SIZE), "--max-num-seqs", str(max_seqs),
            "--max-num-batched-tokens", str(max_tokens), "--dataset", wl_rel,
-           "--output", out_rel, "--num-req", str(n_req), "--log-level", "WARNING"]
+           "--output", out_rel, "--num-req", str(n_req), "--log-level", "INFO"]
 
     if dry_run:
-        print(f"  [dry] {label:38s} ep={ep:<4d} {meta}")
+        print(f"  [dry] {label:38s} ep={ep:<4d} b={batch_per_inst:<4d} {meta}")
         return {"label": label, "status": "dry", **meta}
 
     t0 = time.time()
@@ -239,7 +324,12 @@ def run_one(label, cfg, ep, meta, mode, isl, osl, max_tokens, batch_per_inst, ou
             return {"label": label, "status": "error", "elapsed_s": elapsed,
                     "error": err, **meta}
         m = parse_metrics(out_csv) or {}
-        return {"label": label, "status": "ok", "elapsed_s": elapsed, "error": "", **meta, **m}
+        exposed = parse_exposed_log((proc.stdout or "") + (proc.stderr or "")) or {}
+        analyt = analytical_estimates(_MODEL_CFG, ep, batch_per_inst,
+                                      float(meta.get("inter_bw") or NVL72_ELEC_BW),
+                                      float(meta.get("intra_opt_bw") or NVL72_ELEC_BW))
+        return {"label": label, "status": "ok", "elapsed_s": elapsed, "error": "",
+                **meta, **m, **exposed, **analyt}
     except subprocess.TimeoutExpired:
         return {"label": label, "status": "timeout", "elapsed_s": timeout,
                 "error": f"timeout>{timeout}s", **meta}
@@ -317,16 +407,69 @@ def build_inter_runs(panels, inter_bws, fixed_wg, mode, isl, osl):
     return runs
 
 
+def _fabric_pair(sweep_name, panel, wg, inter_opt_bw, ep, batch, mode):
+    """Build the FB-glass + NVL72 run pair for one (EP, per-device batch) cell.
+
+    Both fabrics share EP, model and per-device batch; only the inter-GPU link
+    differs (glass optical fiber vs NVLink-rack + inter-rack IB). This isolates
+    'when does the EP all-to-all leave the compute shadow' as a function of
+    batch (message size up) and EP (per-rank weight-load down)."""
+    rows, cols = panel
+    panel_size = rows * cols
+    multi = ep > panel_size
+    fb_cfg = make_panel_config(rows, cols, ep, wg_count=wg,
+                               inter_bw=(inter_opt_bw if multi else 0.0))
+    fb_meta = {"sweep": sweep_name, "mode": mode, "topology": "glass_fb", "fabric": "glass_fb",
+               "panel": panel_size, "ep": ep, "per_device_batch": batch, "wg_count": wg,
+               "intra_opt_bw": int(wg * WG_BW), "inter_bw": (inter_opt_bw if multi else 0)}
+    nvl_meta = {"sweep": sweep_name, "mode": mode, "topology": "nvl72", "fabric": "nvl72",
+                "panel": NVL72_RACK, "ep": ep, "per_device_batch": batch, "wg_count": 0,
+                "intra_opt_bw": int(NVL72_ELEC_BW),
+                "inter_bw": (NVL72_IB_BW if ep > NVL72_RACK else 0)}
+    return [
+        (f"{sweep_name}_fb_ep{ep}_b{batch}", fb_cfg, ep, fb_meta),
+        (f"{sweep_name}_nvl72_ep{ep}_b{batch}", make_nvl72_config(ep), ep, nvl_meta),
+    ]
+
+
+def build_batch_runs(panel, wg, inter_opt_bw, ep, batch_list, mode):
+    """Fixed EP, sweep per-device batch over both fabrics. Tests the hypothesis
+    that exposed=0 at small batch flips to exposed>0 as the batch grows."""
+    runs = []
+    for batch in batch_list:
+        runs += _fabric_pair("batch", panel, wg, inter_opt_bw, ep, batch, mode)
+    return runs
+
+
+def build_batch_x_ep_runs(panel, wg, inter_opt_bw, batch_list, ep_list, mode):
+    """Full batch x EP grid over both fabrics — the data behind the P6 exposure
+    heatmap and the B*(EP) crossover table."""
+    runs = []
+    for ep in ep_list:
+        for batch in batch_list:
+            runs += _fabric_pair("batch_x_ep", panel, wg, inter_opt_bw, ep, batch, mode)
+    return runs
+
+
 def main():
-    global MODEL_NAME, HARDWARE
+    global MODEL_NAME, HARDWARE, NVL72_RACK
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sweep", choices=["intra", "inter", "epscale"], required=True)
+    ap.add_argument("--sweep", choices=["intra", "inter", "epscale", "batch", "batch_x_ep"],
+                    required=True)
     ap.add_argument("--ep-list", nargs="+", type=int, default=[16, 32, 64, 128, 256],
-                    help="epscale: EP degrees to sweep (must divide model experts)")
+                    help="epscale/batch_x_ep: EP degrees to sweep (must divide model experts)")
+    ap.add_argument("--batch-ep", type=int, default=64,
+                    help="batch sweep: the single fixed EP to hold while sweeping per-device batch")
+    ap.add_argument("--batch-list", nargs="+", type=int, default=[8, 16, 32, 64, 128, 256, 512],
+                    help="batch / batch_x_ep: per-device batch sizes to sweep")
     ap.add_argument("--epscale-panel", nargs=2, type=int, default=[4, 8],
                     help="epscale: glass panel (rows cols), default 4x8=32 (6x6-4c)")
     ap.add_argument("--inter-opt-bw", type=int, default=512,
                     help="epscale: glass inter-panel optical egress BW (GB/s)")
+    ap.add_argument("--nvl72-rack", type=int, default=NVL72_RACK,
+                    help="NVLink domain (rack) size used as the cross-rack boundary. "
+                         "Lower it (e.g. 4) so a small EP crosses into the inter-rack IB "
+                         "dim — lets the cliff be reproduced locally without 128 instances.")
     ap.add_argument("--mode", choices=["controlled", "realistic"], default="controlled")
     ap.add_argument("--panels", nargs="+", default=["4x4", "6x6_4c", "6x6"], choices=list(PANELS))
     ap.add_argument("--wg", nargs="+", type=int, default=WG_COUNTS_DEFAULT, help="intra: WG counts")
@@ -356,6 +499,10 @@ def main():
     MODEL_NAME = args.model
     HARDWARE = args.hardware
     NPU_MEM["mem_size"] = args.npu_mem_gb
+    NVL72_RACK = args.nvl72_rack
+    global _MODEL_CFG
+    with open(os.path.join(REPO_ROOT, "configs", "model", MODEL_NAME + ".json")) as f:
+        _MODEL_CFG = json.load(f)
 
     out_dir = os.path.join(REPO_ROOT, "outputs", "panel_dse")
     results_csv = args.out or os.path.join(out_dir, f"dse_{args.sweep}_{args.mode}.csv")
@@ -366,6 +513,12 @@ def main():
     elif args.sweep == "epscale":
         runs = build_epscale_runs(tuple(args.epscale_panel), args.fixed_wg, args.inter_opt_bw,
                                   args.ep_list, args.mode)
+    elif args.sweep == "batch":
+        runs = build_batch_runs(tuple(args.epscale_panel), args.fixed_wg, args.inter_opt_bw,
+                                args.batch_ep, args.batch_list, args.mode)
+    elif args.sweep == "batch_x_ep":
+        runs = build_batch_x_ep_runs(tuple(args.epscale_panel), args.fixed_wg, args.inter_opt_bw,
+                                     args.batch_list, args.ep_list, args.mode)
     else:
         runs = build_inter_runs(args.panels, args.inter_bw, args.fixed_wg, args.mode, args.isl, args.osl)
 
@@ -378,9 +531,18 @@ def main():
         print(f"  EP list: {args.ep_list}  glass panel {args.epscale_panel} wg{args.fixed_wg}, "
               f"inter-panel optical {args.inter_opt_bw} GB/s  vs  NVL72 (NVLink {NVL72_ELEC_BW} / "
               f"inter-rack IB {NVL72_IB_BW} @EP>{NVL72_RACK})")
+    elif args.sweep == "batch":
+        print(f"  fixed EP: {args.batch_ep}  per-device batch sweep: {args.batch_list}  "
+              f"glass panel {args.epscale_panel} wg{args.fixed_wg} inter-opt {args.inter_opt_bw}  vs  "
+              f"NVL72 (IB {NVL72_IB_BW} @EP>{NVL72_RACK})")
+    elif args.sweep == "batch_x_ep":
+        print(f"  EP x batch grid: {args.ep_list} x {args.batch_list}  "
+              f"glass panel {args.epscale_panel} wg{args.fixed_wg} inter-opt {args.inter_opt_bw}  vs  "
+              f"NVL72 (IB {NVL72_IB_BW} @EP>{NVL72_RACK})")
     else:
         print(f"  fixed intra WG: {args.fixed_wg} (={int(args.fixed_wg*WG_BW)} GB/s)  inter_bw sweep: {args.inter_bw}")
-    print(f"  workload: N=EP×{args.batch_per_instance}, ISL/OSL {args.isl}/{args.osl}, "
+    _wl_b = "per-run" if args.sweep in ("batch", "batch_x_ep") else args.batch_per_instance
+    print(f"  workload: N=EP×{_wl_b}, ISL/OSL {args.isl}/{args.osl}, "
           f"max_tokens={args.max_tokens}, arrivals={'t=0' if args.mode=='controlled' else '1ms staggered'}")
     print(f"  baseline: NVL72 {NVL72_ELEC_BW} GB/s bidirectional")
     print(f"  runs: {len(runs)}   results: {results_csv}")
@@ -393,8 +555,9 @@ def main():
             append_row(results_csv, row)
             tag = row.get("status")
             if row.get("ttft_ms") is not None and tag == "ok":
-                print(f"  {label:40s} {tag:8s} "
-                      f"TTFT={row['ttft_ms']:.3f}ms  TPOT_ss={row.get('tpot_steady_ms', 0):.4f}ms")
+                print(f"  {label:44s} {tag:6s} "
+                      f"TTFT={row['ttft_ms']:8.2f}ms  TPOT_ss={row.get('tpot_steady_ms', 0):8.3f}ms  "
+                      f"exposed={row.get('exposed_frac', 0)*100:5.1f}%")
             else:
                 print(f"  {label:40s} {tag}  {row.get('error','')[:80]}")
 

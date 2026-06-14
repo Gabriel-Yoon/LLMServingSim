@@ -87,6 +87,17 @@ def get_config(model_name):
             f"{', '.join(candidate_paths)}. Please add the corresponding config file."
         )
 
+    # Normalize the MoE expert-count key across model families. The simulator
+    # keys MoE routing/sizing off ``num_local_experts`` (Mistral/Mixtral style);
+    # Qwen3-MoE uses ``num_experts`` and DeepSeek-V3 / Kimi-K2 (model_type
+    # deepseek_v3) expose routed experts as ``n_routed_experts``. Without this,
+    # DeepSeek configs resolve to gate=None / is_moe=False and the entire MoE
+    # block (and its EP all-to-all) is silently dropped from the trace.
+    if "num_local_experts" not in config and "num_experts" not in config:
+        routed = config.get("n_routed_experts")
+        if routed:
+            config["num_local_experts"] = routed
+
     return config
 
 
