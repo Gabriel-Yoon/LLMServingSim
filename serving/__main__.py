@@ -510,16 +510,20 @@ def main():
                     max_total_len = max(b.total_len for b, _ in dp_pending[dg].values())
                     for b, _ in dp_pending[dg].values():
                         _pad_batch_to_max(b, max_total_len)
-                    # MoE AG/RS comm size is anchored to ``max_total_len``
-                    # (not ``max × group_size``). The trace generator divides
-                    # this by ep_total internally for the per-rank AG chunk
-                    # and uses the same value for the RS pre-scatter buffer.
-                    # Empirically this matches real NCCL AG/RS bandwidth on
-                    # PCIe 5.0 at the same ``link_bw`` that already calibrates
-                    # AllReduce — i.e. ASTRA-Sim's Ring half-duplex model
-                    # ends up correct for AR but 2× over real AG/RS, and the
-                    # "× group_size" we used previously stacked the two errors.
-                    sum_total_len = max_total_len
+                    # MoE AG/RS comm size = the GROUP-TOTAL token count
+                    # (max_total_len × ep_total), because the EP all-to-all /
+                    # AllGather moves every rank's tokens across the group — the
+                    # volume scales with EP, not with one rank's batch. The
+                    # trace generator divides this by ep_total for the per-rank
+                    # AG chunk (→ back to max_total_len) and uses the full value
+                    # for the RS pre-scatter buffer. The ÷2 corrects ASTRA-Sim's
+                    # Ring half-duplex model, which over-counts AG/RS ~2× vs real
+                    # NCCL. (Previously this was anchored to max_total_len alone,
+                    # which only matched at ep_total=2 — where ×2÷2 = ×1 — and
+                    # under-counted EP comm by ep_total/2 for larger groups,
+                    # flattening the EP-scalability curve.)
+                    ep_total_grp = instances[dp_groups[dg][0]]["ep_total"]
+                    sum_total_len = max(1, max_total_len * ep_total_grp // 2)
 
                     first_inst_id = dp_groups[dg][0]
                     first_batch = dp_pending[dg][first_inst_id][0]
@@ -586,9 +590,11 @@ def main():
                         max_total_len = max(b.total_len for b, _ in dp_pending[dg].values())
                         for b, _ in dp_pending[dg].values():
                             _pad_batch_to_max(b, max_total_len)
-                        # See twin block above: anchor MoE comm to max_total_len
-                        # (no group-size multiplier).
-                        sum_total_len = max_total_len
+                        # See twin block above: MoE comm = group-total tokens
+                        # (max_total_len × ep_total), ÷2 for ASTRA's Ring AG/RS
+                        # over-count. Scales EP comm correctly across group sizes.
+                        ep_total_grp = instances[dp_groups[dg][0]]["ep_total"]
+                        sum_total_len = max(1, max_total_len * ep_total_grp // 2)
 
                         first_inst_id = dp_groups[dg][0]
                         first_batch = dp_pending[dg][first_inst_id][0]

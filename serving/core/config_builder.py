@@ -592,8 +592,12 @@ def _validate_fb_topology_config(tc):
     if tc_type == "fb_2d":
         if tc.get("panel_rows", 0) < 2 or tc.get("panel_cols", 0) < 2:
             raise ValueError(f"fb_2d topology_config requires panel_rows>=2 and panel_cols>=2")
-        if "intra_bw" not in tc:
-            raise KeyError("fb_2d topology_config must have 'intra_bw'")
+        # Optical (far) intra-panel bandwidth: wg_count, intra_opt_bw, or legacy intra_bw.
+        if not any(k in tc for k in ("wg_count", "intra_opt_bw", "intra_bw")):
+            raise KeyError(
+                "fb_2d topology_config must specify the optical intra-panel bandwidth "
+                "via 'wg_count' (×128 GB/s), 'intra_opt_bw', or legacy 'intra_bw'"
+            )
         return
     # hierarchical_fb validation
     if tc.get("panel_size", 0) < 2:
@@ -647,6 +651,9 @@ def _fb2d_fb_rows(dp_size, panel_rows, panel_cols):
     return best
 
 
+_WG_BW_GBPS = 128.0  # 1 waveguide group = 32λ × 32 Gb/s = 1.024 Tb/s = 128 GB/s
+
+
 def _compute_fb2d_dims(dp_size, topology_config):
     """Compute ASTRA-Sim dims for fb_2d topology using FlattenedButterfly.
 
@@ -655,14 +662,43 @@ def _compute_fb2d_dims(dp_size, topology_config):
       - Cross (different row AND col)           → 2 hops
     Multi-panel configurations add a Ring dimension for inter-panel links.
 
-    Returns (dims, bandwidths, latencies, topologies, fb_rows) with trailing 1s removed.
+    Intra-panel links are heterogeneous (glass-panel DSE):
+      - electrical RDL    for *adjacent* tiles (grid distance == 1)
+      - optical waveguide for *far* same-row/col tiles
+    The optical bandwidth is the swept knob and may be given directly via
+    ``intra_opt_bw`` or as a waveguide count via ``wg_count`` (×128 GB/s).
+    The electrical bandwidth/latency come from ``elec_bw``/``elec_latency``;
+    when omitted they default to the optical values (uniform link = legacy
+    behaviour). ASTRA-Sim's FlattenedButterfly applies the electrical params
+    to distance-1 hops and the optical params to longer hops.
+
+    Returns (dims, bandwidths, latencies, topologies, fb_rows,
+             elec_bandwidths, elec_latencies) with trailing 1s removed.
+    ``bandwidths``/``latencies`` carry the optical (far) link; the elec_*
+    arrays carry the electrical (adjacent) link. For non-FB dims (Ring) the
+    elec_* entries equal the regular bandwidth/latency.
     Raises ValueError if dp_size cannot be mapped.
     """
     rows = int(topology_config["panel_rows"])
     cols = int(topology_config["panel_cols"])
     panel_size = rows * cols
-    intra_bw = float(topology_config["intra_bw"])
-    intra_lat = float(topology_config.get("intra_lat", 300.0))
+
+    # Optical (far same-row/col) intra-panel link — the WG-swept knob.
+    wg_count = topology_config.get("wg_count")
+    if wg_count is not None:
+        wg_bw = float(topology_config.get("wg_bw", _WG_BW_GBPS))
+        intra_opt_bw = float(wg_count) * wg_bw
+    else:
+        # accept intra_opt_bw, else fall back to legacy intra_bw
+        intra_opt_bw = float(topology_config.get("intra_opt_bw",
+                                                 topology_config["intra_bw"]))
+    intra_opt_lat = float(topology_config.get("intra_opt_latency",
+                                              topology_config.get("intra_lat", 300.0)))
+
+    # Electrical RDL (adjacent tiles) — defaults to optical when unspecified.
+    intra_elec_bw  = float(topology_config.get("elec_bw", intra_opt_bw))
+    intra_elec_lat = float(topology_config.get("elec_latency", intra_opt_lat))
+
     inter_bw  = float(topology_config.get("inter_bw", 0.0))
     inter_lat = float(topology_config.get("inter_lat", 5000.0))
 
@@ -670,16 +706,21 @@ def _compute_fb2d_dims(dp_size, topology_config):
         # Entire EP fits on one panel: single FlattenedButterfly dimension
         fb_r, _ = _fb2d_fb_rows(dp_size, rows, cols)
         dims = [dp_size]
-        bws  = [intra_bw]
-        lats = [intra_lat]
+        bws  = [intra_opt_bw]
+        lats = [intra_opt_lat]
+        elec_bws = [intra_elec_bw]
+        elec_lats = [intra_elec_lat]
         topos   = ["FlattenedButterfly"]
         fb_rows = [fb_r]
     elif dp_size % panel_size == 0:
-        # Multi-panel: FlattenedButterfly for intra-panel + Ring for inter-panel
+        # Multi-panel: FlattenedButterfly for intra-panel + Ring for inter-panel.
+        # The Ring dim has no electrical/optical split → elec == regular link.
         n_panels = dp_size // panel_size
         dims = [panel_size, n_panels]
-        bws  = [intra_bw, inter_bw]
-        lats = [intra_lat, inter_lat]
+        bws  = [intra_opt_bw, inter_bw]
+        lats = [intra_opt_lat, inter_lat]
+        elec_bws = [intra_elec_bw, inter_bw]
+        elec_lats = [intra_elec_lat, inter_lat]
         topos   = ["FlattenedButterfly", "Ring"]
         fb_rows = [rows, 0]  # 0 = not applicable for Ring dim
     else:
@@ -690,7 +731,8 @@ def _compute_fb2d_dims(dp_size, topology_config):
 
     while len(dims) > 1 and dims[-1] == 1:
         dims.pop(); bws.pop(); lats.pop(); topos.pop(); fb_rows.pop()
-    return dims, bws, lats, topos, fb_rows
+        elec_bws.pop(); elec_lats.pop()
+    return dims, bws, lats, topos, fb_rows, elec_bws, elec_lats
 
 
 def _compute_fb_dims(dp_size, topology_config):
@@ -712,7 +754,7 @@ def _compute_fb_dims(dp_size, topology_config):
     only unpack 3 values still work because Python tuple unpacking is positional.
     """
     if topology_config.get("type") == "fb_2d":
-        dims, bws, lats, _topos, _fb_rows = _compute_fb2d_dims(dp_size, topology_config)
+        dims, bws, lats, _topos, _fb_rows, _ebws, _elats = _compute_fb2d_dims(dp_size, topology_config)
         return dims, bws, lats
 
     panel_size = topology_config["panel_size"]
@@ -787,12 +829,17 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
 
     is_fb = topology_config is not None and topology_config.get("type") in ("hierarchical_fb", "fb_2d")
 
+    # Per-dim electrical (adjacent-tile) link params for FlattenedButterfly.
+    # None → no split; ASTRA-Sim falls back to uniform bandwidth/latency.
+    elec_bandwidths = None
+    elec_latencies = None
+
     if is_fb and dp_groups:
         first_group = next(iter(dp_groups.values()))
         dp_size = len(first_group)
         tc_type = topology_config.get("type")
         if tc_type == "fb_2d":
-            dims, bandwidths, latencies, topology_names, fb_rows_list = \
+            dims, bandwidths, latencies, topology_names, fb_rows_list, elec_bandwidths, elec_latencies = \
                 _compute_fb2d_dims(dp_size, topology_config)
         else:
             dims, bandwidths, latencies = _compute_fb_dims(dp_size, topology_config)
@@ -836,6 +883,15 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
     # Write fb_rows when any dimension is FlattenedButterfly
     if fb_rows_list is not None and any(t == "FlattenedButterfly" for t in final_topo_names):
         topology_data["fb_rows"] = FlowStyleList(fb_rows_list)
+
+    # Write electrical RDL link params only when the split is active (elec
+    # differs from the optical bandwidth/latency on any dim). Otherwise omit
+    # them so the parser defaults to the uniform link (legacy behaviour).
+    if elec_bandwidths is not None and (
+        list(elec_bandwidths) != list(bandwidths) or list(elec_latencies) != list(latencies)
+    ):
+        topology_data["elec_bandwidth"] = FlowStyleList(elec_bandwidths)
+        topology_data["elec_latency"] = FlowStyleList(elec_latencies)
 
     with open(network_config_path, 'w') as yaml_file:
         yaml.dump(topology_data, yaml_file, default_flow_style=False, sort_keys=False)

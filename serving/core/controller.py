@@ -20,11 +20,44 @@ class Controller():
         return out
 
     def check_end(self, p):
-        out = ["",""]
+        # After the main loop sends a single "exit", ASTRA-Sim breaks out of its
+        # while(!exit) loop and prints a terminal handshake line. But in the
+        # degenerate EP case where only one instance ever ran real work (e.g.
+        # N=1 over a 32-way EP group, with the other ranks running dummy waves),
+        # ASTRA's exit can land while one or more NPUs are still blocked on
+        # std::getline(std::cin) — they keep re-emitting a "Waiting" prompt that
+        # nobody answers. A read-only check_end then deadlocks; if instead every
+        # remaining NPU is asleep, ASTRA spins printing check lines and we grow
+        # ``out`` until the OS OOM-kills us (SIGKILL/137).
+        #
+        # Fix: keep driving ASTRA toward termination. Whenever it prompts for
+        # input again, answer "exit" so the next getline breaks its loop; stop
+        # on either terminal line or on EOF. ``out`` is kept bounded so a runaway
+        # ASTRA can never OOM us. In the normal path (N>=2) ASTRA breaks
+        # immediately, no "Waiting" prompt appears, and this behaves as before.
+        out = ["", ""]
         while out[-2] != "All Request Has Been Exited\n" and out[-2] != "ERROR: Some Requests Remain\n":
-            out.append(p.stdout.readline())
+            line = p.stdout.readline()
+            # EOF: ASTRA-Sim closed stdout (process exited) before emitting a
+            # terminal handshake line. Mirror read_wait()'s EOF handling.
+            if line == "":
+                self.logger.warning(
+                    "ASTRA-Sim stdout closed during exit handshake before "
+                    "'All Request Has Been Exited' — treating simulation as "
+                    "ended (Python-side request accounting already complete)."
+                )
+                break
+            # ASTRA is still blocked waiting for a per-NPU command. Push it to
+            # exit instead of letting it (and us) hang.
+            if "Waiting" in line:
+                self.write_flush(p, "exit")
+            out.append(line)
+            # Keep only a small tail; we only ever inspect out[-2]/out[-4].
+            if len(out) > 64:
+                out = out[-64:]
             p.stdout.flush()
-        print(out[-4], end='')
+        if len(out) >= 4:
+            print(out[-4], end='')
         print(out[-2], end='')
         return out
 
