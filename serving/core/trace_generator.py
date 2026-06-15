@@ -984,6 +984,27 @@ def _with_dim(comm_type, involved_dim):
     return f"{comm_type}:{dim_str}"
 
 
+def _inter_only_dim(involved_dim):
+    """Restrict a true all-to-all to the OUTERMOST (inter-domain) dimension.
+
+    ASTRA's AllToAll is O(N^2) packets on the innermost 'Local' dimension
+    (AllToAll.cc::get_non_zero_latency_packets), so a full all-to-all over a
+    large intra-domain dim (e.g. a 64-GPU NVLink rack) is prohibitively slow to
+    simulate (EP=128 does not finish in an hour). The cross-domain (inter) link
+    is the bottleneck that drives the reach result; the fast intra-domain shuffle
+    is dropped — it is a few percent of the inter cost and drops symmetrically
+    for both fabrics. Single-domain configs (<=1 involved dim) keep the full
+    all-to-all (the panel is small, so O(N^2) is cheap)."""
+    if involved_dim is None:
+        return None
+    trues = [i for i, v in enumerate(involved_dim) if v]
+    if len(trues) <= 1:
+        return involved_dim
+    scoped = [False] * len(involved_dim)
+    scoped[trues[-1]] = True
+    return scoped
+
+
 def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
     """Emit PIM attention for decode requests across PIM channels."""
     for ch in range(ctx.pim_channels):
@@ -1045,29 +1066,34 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     combine_per_token = n_embd * ctx.fp
     ag_per_rank_tokens = max(1, effective_total_len_comm // max(ep_total, 1))
     _moe_a2a = os.environ.get('MOE_ALLTOALL') == '1'
-    if _moe_a2a:
-        # DeepEP-style true all-to-all volume: each of this rank's total_len
-        # tokens is routed to k=num_experts_per_tok experts, so dispatch (and the
-        # symmetric combine) shuffles ~total_len * k token-vectors per rank across
-        # the fabric. This is ~constant in EP (per-token routing is independent of
-        # EP); ASTRA's all-to-all spreads it over the topology so the slow
-        # inter-domain dim scales the cross-domain cost. NOT the EP-anchored
-        # AllGather sum (max*EP/2), which over-grows the message ~EP-fold.
+    # All-to-all is used only when MOE_ALLTOALL is on AND the EP group spans more
+    # than one topology dimension (multi-domain). Then the cross-domain (inter)
+    # link is the bottleneck, so we emit an ALLTOALL scoped to the OUTERMOST dim
+    # only — this captures the IB / inter-panel cliff while avoiding ASTRA's
+    # O(N^2) all-to-all over the large intra-domain dim (the cause of the EP=128
+    # hang). Single-domain EP (one involved dim, e.g. NVL72 within a rack at
+    # EP<=64) has no cross-domain cliff, so it falls back to the cheap O(N)
+    # AllGather/ReduceScatter — which is also the vLLM default backend.
+    ep_dim_trues = [i for i, v in enumerate(ctx.ep_dim or []) if v]
+    _use_a2a = _moe_a2a and ep_total > 1 and len(ep_dim_trues) > 1
+
+    if _use_a2a:
+        # DeepEP-style all-to-all volume per rank = total_len * k (each token
+        # routed to k=num_experts_per_tok experts); ~constant in EP. Scoped to
+        # the inter-domain dim so ASTRA spreads it over the slow cross-domain link.
         k_top = max(1, ctx.config.get('num_experts_per_tok', 1))
         a2a_tokens = bctx.total_len * k_top
         dispatch_comm_size = a2a_tokens * dispatch_per_token
         combine_comm_size = a2a_tokens * combine_per_token
-    else:
+        a2a_dim = _inter_only_dim(ctx.ep_dim)
+        dispatch_comm_type = _with_dim('ALLTOALL', a2a_dim)
+        combine_comm_type = _with_dim('ALLTOALL', a2a_dim)
+    elif ep_total > 1:
+        # AllGather/ReduceScatter (vLLM default + single-domain MOE_ALLTOALL).
         dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
         combine_comm_size = effective_total_len_comm * combine_per_token
-
-    if ep_total > 1:
-        if _moe_a2a:
-            dispatch_comm_type = _with_dim('ALLTOALL', ctx.ep_dim)
-            combine_comm_type = _with_dim('ALLTOALL', ctx.ep_dim)
-        else:
-            dispatch_comm_type = _with_dim('ALLGATHER', ctx.ep_dim)
-            combine_comm_type = _with_dim('REDUCESCATTER', ctx.ep_dim)
+        dispatch_comm_type = _with_dim('ALLGATHER', ctx.ep_dim)
+        combine_comm_type = _with_dim('REDUCESCATTER', ctx.ep_dim)
     else:
         dispatch_comm_type = 'NONE'
         combine_comm_type = 'NONE'
