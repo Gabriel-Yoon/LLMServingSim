@@ -423,6 +423,7 @@ def main():
     dp_pending = {dg: {} for dg in dp_groups}  # dp_group -> {instance_id: (new_req, sys)}
     # Pre-generated workloads ready to submit on next "Waiting"
     dp_ready_workloads = {}  # instance_id -> workload_path
+    dp_ready_batch = {}      # instance_id -> Batch (to mark .written when flushed)
 
     # ----------------------------------- Start simulation loop ------------------------------------
     # Starting simulation, one while loop processes one iteration
@@ -486,6 +487,9 @@ def main():
         # Check if a pre-generated workload is ready for this instance (from DP sync)
         if new_req is None and instance_id in dp_ready_workloads:
             controller.write_flush(p, dp_ready_workloads.pop(instance_id))
+            _wb = dp_ready_batch.pop(instance_id, None)
+            if _wb is not None:
+                _wb.written = True
             responded = True
         # DP group: truly idle instance (no inflight batch) — create dummy batch so ALLTOALL syncs
         elif new_req is None and instance_id in inst_dp_group and sys == inst2npu_mapping[instance_id] and len(schedulers[instance_id].inflight) == 0:
@@ -554,6 +558,7 @@ def main():
                         if inst_id != instance_id:
                             dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
                                                                     workload_name=dp_workload_name)
+                            dp_ready_batch[inst_id] = batch
 
                     dp_pending[dg].clear()
                     workload = get_workload(dummy, instances[instance_id]["hardware"], instance_id,
@@ -579,6 +584,9 @@ def main():
                     # batch for the next barrier.
                     if instance_id in dp_ready_workloads:
                         controller.write_flush(p, dp_ready_workloads.pop(instance_id))
+                        _wb = dp_ready_batch.pop(instance_id, None)
+                        if _wb is not None:
+                            _wb.written = True
                         responded = True
 
                     dp_pending[dg][instance_id] = (new_req, node_id)
@@ -625,6 +633,7 @@ def main():
                             if inst_id != instance_id:
                                 dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
                                                                         workload_name=dp_workload_name)
+                                dp_ready_batch[inst_id] = batch
 
                         dp_pending[dg].clear()
                         workload = get_workload(new_req, instance["hardware"], instance_id,
@@ -633,8 +642,10 @@ def main():
                             # Old dp_ready was already flushed to ASTRA; queue the new
                             # workload so it is consumed on the next re-check.
                             dp_ready_workloads[instance_id] = workload
+                            dp_ready_batch[instance_id] = new_req
                         else:
                             controller.write_flush(p, workload)
+                            new_req.written = True
                             responded = True
                     else:
                         # Waiting for other DP members — send pass (only if not already sent)
@@ -654,6 +665,7 @@ def main():
                                    instance_id, inst2npu_mapping[instance_id], enable_local_offloading)
                     workload = get_workload(new_req, instance["hardware"], instance_id)
                     controller.write_flush(p, workload)
+                    new_req.written = True
             elif new_req is not None:
                 # Non-first NPU: pick up existing batch workload
                 workload = get_workload(new_req, instances[instance_id]["hardware"], instance_id)

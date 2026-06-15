@@ -653,12 +653,17 @@ class Scheduler:
         end_reqs = []
         if len(self.inflight) == 0:
             return prompt_t, gen_t, end_reqs
-        # FIFO: the oldest inflight batch is always the one ASTRA just completed.
-        # A fixed id-1 offset breaks for instances that ran dummy traces before
-        # their first real batch (the dummy iterations shift the ASTRA counter
-        # without adding to inflight, causing a permanent id/batch_id mismatch).
+        # FIFO: the oldest inflight batch is the one ASTRA just completed — BUT
+        # only if it was actually written to ASTRA. A scheduled-but-PASS'd batch
+        # sits in inflight un-written; ASTRA re-polls with the same iteration id,
+        # and completing the un-simulated batch here would advance its requests
+        # without simulation (the DP+EP "optimistic TPOT" bug). Skip until the
+        # oldest inflight batch has been written. (Dummy waves are not in inflight
+        # and are harmless: they report while inflight is empty / un-written.)
         batch = self.inflight[0]
         idx = 0
+        if not batch.written:
+            return prompt_t, gen_t, end_reqs
         if sys in batch.end:
             return prompt_t, gen_t, end_reqs
         else:

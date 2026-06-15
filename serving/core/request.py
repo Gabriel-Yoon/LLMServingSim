@@ -92,6 +92,12 @@ class Batch:
         self.fired = [] # systems that fired this batch
         self.requests = []
         self.end = []
+        # True once this batch's workload has actually been WRITTEN to ASTRA-Sim
+        # (controller.write_flush). A batch can be scheduled into `inflight` but
+        # then PASS'd (DP barrier not ready) without being written; ASTRA re-polls
+        # with the same iteration id, and add_done must NOT complete such an
+        # un-simulated batch on the re-poll report. Only written batches complete.
+        self.written = False
         # vllm
         self.kv_size = kv_size
         self.evict = evict
