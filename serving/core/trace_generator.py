@@ -1046,13 +1046,20 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     ag_per_rank_tokens = max(1, effective_total_len_comm // max(ep_total, 1))
     _moe_a2a = os.environ.get('MOE_ALLTOALL') == '1'
     if _moe_a2a:
-        # DeepEP-style true all-to-all: router-directed dispatch sends each
-        # token only to its expert's rank, so the full activation volume crosses
-        # the (slow) inter-domain link — no hierarchical minimization.
-        dispatch_comm_size = effective_total_len_comm * dispatch_per_token
+        # DeepEP-style true all-to-all volume: each of this rank's total_len
+        # tokens is routed to k=num_experts_per_tok experts, so dispatch (and the
+        # symmetric combine) shuffles ~total_len * k token-vectors per rank across
+        # the fabric. This is ~constant in EP (per-token routing is independent of
+        # EP); ASTRA's all-to-all spreads it over the topology so the slow
+        # inter-domain dim scales the cross-domain cost. NOT the EP-anchored
+        # AllGather sum (max*EP/2), which over-grows the message ~EP-fold.
+        k_top = max(1, ctx.config.get('num_experts_per_tok', 1))
+        a2a_tokens = bctx.total_len * k_top
+        dispatch_comm_size = a2a_tokens * dispatch_per_token
+        combine_comm_size = a2a_tokens * combine_per_token
     else:
         dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
-    combine_comm_size = effective_total_len_comm * combine_per_token
+        combine_comm_size = effective_total_len_comm * combine_per_token
 
     if ep_total > 1:
         if _moe_a2a:
