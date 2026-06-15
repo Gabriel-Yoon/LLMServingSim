@@ -21,13 +21,31 @@ import matplotlib.pyplot as plt
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# Headline decode-TPOT metric. tpot_gt_ms = MODE of ASTRA per-iteration decode
+# cycles (parse_steady_decode_cycle). This is the only DP+EP-safe choice: the
+# add_done dummy-completion bug distorts completion-timing metrics (tpot_avg_ms /
+# tpot_steady_ms) and inflates the faster fabric's apparent advantage, but leaves
+# the per-iteration decode cycle untouched. Verified bug-immune: NVL72/glass ratio
+# 1.017 (correct add_done) vs 1.019 (buggy), while the mean-TPOT ratio moved
+# 1.02 -> 1.41. Never fall back to tpot_steady_ms here.
+def _tpot_gt(r):
+    v = r.get("tpot_gt_ms")
+    if v in (None, "", "None"):
+        raise SystemExit(
+            "tpot_gt_ms missing/empty in CSV — this is the DP+EP-safe headline "
+            "metric. Re-run the sweep with the current sweep_panel_dse.py (which "
+            "populates tpot_gt_ms via parse_steady_decode_cycle). tpot_steady_ms / "
+            "tpot_avg_ms are completion-timing metrics distorted by the add_done bug.")
+    return float(v)
+
+
 def load(path):
     d = {}
     for r in csv.DictReader(open(path)):
         if r.get("status") != "ok":
             continue
         d.setdefault(r["fabric"], {})[int(r["ep"])] = (
-            float(r["tpot_steady_ms"]), float(r.get("exposed_frac") or 0) * 100)
+            _tpot_gt(r), float(r.get("exposed_frac") or 0) * 100)
     return d
 
 

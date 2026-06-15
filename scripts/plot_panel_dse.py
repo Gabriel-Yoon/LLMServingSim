@@ -58,7 +58,7 @@ def _save(fig, name):
 
 
 def plot_intra(rows, metric, ylabel, title, fname):
-    """metric: 'ttft_ms' or 'tpot_steady_ms'. One line per panel vs WG count."""
+    """metric: 'ttft_ms' or 'tpot_gt_ms'. One line per panel vs WG count."""
     fig, ax = plt.subplots(figsize=(7.5, 5))
     panels = [p for p in PANEL_STYLE if any(r["topology"] == p for r in rows)]
     for p in panels:
@@ -132,7 +132,12 @@ def plot_epscale(rows, fname, title="EP-scaling: glass-FB vs NVL72"):
         if not sub:
             continue
         xs = [int(r["ep"]) for r in sub]
-        ys = [float(r["tpot_steady_ms"]) for r in sub]
+        # tpot_gt_ms (MODE of ASTRA per-iteration decode cycles) is the only
+        # DP+EP-safe decode-TPOT metric: the add_done dummy-completion bug
+        # distorts completion-timing metrics (tpot_steady/avg) and inflates the
+        # faster fabric's edge (NVL72/glass mean-TPOT ratio moved 1.02->1.41),
+        # but the per-iteration decode cycle is untouched (ratio 1.017 vs 1.019).
+        ys = [float(r["tpot_gt_ms"]) for r in sub]
         ax.plot(xs, ys, lw=2.5, markersize=7, **s)
     ax.axvline(64, color="gray", ls=":", alpha=0.6)
     ax.text(64, ax.get_ylim()[0], " NVL72 rack=64", color="gray", fontsize=8, va="bottom")
@@ -168,7 +173,7 @@ def main():
         plot_intra(intra, "ttft_ms", "TTFT [ms]  (prefill; lower = better)",
                    "Intra-panel WG sweep: TTFT vs optical bandwidth\nDotted = NVL72 ref per panel EP",
                    "intra_ttft_vs_wg.png")
-        plot_intra(intra, "tpot_steady_ms", "TPOT steady [ms]  (decode; noisy under controlled)",
+        plot_intra(intra, "tpot_gt_ms", "decode TPOT [ms]  (steady, gt; lower = better)",
                    "Intra-panel WG sweep: decode TPOT vs optical bandwidth",
                    "intra_tpot_vs_wg.png")
     else:

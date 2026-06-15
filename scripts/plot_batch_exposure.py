@@ -40,7 +40,11 @@ def load(csv_path):
                 "fabric": r["fabric"], "ep": int(r["ep"]),
                 "batch": int(r["per_device_batch"]),
                 "exposed_frac": float(r["exposed_frac"] or 0),
-                "tpot": float(r["tpot_steady_ms"] or 0),
+                # tpot_gt_ms (MODE of ASTRA per-iteration decode cycles) is the
+                # DP+EP-safe metric; tpot_steady_ms/tpot_avg_ms are distorted by
+                # the add_done dummy-completion bug. (exposed_frac above is read
+                # straight from ASTRA and is already bug-immune.)
+                "tpot": float(r.get("tpot_gt_ms") or 0),
                 "ttft": float(r["ttft_ms"] or 0),
                 "a2a_us": float(r.get("all_to_all_us") or 0),
                 "wl_us": float(r.get("weight_load_us") or 0),
