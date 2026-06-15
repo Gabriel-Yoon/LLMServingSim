@@ -36,6 +36,7 @@ Usage (inside Docker, from /app/LLMServingSim):
 """
 
 import argparse
+import collections
 import csv
 import json
 import os
@@ -270,6 +271,35 @@ def parse_exposed_log(text):
     }
 
 
+_ITER_RE = re.compile(r"NPU\[(\d+)\] iteration (\d+) finished, (\d+) cycles")
+
+
+def parse_steady_decode_cycle(text):
+    """Ground-truth steady-state decode step (ms) from ASTRA's per-iteration cycle
+    counts in the controller log — bypasses the per-request ITL, which is
+    unreliable in the multi-instance / all-arrive-at-t=0 regime (prefill-fill
+    transients inflate the mean; un-synced NPUs add ITL noise).
+
+    Groups cumulative cycles by NPU, takes consecutive deltas, returns the MODE
+    (most common delta, binned to ms): the steady decode step repeats every
+    decode iteration, while prefill steps vary, so the mode lands on the decode
+    step (e.g. glass EP=32 -> 28 ms, where 28 ms recurs thousands of times) and
+    is unaffected by the few large prefill iterations or the rolling tail."""
+    by_npu = {}
+    for m in _ITER_RE.finditer(text or ""):
+        npu, it, cyc = int(m[1]), int(m[2]), int(m[3])
+        by_npu.setdefault(npu, {})[it] = cyc
+    deltas = []
+    for iters in by_npu.values():
+        seq = [iters[k] for k in sorted(iters)]
+        deltas += [b - a for a, b in zip(seq, seq[1:]) if b > a]
+    if not deltas:
+        return None
+    # mode of per-iteration deltas, binned to the nearest ms
+    binned = collections.Counter(round(d / 1e6) for d in deltas)
+    return float(binned.most_common(1)[0][0])
+
+
 def analytical_estimates(model_cfg, ep, batch_per_inst, inter_bw, intra_bw, fp_bytes=2):
     """Analytical companions to the logged exposed metric (for interpretation only).
 
@@ -309,7 +339,7 @@ def analytical_estimates(model_cfg, ep, batch_per_inst, inter_bw, intra_bw, fp_b
 # ─────────────────────────── Run one config ───────────────────────────────────
 CSV_FIELDS = ["label", "sweep", "mode", "topology", "fabric", "panel", "ep",
               "per_device_batch", "wg_count", "intra_opt_bw", "inter_bw", "status",
-              "ttft_ms", "e2e_latency_ms", "tpot_avg_ms", "tpot_steady_ms",
+              "ttft_ms", "e2e_latency_ms", "tpot_avg_ms", "tpot_steady_ms", "tpot_gt_ms",
               "interactivity_tok_s_user", "n_completed",
               "total_cycles", "exposed_cycles", "compute_cycles", "exposed_frac",
               "all_to_all_us", "weight_load_us",
@@ -361,7 +391,11 @@ def run_one(label, cfg, ep, meta, mode, isl, osl, max_tokens, batch_per_inst, ou
             return {"label": label, "status": "error", "elapsed_s": elapsed,
                     "error": err, **meta}
         m = parse_metrics(out_csv) or {}
-        exposed = parse_exposed_log((proc.stdout or "") + (proc.stderr or "")) or {}
+        _log = (proc.stdout or "") + (proc.stderr or "")
+        exposed = parse_exposed_log(_log) or {}
+        gt = parse_steady_decode_cycle(_log)
+        if gt is not None:
+            m["tpot_gt_ms"] = gt
         analyt = analytical_estimates(_MODEL_CFG, ep, batch_per_inst,
                                       float(meta.get("inter_bw") or NVL72_ELEC_BW),
                                       float(meta.get("intra_opt_bw") or NVL72_ELEC_BW))
@@ -597,7 +631,7 @@ def main():
             tag = row.get("status")
             if row.get("ttft_ms") is not None and tag == "ok":
                 print(f"  {label:44s} {tag:6s} "
-                      f"TTFT={row['ttft_ms']:8.2f}ms  TPOT_ss={row.get('tpot_steady_ms', 0):8.3f}ms  "
+                      f"TTFT={row['ttft_ms']:8.2f}ms  TPOT_gt={row.get('tpot_gt_ms', 0) or 0:8.3f}ms  "
                       f"exposed={row.get('exposed_frac', 0)*100:5.1f}%")
             else:
                 print(f"  {label:40s} {tag}  {row.get('error','')[:80]}")
