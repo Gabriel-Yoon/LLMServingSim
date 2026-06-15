@@ -1044,12 +1044,23 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     dispatch_per_token = (n_embd + num_experts) * ctx.fp
     combine_per_token = n_embd * ctx.fp
     ag_per_rank_tokens = max(1, effective_total_len_comm // max(ep_total, 1))
-    dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
+    _moe_a2a = os.environ.get('MOE_ALLTOALL') == '1'
+    if _moe_a2a:
+        # DeepEP-style true all-to-all: router-directed dispatch sends each
+        # token only to its expert's rank, so the full activation volume crosses
+        # the (slow) inter-domain link — no hierarchical minimization.
+        dispatch_comm_size = effective_total_len_comm * dispatch_per_token
+    else:
+        dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
     combine_comm_size = effective_total_len_comm * combine_per_token
 
     if ep_total > 1:
-        dispatch_comm_type = _with_dim('ALLGATHER', ctx.ep_dim)
-        combine_comm_type = _with_dim('REDUCESCATTER', ctx.ep_dim)
+        if _moe_a2a:
+            dispatch_comm_type = _with_dim('ALLTOALL', ctx.ep_dim)
+            combine_comm_type = _with_dim('ALLTOALL', ctx.ep_dim)
+        else:
+            dispatch_comm_type = _with_dim('ALLGATHER', ctx.ep_dim)
+            combine_comm_type = _with_dim('REDUCESCATTER', ctx.ep_dim)
     else:
         dispatch_comm_type = 'NONE'
         combine_comm_type = 'NONE'

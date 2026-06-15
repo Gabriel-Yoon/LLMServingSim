@@ -559,15 +559,19 @@ WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 
 - ASTRA BW 입력은 **unidirectional**. NVL72·글래스 모두 단방향으로 통일 적용.
 - 양쪽 동일 convention이면 절대값과 무관하게 비율(4.3×)·breakeven 유지.
 
-### Collective topology 주의 (open issue — 헤드라인 미발현 원인)
-- 현재 inter-panel을 **Ring**으로 모델 → 패널 多(4×4 8장 @ EP=128)면 ring step↑로
-  glass가 과도하게 느려 **EP>rack crossover가 미발현** (EP=128에서 NVL72 16.3 < glass 29.5).
-  PanelScale의 **optical crossbar**(≤1-2홉)를 반영하려면 `config_builder`의 inter-panel
-  dim을 Ring → Switch/FlattenedButterfly로 바꿔야 함.
-- NVL72 IB cliff도 ring 분해상 inter-rack이 1-2 step만 들어가 **과소 페널티** 의심
-  (EP=64→128에서 13.4→16.3로 거의 안 오름) — collective 분해/`involved_dim` 점검 필요.
-- 이 둘이 glass 불리·NVL72 유리로 치우쳐 reach 헤드라인이 안 나옴. latency/BW 가정이
-  아니라 **collective topology 구조 문제** → 모델 수정이 선결.
+### MoE collective 모델 (해결 — reach 헤드라인의 핵심)
+- **근본 원인**: MoE dispatch/combine을 vLLM 기본 **AllGather/ReduceScatter**로 모델하면
+  multi-dim에서 계층 분해돼 느린 inter-domain(IB / inter-panel)에 데이터가 조금만 실려
+  → NVL72 IB cliff 과소 → crossover 미발현.
+- **수정**: 大EP 실제 통신은 **router-directed true all-to-all (DeepEP)** — 토큰이 흩어진
+  expert rank로 직접 가 locality가 없으니 cross-domain 전량이 느린 링크를 탄다.
+  `MOE_ALLTOALL=1` env로 dispatch/combine을 ALLTOALL로 전환 (`trace_generator._emit_moe_block`),
+  default off (기존 동작 보존).
+- **검증 (mini rack=4, EP 4→32, batch128, glass wg5)**: NVL72/glass TPOT 비 =
+  1.05 → 1.47 → 3.23 → **6.39×**. NVL72 exposed 4%→95%(IB 폭발), glass 3%→69%(평탄). crossover 확정.
+- **부수 결론**: glass inter-panel은 **Ring 유지로 충분** — cross-domain 대역차(optical 512
+  vs IB 50 = 10×)가 Ring 홉수차를 압도해 glass가 Ring인데도 이김. crossbar로 바꿀 필요 없음.
+- TODO: `MOE_ALLTOALL` env를 정식 config/CLI 플래그로 승격; 大EP=all2all 근거(DeepEP) 본문 명시.
 
 ## README and docs split
 
