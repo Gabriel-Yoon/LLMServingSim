@@ -282,32 +282,46 @@ def parse_exposed_log(text):
 _ITER_RE = re.compile(r"NPU\[(\d+)\] iteration (\d+) finished, (\d+) cycles")
 
 
-def parse_steady_decode_cycle(text):
-    """Ground-truth steady-state decode step (ms) from ASTRA's per-iteration cycle
-    counts in the controller log — bypasses the per-request ITL, which is
-    unreliable in the multi-instance / all-arrive-at-t=0 regime (prefill-fill
-    transients inflate the mean; un-synced NPUs add ITL noise).
+def parse_steady_decode(text):
+    """Ground-truth STEADY-STATE DECODE step from ASTRA's per-iteration controller
+    log. Returns (tpot_gt_ms, exposed_frac) computed on the SAME steady-decode
+    iterations, so the two are consistent (the old parse_exposed_log gave a
+    CUMULATIVE run-average exposed_frac — prefill included — which did not match
+    the steady-decode tpot_gt).
 
-    Groups cumulative cycles by NPU, takes consecutive deltas, returns the MODE
-    (most common delta, binned to ms): the steady decode step repeats every
-    decode iteration, while prefill steps vary, so the mode lands on the decode
-    step (e.g. glass EP=32 -> 28 ms, where 28 ms recurs thousands of times) and
-    is unaffected by the few large prefill iterations or the rolling tail."""
-    by_npu = {}
-    for m in _ITER_RE.finditer(text or ""):
-        npu, it, cyc = int(m[1]), int(m[2]), int(m[3])
-        by_npu.setdefault(npu, {})[it] = cyc
-    deltas = []
+    Both 'C cycles' and 'exposed E cycles' are cumulative per NPU, so per-iteration
+    total_delta = C[i]-C[i-1] and exposed_delta = E[i]-E[i-1]. The decode step
+    repeats every iteration, so the MODE of total_delta (binned to 0.1 ms) is the
+    steady decode step (tpot_gt); the exposed fraction is averaged over exactly the
+    iterations that land in that mode bin (prefill / ramp iterations excluded)."""
+    by_npu = {}  # npu -> {iter: (total_cyc, exposed_cyc)}
+    for m in _EXPOSED_RE.finditer(text or ""):
+        npu, it, cyc, exc = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+        by_npu.setdefault(npu, {})[it] = (cyc, exc)
+    pairs = []  # (total_delta, exposed_delta) per iteration
     for iters in by_npu.values():
-        seq = [iters[k] for k in sorted(iters)]
-        deltas += [b - a for a, b in zip(seq, seq[1:]) if b > a]
-    if not deltas:
-        return None
-    # mode of per-iteration deltas, binned to 0.1 ms. The steady decode step
-    # repeats thousands of times so the mode is sharp; sub-ms bins avoid the
-    # +/-1 ms quantization that made small-TPOT (10-20 ms) curves look jagged.
-    binned = collections.Counter(round(d / 1e5) / 10.0 for d in deltas)
-    return float(binned.most_common(1)[0][0])
+        ks = sorted(iters)
+        for a, b in zip(ks, ks[1:]):
+            dt = iters[b][0] - iters[a][0]
+            de = iters[b][1] - iters[a][1]
+            if dt > 0:
+                pairs.append((dt, de))
+    if not pairs:
+        return None, None
+    binned = collections.Counter(round(dt / 1e5) / 10.0 for dt, _ in pairs)
+    mode_ms = float(binned.most_common(1)[0][0])
+    # exposed fraction over only the steady (mode-bin) iterations
+    sel = [(dt, de) for dt, de in pairs if round(dt / 1e5) / 10.0 == mode_ms]
+    sum_dt = sum(dt for dt, _ in sel)
+    sum_de = sum(max(0, de) for _, de in sel)
+    ef = (sum_de / sum_dt) if sum_dt > 0 else None
+    return mode_ms, ef
+
+
+def parse_steady_decode_cycle(text):
+    """Back-compat shim: steady decode tpot_gt only."""
+    gt, _ = parse_steady_decode(text)
+    return gt
 
 
 OVERLAP_EFFICIENCY = 0.8   # eta: fraction of the overlappable comm a real
@@ -443,15 +457,18 @@ def run_one(label, cfg, ep, meta, mode, isl, osl, max_tokens, batch_per_inst, ou
                     "error": err, **meta}
         m = parse_metrics(out_csv) or {}
         _log = (proc.stdout or "") + (proc.stderr or "")
-        exposed = parse_exposed_log(_log) or {}
-        gt = parse_steady_decode_cycle(_log)
+        exposed = parse_exposed_log(_log) or {}   # cumulative total/exposed (reference cols)
+        gt, ef = parse_steady_decode(_log)         # steady-decode tpot_gt + consistent exposed_frac
         if gt is not None:
             m["tpot_gt_ms"] = gt
+        if ef is not None:
+            # use the STEADY-DECODE exposed (same iterations as tpot_gt), not the
+            # cumulative run-average (which folds in prefill) — they must share a basis.
+            exposed["exposed_frac"] = ef
         # Analytical comp-comm overlap (DeepEP/AIC++): hide the all-to-all behind
         # the other micro-batch's compute. Reported alongside the serial tpot_gt.
-        _ef = exposed.get("exposed_frac")
-        if gt is not None and _ef is not None:
-            t_ov, ef_ov = apply_overlap(gt, _ef)
+        if gt is not None and ef is not None:
+            t_ov, ef_ov = apply_overlap(gt, ef)
             m["tpot_gt_overlap_ms"] = t_ov
             m["exposed_frac_overlap"] = ef_ov
         analyt = analytical_estimates(_MODEL_CFG, ep, batch_per_inst,
