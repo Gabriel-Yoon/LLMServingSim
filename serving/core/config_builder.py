@@ -722,16 +722,21 @@ def _compute_fb2d_dims(dp_size, topology_config):
         topos   = ["FlattenedButterfly"]
         fb_rows = [fb_r]
     elif dp_size % panel_size == 0:
-        # Multi-panel: FlattenedButterfly for intra-panel + Ring for inter-panel.
-        # The Ring dim has no electrical/optical split → elec == regular link.
+        # Multi-panel: FlattenedButterfly for intra-panel + a FullyConnected
+        # (optical-switch / crossbar) inter-panel dim. Panels attach to an optical
+        # circuit switch, so inter-panel is a single switched hop — NOT a Ring.
+        # Modelling it as a Ring charged O(n_panels) hops and (wrongly) penalised
+        # configs with many small panels, inverting the EP>rack cliff: the
+        # all-to-all cost must be set by the inter-domain BANDWIDTH (optical vs IB),
+        # not by domain count. FullyConnected makes it bandwidth-bound (1 hop).
         n_panels = dp_size // panel_size
         dims = [panel_size, n_panels]
         bws  = [intra_opt_bw, inter_bw]
         lats = [intra_opt_lat, inter_lat]
         elec_bws = [intra_elec_bw, inter_bw]
         elec_lats = [intra_elec_lat, inter_lat]
-        topos   = ["FlattenedButterfly", "Ring"]
-        fb_rows = [rows, 0]  # 0 = not applicable for Ring dim
+        topos   = ["FlattenedButterfly", "FullyConnected"]
+        fb_rows = [rows, 0]  # 0 = not applicable for the inter-panel dim
     else:
         raise ValueError(
             f"EP={dp_size} is not a multiple of panel_size={panel_size} ({rows}×{cols}) "
