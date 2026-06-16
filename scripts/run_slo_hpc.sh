@@ -29,16 +29,23 @@ MAXOSL=24         # cap decode tokens: steady TPOT is reached in a few tokens, s
 TIMEOUT=10800     # 3h per (model,ds,ep,pd,qps-list) invocation
 MEMGB=1024
 
-# (model, tpot_slo is auto from slo_eval; we just pass model/dataset/qps)
-# QPS lists are COARSE starting points — tune after the first pass.
+# QPS lists below are the EP=8 baseline (cluster-wide). They are SCALED by ep/8
+# inside run() so the PER-INSTANCE load stays constant across EP. Without this,
+# ep128 gets n_req(96) < 128 instances and a tiny cluster QPS -> most instances
+# are idle -> the DP-sync barrier makes every idle instance emit dummy batches
+# each iteration -> dummy explosion -> effective hang. (ep8 ran fine; the cliff
+# ep128 stalled purely from this starvation, not prefill — ep8 did full prefill.)
 run () {
   local model="$1" tag="$2" ds="$3" pd="$4" ep="$5" qps="$6"
-  echo "=== SLO: $tag ds=$ds pd=$pd ep=$ep qps=[$qps] ==="
+  local f=$(( ep / 8 )); [ "$f" -lt 1 ] && f=1     # per-instance-load scale (ep8 base)
+  local sqps=""; for q in $qps; do sqps="$sqps $(echo "$q * $f" | bc -l)"; done
+  local nreq=$(( NREQ * f ))
+  echo "=== SLO: $tag ds=$ds pd=$pd ep=$ep qps=[$sqps] n_req=$nreq (scaled x$f) ==="
   MOE_ALLTOALL=1 python scripts/slo_eval.py \
     --model "$model" --hardware H100 --tp 1 \
     --dataset "$ds" --pd-mode "$pd" --ep "$ep" \
     --panel $PANEL --fixed-wg $WG --inter-opt-bw $INTER_BW --nvl72-rack $RACK \
-    --fabrics glass nvl72 --qps-list $qps --n-req $NREQ --max-osl $MAXOSL \
+    --fabrics glass nvl72 --qps-list $sqps --n-req $nreq --max-osl $MAXOSL \
     --npu-mem-gb $MEMGB --timeout $TIMEOUT \
     --out "outputs/slo_eval/${tag}_${ds}_${pd}_ep${ep}.csv"
 }
