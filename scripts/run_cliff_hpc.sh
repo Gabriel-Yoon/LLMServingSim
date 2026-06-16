@@ -22,7 +22,11 @@ EP_LIST="8 16 32 64 128"
 PANEL="4 4"          # glass panel 4x4 (16 GPUs); WG cap 5
 WG=5
 RACK=64              # NVL72 NVLink-domain boundary (real)
-BATCH=4
+BATCH=16             # decode concurrency per instance (ViBE-matched). batch=4 was
+                     # too small: tiny all-to-all volume muted the NVL72 IB cliff.
+                     # Larger batch -> bigger a2a -> pronounced cliff (cliff scales
+                     # with batch). batch doesn't OOM like EP (a2a size is a scalar,
+                     # not graph nodes); only N=EP*batch request count grows.
 ISL=256
 OSL=24               # enough steady-decode samples for tpot_gt; keep small for speed
 TIMEOUT=10800        # 3h per config
