@@ -111,6 +111,7 @@ class TraceCtx:
     tp_dim: list       # involved_dim for TP collectives (ALLREDUCE), None = all dims
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
+    topology_dims: list = None  # per-dim NPU counts (npus_count); lets the MoE all-to-all check the innermost (O(N^2)) dim size before choosing full vs inter-only scoping
 
 
 @dataclass
@@ -830,7 +831,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                     tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                     tp_dim=None, ep_dim=None, dp_sum_total_len=0, topology_dims=None):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -863,6 +864,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+        topology_dims=topology_dims,
     )
 
 
@@ -963,7 +965,10 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
         if wt_loc != 'LOCAL':
             power_acc.dram_weight_bytes += wt
         if comm_size > 0:
-            power_acc.link_data_bytes += total_ring_data(comm_size, ctx.tp_size, collective=comm_type.lower())
+            # comm_type may carry an involved_dim suffix (e.g. 'ALLREDUCE:1,0');
+            # strip it for the power-model collective lookup.
+            base_collective = comm_type.split(':')[0].lower()
+            power_acc.link_data_bytes += total_ring_data(comm_size, ctx.tp_size, collective=base_collective)
 
     return latency_ns
 
@@ -1003,6 +1008,36 @@ def _inter_only_dim(involved_dim):
     scoped = [False] * len(involved_dim)
     scoped[trues[-1]] = True
     return scoped
+
+
+# Max innermost ('Local', O(N^2)) involved-dim size for which a FULL multi-dim
+# all-to-all is simulated honestly rather than scoped to the inter-domain link.
+# DEFAULT 0 = always inter-only (the original, tractable behaviour): ASTRA's
+# AllToAll is O(N^2) packets on the innermost dim, so a full all-to-all over a
+# 16+ GPU panel is prohibitively slow under emulation (this re-introduced
+# per-iteration timeouts when it defaulted to 32). The full-a2a path is kept as
+# an opt-in (set A2A_FULL_MAX_LOCAL>0) for the in-domain fairness analysis only;
+# it does NOT affect the EP>rack reach cliff, where both fabrics are multi-domain
+# and inter-only-scoped symmetrically.
+_A2A_FULL_MAX_LOCAL = int(os.environ.get('A2A_FULL_MAX_LOCAL', '0'))
+
+
+def _moe_a2a_dim(involved_dim, topology_dims, trues):
+    """Pick the involved_dim for a multi-domain MoE all-to-all.
+
+    Keeps the FULL all-to-all over every involved dim when the innermost
+    (lowest-index, O(N^2) 'Local') dimension is small enough to simulate, so the
+    intra-domain shuffle is not handed out for free. Otherwise restricts to the
+    inter-domain (outermost) dim only — the slow cross-domain link dominates and
+    the full all-to-all over a large intra dim is intractable.
+    """
+    if topology_dims is None or not trues:
+        return _inter_only_dim(involved_dim)
+    inner = trues[0]
+    inner_size = topology_dims[inner] if inner < len(topology_dims) else 0
+    if inner_size and inner_size <= _A2A_FULL_MAX_LOCAL:
+        return list(involved_dim)
+    return _inter_only_dim(involved_dim)
 
 
 def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
@@ -1085,7 +1120,12 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
         a2a_tokens = bctx.total_len * k_top
         dispatch_comm_size = a2a_tokens * dispatch_per_token
         combine_comm_size = a2a_tokens * combine_per_token
-        a2a_dim = _inter_only_dim(ctx.ep_dim)
+        # Full all-to-all when the intra-domain (innermost) dim is small enough
+        # to simulate honestly (small glass panel), else inter-domain-only. This
+        # removes the transition-regime bias where a fabric with a small panel
+        # got its intra-domain shuffle for free while a single-domain rack paid
+        # the full collective. See _moe_a2a_dim.
+        a2a_dim = _moe_a2a_dim(ctx.ep_dim, ctx.topology_dims, ep_dim_trues)
         dispatch_comm_type = _with_dim('ALLTOALL', a2a_dim)
         combine_comm_type = _with_dim('ALLTOALL', a2a_dim)
     elif ep_total > 1:
@@ -1353,13 +1393,14 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                      tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                      tp_dim=None, ep_dim=None, dp_sum_total_len=0, topology_dims=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                           topology_dims=topology_dims)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1406,13 +1447,14 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0, topology_dims=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                           topology_dims=topology_dims)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1507,7 +1549,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True):
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True,
+                   topology_dims=None):
 
     model = batch.model
     config = get_config(model)
@@ -1554,7 +1597,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         variant=variant, kv_cache_dtype=kv_cache_dtype,
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
-                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                        topology_dims=topology_dims)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:

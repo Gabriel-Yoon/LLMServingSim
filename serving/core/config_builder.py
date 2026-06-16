@@ -134,8 +134,17 @@ def _resolve_dp_groups(all_instances, topology_config=None):
                         f"DP group '{group_name}': dp_group_size ({dp_size}) not divisible by "
                         f"topology_config.tile_size ({tile_size})"
                     )
-            tp_dim = [True, False, False]   # TP ALLREDUCE on dim 0 only
-            ep_dim = [True, True, True]     # EP ALLTOALL across all levels; trimmed later
+            if tp0 > 1:
+                # tp_size>1 prepends a dedicated TP dim (dim 0) to the FB topology
+                # (see _create_network_config). TP ALLREDUCE runs on that dim only;
+                # EP ALLTOALL runs on the FB spatial dims, never the TP dim — so the
+                # reach cliff stays governed by the EP interconnect while TP just
+                # shards the dense compute.
+                tp_dim = [True, False, False, False]
+                ep_dim = [False, True, True, True]
+            else:
+                tp_dim = [True, False, False]   # TP ALLREDUCE on dim 0 only
+                ep_dim = [True, True, True]     # EP ALLTOALL across all levels; trimmed later
         else:
             tp_dim = [True, False]
             if ep_total <= tp0:
@@ -837,6 +846,7 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
     if is_fb and dp_groups:
         first_group = next(iter(dp_groups.values()))
         dp_size = len(first_group)
+        tp_size = first_group[0]["tp_size"]
         tc_type = topology_config.get("type")
         if tc_type == "fb_2d":
             dims, bandwidths, latencies, topology_names, fb_rows_list, elec_bandwidths, elec_latencies = \
@@ -845,6 +855,23 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
             dims, bandwidths, latencies = _compute_fb_dims(dp_size, topology_config)
             topology_names = None
             fb_rows_list = None
+        if tp_size > 1:
+            # Prepend a dedicated TP dimension (dim 0) to the FB topology: each EP
+            # rank/panel-position is a tp_size-GPU group doing the dense ALLREDUCE on
+            # a fast intra-node FullyConnected link. The TP link reuses the fabric's
+            # innermost (fastest local) bandwidth/latency. EP collectives are scoped
+            # to the FB dims (ep_dim leads with False), so the reach cliff is
+            # unchanged — TP only shards the dense compute.
+            dims = [tp_size] + list(dims)
+            bandwidths = [bandwidths[0]] + list(bandwidths)
+            latencies = [latencies[0]] + list(latencies)
+            if topology_names is not None:
+                topology_names = ["FullyConnected"] + list(topology_names)
+            if fb_rows_list is not None:
+                fb_rows_list = [0] + list(fb_rows_list)
+            if elec_bandwidths is not None:
+                elec_bandwidths = [elec_bandwidths[0]] + list(elec_bandwidths)
+                elec_latencies = [elec_latencies[0]] + list(elec_latencies)
     elif dp_groups:
         first_group = next(iter(dp_groups.values()))
         tp_size = first_group[0]["tp_size"]
@@ -911,6 +938,10 @@ def _fixup_collective_dims(instances, final_dims):
             v = inst.get(attr)
             if isinstance(v, list) and len(v) > ndims:
                 inst[attr] = v[:ndims]
+        # Expose the actual per-dim NPU counts so the MoE all-to-all can decide
+        # whether a full (intra+inter) all-to-all is tractable on the innermost
+        # (O(N^2)) dimension, or must fall back to inter-domain-only scoping.
+        inst["topology_dims"] = list(final_dims)
 
 
 # Validate memory configuration against placement settings

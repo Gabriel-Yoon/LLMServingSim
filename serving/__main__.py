@@ -545,6 +545,7 @@ def main():
                                        power_model, pim_models[nid],
                                        enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
+                                       topology_dims=inst.get("topology_dims"),
                                        dp_sum_total_len=sum_total_len, enable_block_copy=enable_block_copy)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id], enable_local_offloading,
@@ -620,6 +621,7 @@ def main():
                                            power_model, pim_models[nid],
                                            enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
+                                           topology_dims=inst.get("topology_dims"),
                                            dp_sum_total_len=sum_total_len, enable_block_copy=enable_block_copy)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id], enable_local_offloading,
@@ -660,6 +662,7 @@ def main():
                                    node_id, instance_id, max_num_batched_tokens, max_num_seqs, placement[instance_id], block_mode_on[instance_id],
                                    expert_routing_policy, enable_prefix_caching, enable_attn_offloading, power_model, pim_models[node_id],
                                    enable_sub_batch_interleaving, fp, dtype=dtype, kv_cache_dtype=kv_cache_dtype,
+                                   topology_dims=instance.get("topology_dims"),
                                    enable_block_copy=enable_block_copy)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id], enable_local_offloading)
