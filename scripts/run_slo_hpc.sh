@@ -47,7 +47,7 @@ run () {
     return
   fi
   local f=$(( ep / 8 )); [ "$f" -lt 1 ] && f=1     # per-instance-load scale (ep8 base)
-  local sqps=""; for q in $qps; do sqps="$sqps $(echo "$q * $f" | bc -l)"; done
+  local sqps=""; for q in $qps; do sqps="$sqps $(awk "BEGIN{print $q*$f}")"; done
   local nreq=$(( NREQ * f ))
   echo "=== SLO: $tag ds=$ds pd=$pd ep=$ep qps=[$sqps] n_req=$nreq (scaled x$f) ==="
   MOE_ALLTOALL=1 python scripts/slo_eval.py \
