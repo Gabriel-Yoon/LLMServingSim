@@ -37,6 +37,15 @@ MEMGB=1024
 # ep128 stalled purely from this starvation, not prefill — ep8 did full prefill.)
 run () {
   local model="$1" tag="$2" ds="$3" pd="$4" ep="$5" qps="$6"
+  local out="outputs/slo_eval/${tag}_${ds}_${pd}_ep${ep}.csv"
+  # Resumable: skip configs whose CSV already exists (header + >=1 row), so a
+  # re-run only does the missing ones and never overwrites good data. ep8 params
+  # are unchanged by the EP-scaling (f=1), so those CSVs stay valid. FORCE=1 to
+  # re-run everything.
+  if [ -z "${FORCE:-}" ] && [ -s "$out" ] && [ "$(wc -l < "$out")" -gt 1 ]; then
+    echo "=== SKIP (exists): $out  (FORCE=1 to redo) ==="
+    return
+  fi
   local f=$(( ep / 8 )); [ "$f" -lt 1 ] && f=1     # per-instance-load scale (ep8 base)
   local sqps=""; for q in $qps; do sqps="$sqps $(echo "$q * $f" | bc -l)"; done
   local nreq=$(( NREQ * f ))
@@ -47,7 +56,7 @@ run () {
     --panel $PANEL --fixed-wg $WG --inter-opt-bw $INTER_BW --nvl72-rack $RACK \
     --fabrics glass nvl72 --qps-list $sqps --n-req $nreq --max-osl $MAXOSL \
     --npu-mem-gb $MEMGB --timeout $TIMEOUT \
-    --out "outputs/slo_eval/${tag}_${ds}_${pd}_ep${ep}.csv"
+    --out "$out"
 }
 
 # ── DeepSeek-V3 (256 experts; TPOT SLO 125ms) ──
