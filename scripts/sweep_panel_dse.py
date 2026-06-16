@@ -58,6 +58,8 @@ MODEL_NAME = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 HARDWARE   = "H100"
 NPU_MEM    = {"mem_size": 80, "mem_bw": 3350, "mem_latency": 0}
 CPU_MEM    = {"mem_size": 1024, "mem_bw": 512, "mem_latency": 0}
+TP         = 1     # tensor-parallel degree per EP rank (shards dense; ALLREDUCE on a
+                   # prepended FullyConnected TP dim, EP all-to-all on the FB dims)
 
 BLOCK_SIZE = 16
 MAX_SEQS   = 128
@@ -137,7 +139,7 @@ def compute_nwg_cap(grid_rows, grid_cols, tile_area_mm2=1600, bump_density=1.083
 
 def _instance(ep):
     return {"model_name": MODEL_NAME, "hardware": HARDWARE, "npu_mem": NPU_MEM,
-            "num_npus": 1, "tp_size": 1, "ep_size": ep, "dp_group": "A", "pd_type": None}
+            "num_npus": TP, "tp_size": TP, "ep_size": ep, "dp_group": "A", "pd_type": None}
 
 
 def _node(ep):
@@ -634,7 +636,7 @@ def build_batch_x_ep_runs(panel, wg, inter_opt_bw, batch_list, ep_list, mode):
 
 
 def main():
-    global MODEL_NAME, HARDWARE, NVL72_RACK, INTER_LAT
+    global MODEL_NAME, HARDWARE, NVL72_RACK, INTER_LAT, TP
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sweep", choices=["intra", "inter", "epscale", "batch", "batch_x_ep", "latency"],
                     required=True)
@@ -670,6 +672,9 @@ def main():
                     help="HF model id (must have configs/model/<id>.json and profiler/perf/<hw>/<id>/). "
                          "DeepSeek-V3 (hidden 7168, 256 experts, 61 layers) is far more bandwidth-bound than Qwen.")
     ap.add_argument("--hardware", default=HARDWARE)
+    ap.add_argument("--tp", type=int, default=1,
+                    help="tensor-parallel degree per EP rank (shards dense compute; "
+                         "needs a profiled tp<N> folder). Total GPUs = TP x EP.")
     ap.add_argument("--npu-mem-gb", type=int, default=NPU_MEM["mem_size"],
                     help="per-NPU memory capacity (GB). Raise for large models like DeepSeek-V3 at tp=1 "
                          "(671B replicates dense weights per GPU); only gates the weight-fit/KV check, "
@@ -689,6 +694,7 @@ def main():
     # Override the model/hardware globals used by the config builders.
     MODEL_NAME = args.model
     HARDWARE = args.hardware
+    TP = args.tp
     NPU_MEM["mem_size"] = args.npu_mem_gb
     NVL72_RACK = args.nvl72_rack
     INTER_LAT = args.inter_lat
