@@ -446,9 +446,26 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                     # inside _compute_fb_dims via dispatch
                 else:
                     num_dims = 2 if has_dp else 1
+                # Topology-aware collective implementation. A FullyConnected
+                # (NVSwitch / optical-switch) or FlattenedButterfly dim performs an
+                # all-pairs / low-diameter exchange in ~1 round (bandwidth-bound) ->
+                # "direct"; only a real Ring dim uses "ring". Charging "ring"
+                # everywhere made a switched 64-GPU domain pay (N-1) x hop_latency,
+                # which inflated the in-domain MoE collective and (wrongly) made the
+                # cost SURGE inside the NVLink rack (EP<=64) instead of at the
+                # inter-rack IB bandwidth boundary (EP>64). With "direct", in-domain
+                # collectives are bandwidth-bound (cheap on fast NVLink/optical) and
+                # the cost rises where the slow link is actually crossed.
+                if is_fb and topology_config.get("type") == "fb_2d":
+                    _, _, _, topo_names, _, _, _ = _compute_fb2d_dims(
+                        max_dp if has_dp else 1, topology_config)
+                else:
+                    topo_names = ["FullyConnected"] * num_dims   # hierarchical_fb / standard
+                topo_names = (list(topo_names) + ["FullyConnected"] * num_dims)[:num_dims]
+                impls = ["ring" if t == "Ring" else "direct" for t in topo_names]
                 for key in ["all-reduce-implementation", "all-gather-implementation",
                             "reduce-scatter-implementation", "all-to-all-implementation"]:
-                    system_config[key] = ["ring"] * num_dims
+                    system_config[key] = list(impls)
 
                 with open(system_config_path, "w", encoding="utf-8") as f:
                     json.dump(system_config, f, ensure_ascii=False, indent=2)
