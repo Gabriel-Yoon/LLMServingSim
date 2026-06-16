@@ -60,6 +60,8 @@ NPU_MEM    = {"mem_size": 80, "mem_bw": 3350, "mem_latency": 0}
 CPU_MEM    = {"mem_size": 1024, "mem_bw": 512, "mem_latency": 0}
 TP         = 1     # tensor-parallel degree per EP rank (shards dense; ALLREDUCE on a
                    # prepended FullyConnected TP dim, EP all-to-all on the FB dims)
+POWER      = False # when True, attach a node "power" spec so the simulator
+                   # integrates real NPU+HBM+link energy (see _power_spec)
 
 BLOCK_SIZE = 16
 MAX_SEQS   = 128
@@ -142,6 +144,35 @@ def _instance(ep):
             "num_npus": TP, "tp_size": TP, "ep_size": ep, "dp_group": "A", "pd_type": None}
 
 
+def _power_spec(fabric, num_npus):
+    """Node power spec for the simulator's energy integrator (config_builder reads
+    node["power"]; auto-fills npu.num_npus and dram.mem_size). FIRST-CUT values —
+    cited, TUNE for the paper. Only `link` differs by fabric (the DSE variable);
+    everything else is identical so the glass-vs-NVL72 delta is the fabric +
+    completion-time effect, not param skew.
+
+      NPU  : H100 SXM 700 W TDP (active), ~150 W idle [NVIDIA H100 datasheet].
+      HBM  : 3.9 pJ/bit [HBM3 ~3.9-7 pJ/bit literature].
+      link : glass = optical CPO, 1.15 pJ/bit [PanelScale Tbl1], PASSIVE fabric
+             (no switch) but always-on laser/SerDes static ~tens W/GPU (CLAUDE.md:
+             x5 WG ~ 59 W/GPU at full BW; use ~40 W/GPU baseline).
+             NVL72 = NVLink electrical + ACTIVE NVSwitch 540 W/rack / 72 = 7.5 W/GPU
+             + SerDes ~ 12 W/GPU; electrical e_bit ~2 pJ/bit (conservative).
+    """
+    npu = {HARDWARE: {"idle_power": 150.0, "active_power": 700.0,
+                      "standby_power": 150.0, "standby_duration": 0.0}}
+    cpu = {"idle_power": 200.0, "active_power": 400.0, "util": 0.1}
+    dram = {"dimm_size": 16, "idle_power": 5.0, "energy_per_bit": 3.9}  # mem_size auto
+    nic = {"idle_power": 15.0, "num_nics": 1}
+    storage = {"idle_power": 5.0, "num_devices": 1}
+    if fabric == "glass":
+        link = {"idle_power": 40.0, "num_links": num_npus, "energy_per_bit": 1.15}
+    else:  # nvl72
+        link = {"idle_power": 12.0, "num_links": num_npus, "energy_per_bit": 2.0}
+    return {"base_node_power": 0.0, "npu": npu, "cpu": cpu, "dram": dram,
+            "link": link, "nic": nic, "storage": storage}
+
+
 def _node(ep):
     return {"num_instances": ep, "cpu_mem": CPU_MEM, "instances": [_instance(ep) for _ in range(ep)]}
 
@@ -150,7 +181,7 @@ def make_panel_config(rows, cols, ep, wg_count, inter_bw, intra_lat=None, inter_
     """fb_2d config with the electrical/optical split. inter_bw=0 → single panel.
     intra_lat / inter_lat override the default optical link latencies (ns) — used
     by the latency-radix sweep; default to the module constants."""
-    return {
+    cfg = {
         "num_nodes": 1,
         "topology_config": {
             "type": "fb_2d",
@@ -163,6 +194,9 @@ def make_panel_config(rows, cols, ep, wg_count, inter_bw, intra_lat=None, inter_
         },
         "nodes": [_node(ep)],
     }
+    if POWER:
+        cfg["nodes"][0]["power"] = _power_spec("glass", ep * TP)
+    return cfg
 
 
 NVL72_RACK = 64    # NVLink domain size used as the rack boundary (largest pow2 <=72 dividing 256/384)
@@ -172,7 +206,7 @@ def make_nvl72_config(ep):
     racks over InfiniBand (~50 GB/s). EP<=64 → flat NVLink; EP>64 → [64, ep/64]
     with the cross-rack dim at IB bandwidth. This inter-rack IB cliff is the
     weak point large models hit, since they need EP >> 64."""
-    return {
+    cfg = {
         "num_nodes": 1,
         "topology_config": {
             "type": "hierarchical_fb", "panel_size": NVL72_RACK, "tile_size": NVL72_RACK,
@@ -181,6 +215,9 @@ def make_nvl72_config(ep):
         },
         "nodes": [_node(ep)],
     }
+    if POWER:
+        cfg["nodes"][0]["power"] = _power_spec("nvl72", ep * TP)
+    return cfg
 
 
 # ─────────────────────────── Workload ─────────────────────────────────────────
@@ -398,6 +435,27 @@ def analytical_estimates(model_cfg, ep, batch_per_inst, inter_bw, intra_bw, fp_b
 
 
 # ─────────────────────────── Run one config ───────────────────────────────────
+_POWER_TOTAL_RE = re.compile(r'Total energy consumption \(kJ\):\s+([0-9.]+)')
+_POWER_COMP_RE = re.compile(r'([A-Za-z][A-Za-z ]*?) energy consumption \(J\):\s+([0-9.]+)')
+
+
+def parse_power(text):
+    """Pull the simulator's final energy summary (printed by PowerModel) into
+    columns. Empty dict if power modeling was off. NPU includes HBM (weights are
+    LOCAL -> folded into NPU active power), Link is the fabric-differentiated part."""
+    out = {}
+    m = _POWER_TOTAL_RE.search(text or "")
+    if m:
+        out["energy_total_kj"] = float(m.group(1))
+    key_of = {"npu": "energy_npu_j", "cpu": "energy_cpu_j",
+              "memory": "energy_dram_j", "link": "energy_link_j"}
+    for cm in _POWER_COMP_RE.finditer(text or ""):
+        k = key_of.get(cm.group(1).strip().lower())
+        if k:
+            out[k] = float(cm.group(2))
+    return out
+
+
 CSV_FIELDS = ["label", "sweep", "mode", "topology", "fabric", "panel", "ep",
               "per_device_batch", "wg_count", "intra_opt_bw", "inter_bw", "status",
               "ttft_ms", "e2e_latency_ms", "tpot_avg_ms", "tpot_steady_ms", "tpot_gt_ms",
@@ -405,6 +463,7 @@ CSV_FIELDS = ["label", "sweep", "mode", "topology", "fabric", "panel", "ep",
               "interactivity_tok_s_user", "n_completed",
               "total_cycles", "exposed_cycles", "compute_cycles", "exposed_frac",
               "all_to_all_us", "weight_load_us",
+              "energy_total_kj", "energy_npu_j", "energy_cpu_j", "energy_dram_j", "energy_link_j",
               "elapsed_s", "error"]
 
 
@@ -477,7 +536,7 @@ def run_one(label, cfg, ep, meta, mode, isl, osl, max_tokens, batch_per_inst, ou
                                       float(meta.get("inter_bw") or NVL72_ELEC_BW),
                                       float(meta.get("intra_opt_bw") or NVL72_ELEC_BW))
         return {"label": label, "status": "ok", "elapsed_s": elapsed, "error": "",
-                **meta, **m, **exposed, **analyt}
+                **meta, **m, **exposed, **analyt, **parse_power(_log)}
     except subprocess.TimeoutExpired:
         return {"label": label, "status": "timeout", "elapsed_s": timeout,
                 "error": f"timeout>{timeout}s", **meta}
@@ -636,7 +695,7 @@ def build_batch_x_ep_runs(panel, wg, inter_opt_bw, batch_list, ep_list, mode):
 
 
 def main():
-    global MODEL_NAME, HARDWARE, NVL72_RACK, INTER_LAT, TP
+    global MODEL_NAME, HARDWARE, NVL72_RACK, INTER_LAT, TP, POWER
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sweep", choices=["intra", "inter", "epscale", "batch", "batch_x_ep", "latency"],
                     required=True)
@@ -675,6 +734,9 @@ def main():
     ap.add_argument("--tp", type=int, default=1,
                     help="tensor-parallel degree per EP rank (shards dense compute; "
                          "needs a profiled tp<N> folder). Total GPUs = TP x EP.")
+    ap.add_argument("--power", action="store_true",
+                    help="attach a node power spec so the simulator integrates real "
+                         "NPU+HBM+link energy (glass optical vs NVL72 NVLink+NVSwitch).")
     ap.add_argument("--npu-mem-gb", type=int, default=NPU_MEM["mem_size"],
                     help="per-NPU memory capacity (GB). Raise for large models like DeepSeek-V3 at tp=1 "
                          "(671B replicates dense weights per GPU); only gates the weight-fit/KV check, "
@@ -695,6 +757,7 @@ def main():
     MODEL_NAME = args.model
     HARDWARE = args.hardware
     TP = args.tp
+    POWER = args.power
     NPU_MEM["mem_size"] = args.npu_mem_gb
     NVL72_RACK = args.nvl72_rack
     INTER_LAT = args.inter_lat
