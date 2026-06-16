@@ -1010,6 +1010,20 @@ def _inter_only_dim(involved_dim):
     return scoped
 
 
+def _inner_only_dim(involved_dim):
+    """Complement of _inter_only_dim: the within-domain dims (all involved dims
+    EXCEPT the outermost). For a single involved dim, returns it unchanged."""
+    if involved_dim is None:
+        return None
+    trues = [i for i, v in enumerate(involved_dim) if v]
+    if len(trues) <= 1:
+        return involved_dim
+    scoped = [False] * len(involved_dim)
+    for i in trues[:-1]:
+        scoped[i] = True
+    return scoped
+
+
 # Max innermost ('Local', O(N^2)) involved-dim size for which a FULL multi-dim
 # all-to-all is simulated honestly rather than scoped to the inter-domain link.
 # DEFAULT 0 = always inter-only (the original, tractable behaviour): ASTRA's
@@ -1110,42 +1124,42 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # EP<=64) has no cross-domain cliff, so it falls back to the cheap O(N)
     # AllGather/ReduceScatter — which is also the vLLM default backend.
     ep_dim_trues = [i for i, v in enumerate(ctx.ep_dim or []) if v]
-    _use_a2a = _moe_a2a and ep_total > 1 and len(ep_dim_trues) > 1
+    _multi = _moe_a2a and ep_total > 1 and len(ep_dim_trues) > 1
+    # cross-domain (inter) all-to-all, emitted as extra collective layers around
+    # the expert block when EP spans >1 topology domain. Default: none.
+    cross_dispatch_type = cross_combine_type = 'NONE'
+    cross_comm_size = 0
 
-    if _use_a2a:
-        # DeepEP-style all-to-all volume per rank = total_len * k (each token
-        # routed to k=num_experts_per_tok experts); ~constant in EP. Scoped to
-        # the inter-domain dim so ASTRA spreads it over the slow cross-domain link.
+    if _moe_a2a and ep_total > 1:
+        # DeepEP volume (each token -> k experts; ~constant in EP).
         k_top = max(1, ctx.config.get('num_experts_per_tok', 1))
         a2a_tokens = bctx.total_len * k_top
         dispatch_comm_size = a2a_tokens * dispatch_per_token
         combine_comm_size = a2a_tokens * combine_per_token
-        # Full all-to-all when the intra-domain (innermost) dim is small enough
-        # to simulate honestly (small glass panel), else inter-domain-only. This
-        # removes the transition-regime bias where a fabric with a small panel
-        # got its intra-domain shuffle for free while a single-domain rack paid
-        # the full collective. See _moe_a2a_dim.
-        a2a_dim = _moe_a2a_dim(ctx.ep_dim, ctx.topology_dims, ep_dim_trues)
-        dispatch_comm_type = _with_dim('ALLTOALL', a2a_dim)
-        combine_comm_type = _with_dim('ALLTOALL', a2a_dim)
+        # WITHIN-domain shuffle over the fast intra-domain link, modelled as the
+        # tractable O(N) AllGather/ReduceScatter (a true intra all-to-all over a
+        # 64-GPU rack is O(N^2) and hangs). For single-domain EP this is the whole
+        # collective; for multi-domain it is the inner dim(s) only.
+        within_dim = _inner_only_dim(ctx.ep_dim) if _multi else ctx.ep_dim
+        dispatch_comm_type = _with_dim('ALLGATHER', within_dim)
+        combine_comm_type = _with_dim('REDUCESCATTER', within_dim)
+        if _multi:
+            # CROSS-domain shuffle over the SLOW inter-domain link (IB / inter-panel
+            # optical) as an ALLTOALL scoped to the outermost dim. EP>rack must pay
+            # BOTH legs: the old inter-only-a2a dropped the within-domain leg, which
+            # made NVL72 cheaper at EP=128 (2 racks, 1 hop) than at EP=64 (full
+            # 64-way in-rack) and INVERTED the cliff. With both legs, EP=128 =
+            # within-rack (NVLink) + cross-rack (IB) > EP=64, and the slow IB makes
+            # NVL72 lose to glass optical at the cliff.
+            cross_dim = _inter_only_dim(ctx.ep_dim)
+            cross_dispatch_type = _with_dim('ALLTOALL', cross_dim)
+            cross_combine_type = _with_dim('ALLTOALL', cross_dim)
+            cross_comm_size = a2a_tokens * dispatch_per_token
     elif ep_total > 1:
-        if _moe_a2a:
-            # Single-domain DeepEP: the real volume is the all-to-all dispatch =
-            # total_len × k (each token → its k experts), NOT the gather-all
-            # (×ep_total) that the vLLM allgather_reducescatter backend moves.
-            # Keep the ALLGATHER/REDUCESCATTER collective TYPE for ASTRA
-            # tractability (single-domain all-to-all is O(N^2) and hangs at large
-            # EP), but anchor the VOLUME to DeepEP so in-domain large-EP comm is
-            # not over-counted (~ep_total/2k× too high otherwise).
-            k_top = max(1, ctx.config.get('num_experts_per_tok', 1))
-            a2a_tokens = bctx.total_len * k_top
-            dispatch_comm_size = a2a_tokens * dispatch_per_token
-            combine_comm_size = a2a_tokens * combine_per_token
-        else:
-            # vLLM allgather_reducescatter backend (small-EP default): gather all
-            # tokens to all ranks, each rank computes its experts, reduce-scatter.
-            dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
-            combine_comm_size = effective_total_len_comm * combine_per_token
+        # vLLM allgather_reducescatter backend (MOE_ALLTOALL off): gather all
+        # tokens to all ranks, each rank computes its experts, reduce-scatter.
+        dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
+        combine_comm_size = effective_total_len_comm * combine_per_token
         dispatch_comm_type = _with_dim('ALLGATHER', ctx.ep_dim)
         combine_comm_type = _with_dim('REDUCESCATTER', ctx.ep_dim)
     else:
@@ -1165,6 +1179,14 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # Pre-expert AllGather power (dispatch)
     if power_acc is not None and ep_total > 1:
         power_acc.link_data_bytes += total_ring_data(dispatch_comm_size, ep_total, collective="allgather")
+
+    # Cross-domain dispatch (slow inter-domain link), emitted before the expert
+    # block so EP>rack pays the cross-rack/inter-panel leg on top of the within-
+    # domain AllGather above. comp_time=1ns: this is a collective-only node.
+    if cross_dispatch_type != 'NONE':
+        lines.append(formatter("moe_cross_dispatch", "1", 'LOCAL', str(cross_comm_size),
+            'LOCAL', '0', 'LOCAL', str(cross_comm_size), cross_dispatch_type,
+            str(cross_comm_size), batch_tag))
 
     for i in range(emit_ep):
         if i == 0:
@@ -1196,9 +1218,18 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
 
     lines.append(f"EXPERT END {combine_comm_type} {combine_comm_size}\n")
 
+    # Cross-domain combine (slow inter-domain link), the mirror of the cross
+    # dispatch — emitted after the expert block.
+    if cross_combine_type != 'NONE':
+        lines.append(formatter("moe_cross_combine", "1", 'LOCAL', str(cross_comm_size),
+            'LOCAL', '0', 'LOCAL', str(cross_comm_size), cross_combine_type,
+            str(cross_comm_size), batch_tag))
+
     # Post-expert ReduceScatter power (combine)
     if power_acc is not None and ep_total > 1:
         power_acc.link_data_bytes += total_ring_data(combine_comm_size, ep_total, collective="reducescatter")
+        if cross_comm_size > 0:
+            power_acc.link_data_bytes += total_ring_data(cross_comm_size, ep_total, collective="alltoall")
 
 
 # ======================================================================
