@@ -85,7 +85,12 @@ INTER_LAT      = 500.0    # ns  inter-panel: edge transceiver (~50-200ns) + shor
 # matching our N_WG×128 unidirectional convention.
 NVL72_ELEC_BW = 900.0     # 1800 GB/s bidirectional → 900 unidirectional
 NVL72_IB_BW   = 50.0      # inter-rack InfiniBand (only used for EP > 64)
-NVL72_LAT     = 1000.0    # ns  NVSwitch hop
+NVL72_LAT     = 500.0     # ns  NVSwitch hardware hop. The ~1-2us figures often
+                          # cited include software/kernel-launch overhead; the
+                          # hardware one-way hop is a few hundred ns. H100
+                          # NVSwitch collectives are bandwidth-dominated, so this
+                          # latency is a secondary factor vs the BW / IB-cliff.
+                          # glass CPO hop ~100 ns -> ~5x (not 10x) latency edge.
 NVL72_SWITCH_POWER = 540.0  # W/rack  (36 NVSwitch × 15 W); glass = passive WG → 0
 
 # ─────────────────────────── Sweep axes ───────────────────────────────────────
@@ -139,8 +144,10 @@ def _node(ep):
     return {"num_instances": ep, "cpu_mem": CPU_MEM, "instances": [_instance(ep) for _ in range(ep)]}
 
 
-def make_panel_config(rows, cols, ep, wg_count, inter_bw):
-    """fb_2d config with the electrical/optical split. inter_bw=0 → single panel."""
+def make_panel_config(rows, cols, ep, wg_count, inter_bw, intra_lat=None, inter_lat=None):
+    """fb_2d config with the electrical/optical split. inter_bw=0 → single panel.
+    intra_lat / inter_lat override the default optical link latencies (ns) — used
+    by the latency-radix sweep; default to the module constants."""
     return {
         "num_nodes": 1,
         "topology_config": {
@@ -148,8 +155,9 @@ def make_panel_config(rows, cols, ep, wg_count, inter_bw):
             "panel_rows": rows, "panel_cols": cols,
             "elec_bw": ELEC_BW, "elec_latency": ELEC_LAT,        # adjacent (fixed)
             "wg_count": wg_count, "wg_bw": WG_BW,                # optical far (swept)
-            "intra_opt_latency": INTRA_OPT_LAT,
-            "inter_bw": float(inter_bw), "inter_lat": INTER_LAT,  # inter-panel (swept)
+            "intra_opt_latency": (INTRA_OPT_LAT if intra_lat is None else float(intra_lat)),
+            "inter_bw": float(inter_bw),
+            "inter_lat": (INTER_LAT if inter_lat is None else float(inter_lat)),  # inter-panel
         },
         "nodes": [_node(ep)],
     }
@@ -295,8 +303,10 @@ def parse_steady_decode_cycle(text):
         deltas += [b - a for a, b in zip(seq, seq[1:]) if b > a]
     if not deltas:
         return None
-    # mode of per-iteration deltas, binned to the nearest ms
-    binned = collections.Counter(round(d / 1e6) for d in deltas)
+    # mode of per-iteration deltas, binned to 0.1 ms. The steady decode step
+    # repeats thousands of times so the mode is sharp; sub-ms bins avoid the
+    # +/-1 ms quantization that made small-TPOT (10-20 ms) curves look jagged.
+    binned = collections.Counter(round(d / 1e5) / 10.0 for d in deltas)
     return float(binned.most_common(1)[0][0])
 
 
@@ -376,6 +386,11 @@ def run_one(label, cfg, ep, meta, mode, isl, osl, max_tokens, batch_per_inst, ou
            "--block-size", str(BLOCK_SIZE), "--max-num-seqs", str(max_seqs),
            "--max-num-batched-tokens", str(max_tokens), "--dataset", wl_rel,
            "--output", out_rel, "--num-req", str(n_req), "--log-level", "INFO"]
+    # SBI=1 enables dual-sub-batch interleaving (comp-comm overlap, DeepEP/LMSYS-style)
+    # so the exposed-comm fraction reflects an overlap-optimized server, not the
+    # serial worst case.
+    if os.environ.get("SBI"):
+        cmd.append("--enable-sub-batch-interleaving")
 
     if dry_run:
         print(f"  [dry] {label:38s} ep={ep:<4d} b={batch_per_inst:<4d} {meta}")
@@ -478,6 +493,42 @@ def build_inter_runs(panels, inter_bws, fixed_wg, mode, isl, osl):
     return runs
 
 
+def build_latency_runs(panel, wg, lat_list, axis, mode, inter_opt_bw):
+    """Latency-radix sweep: hold BW (WG) and EP fixed, sweep the optical LINK
+    LATENCY and watch decode TPOT / TTFT. At sufficient WG the collective is
+    latency-bound (not BW-bound), so this isolates the glass switch-free hop
+    (~100 ns intra / ~500 ns inter) vs the NVL72 switched hop (1000 ns).
+
+      axis='intra' : single panel (EP=panel_size), sweep intra_opt_latency.
+      axis='inter' : two panels  (EP=2*panel_size), sweep inter_lat.
+
+    A single NVL72 run (fixed 1000 ns hop) is the horizontal reference.
+    """
+    rows, cols = panel
+    panel_size = rows * cols
+    ep = panel_size if axis == "intra" else panel_size * 2
+    multi = ep > panel_size
+    runs = []
+    for lat in lat_list:
+        if axis == "intra":
+            cfg = make_panel_config(rows, cols, ep, wg_count=wg, inter_bw=0.0, intra_lat=lat)
+        else:
+            cfg = make_panel_config(rows, cols, ep, wg_count=wg,
+                                    inter_bw=inter_opt_bw, inter_lat=lat)
+        meta = {"sweep": "latency", "mode": mode, "topology": "glass_fb", "fabric": "glass_fb",
+                "panel": panel_size, "ep": ep, "wg_count": wg, "lat_axis": axis,
+                "link_lat": lat, "intra_opt_bw": int(wg * WG_BW),
+                "inter_bw": (inter_opt_bw if multi else 0)}
+        runs.append((f"latency_{axis}_ep{ep}_lat{int(lat)}", cfg, ep, meta))
+    # NVL72 reference (fixed NVL72_LAT hop)
+    runs.append((f"latency_{axis}_ep{ep}_nvl72", make_nvl72_config(ep), ep,
+                 {"sweep": "latency", "mode": mode, "topology": "nvl72", "fabric": "nvl72",
+                  "panel": NVL72_RACK, "ep": ep, "wg_count": 0, "lat_axis": axis,
+                  "link_lat": NVL72_LAT, "intra_opt_bw": int(NVL72_ELEC_BW),
+                  "inter_bw": (NVL72_IB_BW if ep > NVL72_RACK else 0)}))
+    return runs
+
+
 def _fabric_pair(sweep_name, panel, wg, inter_opt_bw, ep, batch, mode):
     """Build the FB-glass + NVL72 run pair for one (EP, per-device batch) cell.
 
@@ -525,8 +576,14 @@ def build_batch_x_ep_runs(panel, wg, inter_opt_bw, batch_list, ep_list, mode):
 def main():
     global MODEL_NAME, HARDWARE, NVL72_RACK, INTER_LAT
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sweep", choices=["intra", "inter", "epscale", "batch", "batch_x_ep"],
+    ap.add_argument("--sweep", choices=["intra", "inter", "epscale", "batch", "batch_x_ep", "latency"],
                     required=True)
+    ap.add_argument("--lat-list", nargs="+", type=float, default=[30, 100, 300, 500, 1000],
+                    help="latency sweep: optical link latencies in ns (glass ~100 intra/500 inter "
+                         "vs NVL72 1000 hop)")
+    ap.add_argument("--lat-axis", choices=["intra", "inter"], default="intra",
+                    help="latency sweep: which optical link latency to vary (intra single-panel "
+                         "or inter multi-panel)")
     ap.add_argument("--ep-list", nargs="+", type=int, default=[16, 32, 64, 128, 256],
                     help="epscale/batch_x_ep: EP degrees to sweep (must divide model experts)")
     ap.add_argument("--batch-ep", type=int, default=64,
@@ -594,6 +651,9 @@ def main():
     elif args.sweep == "batch_x_ep":
         runs = build_batch_x_ep_runs(tuple(args.epscale_panel), args.fixed_wg, args.inter_opt_bw,
                                      args.batch_list, args.ep_list, args.mode)
+    elif args.sweep == "latency":
+        runs = build_latency_runs(tuple(args.epscale_panel), args.fixed_wg, args.lat_list,
+                                  args.lat_axis, args.mode, args.inter_opt_bw)
     else:
         runs = build_inter_runs(args.panels, args.inter_bw, args.fixed_wg, args.mode, args.isl, args.osl)
 
@@ -614,6 +674,9 @@ def main():
         print(f"  EP x batch grid: {args.ep_list} x {args.batch_list}  "
               f"glass panel {args.epscale_panel} wg{args.fixed_wg} inter-opt {args.inter_opt_bw}  vs  "
               f"NVL72 (IB {NVL72_IB_BW} @EP>{NVL72_RACK})")
+    elif args.sweep == "latency":
+        print(f"  latency-radix ({args.lat_axis}): link latency sweep {args.lat_list} ns  "
+              f"glass panel {args.epscale_panel} wg{args.fixed_wg}  vs  NVL72 ({NVL72_LAT:.0f} ns hop)")
     else:
         print(f"  fixed intra WG: {args.fixed_wg} (={int(args.fixed_wg*WG_BW)} GB/s)  inter_bw sweep: {args.inter_bw}")
     _wl_b = "per-run" if args.sweep in ("batch", "batch_x_ep") else args.batch_per_instance
