@@ -22,7 +22,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PANEL="4 4"; WG=5; RACK=64; INTER_BW=512
-NREQ=256          # requests per QPS point (raise for tighter goodput, e.g. 512)
+NREQ=96           # requests per QPS point (sim cost ~ NREQ x MAXOSL iterations)
+MAXOSL=24         # cap decode tokens: steady TPOT is reached in a few tokens, so
+                  # this bounds per-run iterations without changing per-token latency.
+                  # (Sonnet's native 128-out x 256 reqs x low QPS = ~10^4 iters = effective hang.)
 TIMEOUT=10800     # 3h per (model,ds,ep,pd,qps-list) invocation
 MEMGB=1024
 
@@ -35,8 +38,8 @@ run () {
     --model "$model" --hardware H100 --tp 1 \
     --dataset "$ds" --pd-mode "$pd" --ep "$ep" \
     --panel $PANEL --fixed-wg $WG --inter-opt-bw $INTER_BW --nvl72-rack $RACK \
-    --fabrics glass nvl72 --qps-list $qps --n-req $NREQ --npu-mem-gb $MEMGB \
-    --timeout $TIMEOUT \
+    --fabrics glass nvl72 --qps-list $qps --n-req $NREQ --max-osl $MAXOSL \
+    --npu-mem-gb $MEMGB --timeout $TIMEOUT \
     --out "outputs/slo_eval/${tag}_${ds}_${pd}_ep${ep}.csv"
 }
 

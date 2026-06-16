@@ -59,11 +59,14 @@ def _sample_len(mean, fixed, rng, cv=0.6):
     return max(8, int(rng.lognormvariate(mu, sigma)))
 
 
-def make_poisson_workload(dataset, qps, n_req, pd_mode, seed=0):
+def make_poisson_workload(dataset, qps, n_req, pd_mode, seed=0, max_osl=None):
     """Poisson arrivals at `qps` req/s with ViBE dataset token lengths.
 
     pd_mode: 'full' (in/out as dataset), 'prefill' (out=1, TTFT-isolated),
     'decode' (out as dataset; run with --skip-prefill for TPOT-isolation).
+    max_osl caps output_toks (steady-state TPOT is reached in a few tokens, so a
+    small cap keeps the per-request decode-iteration count — and thus the sim
+    runtime — bounded without changing the measured per-token latency).
     """
     spec = DATASETS[dataset]
     rng = random.Random(seed)
@@ -75,6 +78,8 @@ def make_poisson_workload(dataset, qps, n_req, pd_mode, seed=0):
         arrival_ns = int(t * 1e9)
         il = _sample_len(spec["in_len"], spec["fixed"], rng)
         ol = _sample_len(spec["out_len"], spec["fixed"], rng)
+        if max_osl is not None:
+            ol = min(ol, max_osl)
         if pd_mode == "prefill":
             ol = 1                            # prefill isolated: single output token
         lines.append(json.dumps({
@@ -178,6 +183,8 @@ def main():
     ap.add_argument("--fabrics", nargs="+", default=["glass", "nvl72"])
     ap.add_argument("--qps-list", type=float, nargs="+", default=[1, 2, 4])
     ap.add_argument("--n-req", type=int, default=128)
+    ap.add_argument("--max-osl", type=int, default=None,
+                    help="cap output tokens per request (bounds decode iterations / runtime)")
     ap.add_argument("--max-num-seqs", type=int, default=256)
     ap.add_argument("--max-num-batched-tokens", type=int, default=8192)
     ap.add_argument("--npu-mem-gb", type=int, default=320)
@@ -210,7 +217,8 @@ def main():
         for qps in args.qps_list:
             cfg = build_config(fabric, args.ep, args.panel, args.fixed_wg,
                                args.inter_opt_bw, args.nvl72_rack)
-            wl = make_poisson_workload(args.dataset, qps, args.n_req, args.pd_mode, args.seed)
+            wl = make_poisson_workload(args.dataset, qps, args.n_req, args.pd_mode,
+                                       args.seed, args.max_osl)
             run_csv = f"outputs/slo_eval/runs/{fabric}_{args.dataset}_{args.pd_mode}_ep{args.ep}_qps{qps:g}.csv"
             os.makedirs(os.path.dirname(os.path.join(REPO, run_csv)), exist_ok=True)
             ok, log = run_serving(cfg, wl, run_csv, args.pd_mode,
