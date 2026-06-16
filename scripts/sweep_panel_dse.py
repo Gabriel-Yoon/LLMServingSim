@@ -310,6 +310,41 @@ def parse_steady_decode_cycle(text):
     return float(binned.most_common(1)[0][0])
 
 
+OVERLAP_EFFICIENCY = 0.8   # eta: fraction of the overlappable comm a real
+                           # micro-batch pipeline actually hides. Ideal overlap
+                           # (eta=1) hides all comm under compute -> exposed~0,
+                           # which is unphysical: DeepEP/LMSYS large-EP DECODE
+                           # leaves ~15-30% exposed (fill/drain bubbles, kernel
+                           # gaps, M=4 finite depth, load imbalance). eta=0.8
+                           # lands a compute-bound fabric at ~15-25% exposed,
+                           # matching that reported range.
+
+def apply_overlap(tpot_gt_ms, exposed_frac, eta=OVERLAP_EFFICIENCY):
+    """Analytical micro-batch comp-comm overlap (DeepEP/LMSYS; AIC++ Eq. 1).
+
+    The serial trace fully exposes the MoE all-to-all (dispatch/combine) because
+    a batch's expert compute depends on its own dispatch. Real serving pipelines
+    M micro-batches so one micro-batch's all-to-all (network) overlaps another's
+    expert compute (NPU). Split the serial iteration into compute = (1-ef)*tpot
+    and comm = ef*tpot; the pipeline hides eta*min(comm, compute):
+
+      hidden          = eta * min(comm, compute)
+      exposed_overlap = comm - hidden
+      tpot_overlap    = compute + exposed_overlap = tpot*(1 - eta*min(ef, 1-ef))
+
+    eta<1 keeps a realistic residual (no unphysical 0% exposed). When comm
+    dominates (ef>>0.5, e.g. the NVL72 inter-rack IB cliff) only a small slice is
+    hideable, so exposed stays high — the fabric is genuinely network-bound.
+    """
+    if tpot_gt_ms is None or exposed_frac is None or tpot_gt_ms <= 0:
+        return tpot_gt_ms, exposed_frac
+    ef = max(0.0, min(1.0, float(exposed_frac)))
+    hidden = eta * min(ef, 1.0 - ef)           # fraction of tpot hidden
+    tpot_ov = tpot_gt_ms * (1.0 - hidden)
+    exp_ov = (ef - hidden) / (1.0 - hidden) if (1.0 - hidden) > 0 else ef
+    return tpot_ov, max(0.0, exp_ov)
+
+
 def analytical_estimates(model_cfg, ep, batch_per_inst, inter_bw, intra_bw, fp_bytes=2):
     """Analytical companions to the logged exposed metric (for interpretation only).
 
@@ -350,6 +385,7 @@ def analytical_estimates(model_cfg, ep, batch_per_inst, inter_bw, intra_bw, fp_b
 CSV_FIELDS = ["label", "sweep", "mode", "topology", "fabric", "panel", "ep",
               "per_device_batch", "wg_count", "intra_opt_bw", "inter_bw", "status",
               "ttft_ms", "e2e_latency_ms", "tpot_avg_ms", "tpot_steady_ms", "tpot_gt_ms",
+              "tpot_gt_overlap_ms", "exposed_frac_overlap",
               "interactivity_tok_s_user", "n_completed",
               "total_cycles", "exposed_cycles", "compute_cycles", "exposed_frac",
               "all_to_all_us", "weight_load_us",
@@ -411,6 +447,13 @@ def run_one(label, cfg, ep, meta, mode, isl, osl, max_tokens, batch_per_inst, ou
         gt = parse_steady_decode_cycle(_log)
         if gt is not None:
             m["tpot_gt_ms"] = gt
+        # Analytical comp-comm overlap (DeepEP/AIC++): hide the all-to-all behind
+        # the other micro-batch's compute. Reported alongside the serial tpot_gt.
+        _ef = exposed.get("exposed_frac")
+        if gt is not None and _ef is not None:
+            t_ov, ef_ov = apply_overlap(gt, _ef)
+            m["tpot_gt_overlap_ms"] = t_ov
+            m["exposed_frac_overlap"] = ef_ov
         analyt = analytical_estimates(_MODEL_CFG, ep, batch_per_inst,
                                       float(meta.get("inter_bw") or NVL72_ELEC_BW),
                                       float(meta.get("intra_opt_bw") or NVL72_ELEC_BW))
