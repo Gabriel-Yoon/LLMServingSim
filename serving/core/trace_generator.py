@@ -1089,9 +1089,23 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
         dispatch_comm_type = _with_dim('ALLTOALL', a2a_dim)
         combine_comm_type = _with_dim('ALLTOALL', a2a_dim)
     elif ep_total > 1:
-        # AllGather/ReduceScatter (vLLM default + single-domain MOE_ALLTOALL).
-        dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
-        combine_comm_size = effective_total_len_comm * combine_per_token
+        if _moe_a2a:
+            # Single-domain DeepEP: the real volume is the all-to-all dispatch =
+            # total_len × k (each token → its k experts), NOT the gather-all
+            # (×ep_total) that the vLLM allgather_reducescatter backend moves.
+            # Keep the ALLGATHER/REDUCESCATTER collective TYPE for ASTRA
+            # tractability (single-domain all-to-all is O(N^2) and hangs at large
+            # EP), but anchor the VOLUME to DeepEP so in-domain large-EP comm is
+            # not over-counted (~ep_total/2k× too high otherwise).
+            k_top = max(1, ctx.config.get('num_experts_per_tok', 1))
+            a2a_tokens = bctx.total_len * k_top
+            dispatch_comm_size = a2a_tokens * dispatch_per_token
+            combine_comm_size = a2a_tokens * combine_per_token
+        else:
+            # vLLM allgather_reducescatter backend (small-EP default): gather all
+            # tokens to all ranks, each rank computes its experts, reduce-scatter.
+            dispatch_comm_size = ag_per_rank_tokens * dispatch_per_token
+            combine_comm_size = effective_total_len_comm * combine_per_token
         dispatch_comm_type = _with_dim('ALLGATHER', ctx.ep_dim)
         combine_comm_type = _with_dim('REDUCESCATTER', ctx.ep_dim)
     else:
