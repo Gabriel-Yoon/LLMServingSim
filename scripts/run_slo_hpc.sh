@@ -21,7 +21,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PANEL="4 4"; WG=5; RACK=64; INTER_BW=512
+PANEL="4 4"; WG=4; RACK=64; INTER_BW=512   # WG=4: even feasible floor for 4x4 (TX/RX symmetric); wg5 odd=non-physical
 NREQ=96           # requests per QPS point (sim cost ~ NREQ x MAXOSL iterations)
 MAXOSL=24         # cap decode tokens: steady TPOT is reached in a few tokens, so
                   # this bounds per-run iterations without changing per-token latency.

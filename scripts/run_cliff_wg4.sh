@@ -19,9 +19,13 @@ cd "$(dirname "$0")/.."
 
 EP_LIST="8 16 32 64 128"
 PANEL="4 4"
-WG=4                 # per-direction N_WG (feasible floor cap for 4x4; even TX/RX)
+WG=4                 # per-direction N_WG (feasible floor cap for 4x4; even TX/RX).
+                     # This is now the PRIMARY/physical config (wg5 is odd = non-physical;
+                     # see feedback_wg_even). The wg5 framing in older comments is historical.
 RACK=64
-BATCH=16
+BATCH=64             # decode concurrency/instance. batch16 leaves the MoE a2a ~3% of the
+                     # step (compute-bound) -> cliff is MUTED in TPOT; batch64 lifts the
+                     # exposed-comm fraction (~15-25%) so the EP>rack cliff is visible.
 ISL=256
 OSL=24
 TIMEOUT=10800
