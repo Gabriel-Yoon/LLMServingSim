@@ -53,13 +53,27 @@ def grid_for_n(n):
     return r, n // r
 
 
+def dragonfly_params(n):
+    """Balanced Dragonfly (Kim et al. 2008), 1 GPU/router: group size
+    a ~ (2N)^(1/3), groups g = ceil(N/a), global links/router h = ceil((g-1)/a).
+    Returns (a, g, h)."""
+    a = max(2, round((2 * n) ** (1.0 / 3.0)))
+    g = max(1, -(-n // a))                         # ceil(N/a)
+    h = 0 if g <= 1 else -(-(g - 1) // a)          # ceil((g-1)/a)
+    return a, g, h
+
+
 def degree(topo, rows, cols):
+    n = rows * cols
     if topo == "fb":
         return (rows - 1) + (cols - 1)
     if topo in ("mesh", "torus"):
         return 4
     if topo == "ring":
         return 2
+    if topo == "dragonfly":
+        a, g, h = dragonfly_params(n)
+        return (a - 1) + h                         # intra (full group) + global links
     raise ValueError(topo)
 
 
@@ -74,6 +88,9 @@ def latency_hops(topo, rows, cols):
         return rows // 2 + cols // 2               # wrap-around diameter
     if topo == "ring":
         return n - 1                               # ring algorithm: N-1 steps
+    if topo == "dragonfly":
+        _, g, _ = dragonfly_params(n)
+        return 1 if g <= 1 else 3                  # local-global-local, diameter 3
     raise ValueError(topo)
 
 
@@ -87,7 +104,7 @@ def collective_latency_ns(topo, n, msg_bytes, wg_budget=WG_BUDGET, t_hop=T_HOP_N
     return lat_term + bw_term, latency_hops(topo, rows, cols), degree(topo, rows, cols)
 
 
-TOPOS = ["fb", "torus", "mesh", "ring"]
+TOPOS = ["fb", "dragonfly", "torus", "mesh", "ring"]
 
 
 def main():
@@ -152,7 +169,8 @@ def main():
                                        "..", "outputs", "panel_dse", "topo_projection.png")
         out = os.path.abspath(out)
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        color = {"fb": "tab:green", "torus": "tab:blue", "mesh": "tab:orange", "ring": "tab:red"}
+        color = {"fb": "tab:green", "dragonfly": "tab:purple", "torus": "tab:blue",
+                 "mesh": "tab:orange", "ring": "tab:red"}
         fig, ax = plt.subplots(figsize=(7, 4.5))
         for t in TOPOS:
             ax.plot(args.n_list, curves[t], "o-", color=color[t], label=t.upper())
@@ -167,7 +185,8 @@ def main():
         ax.set_xlabel("GPUs (EP)")
         ax.set_ylabel("all-to-all collective latency (ns, log)")
         ax.set_title(f"Topology scale projection (iso-budget {args.wg_budget:.0f} WG/GPU, "
-                     f"{args.msg_kb:.0f} KB msg)\nFB stays flat (diameter 2); mesh/torus/ring diverge")
+                     f"{args.msg_kb:.0f} KB msg)\nFB (diam 2) & Dragonfly (diam 3) stay flat; "
+                     f"mesh/torus/ring diverge")
         ax.legend()
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
