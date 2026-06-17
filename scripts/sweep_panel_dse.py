@@ -211,12 +211,18 @@ def make_panel_config(rows, cols, ep, wg_count, inter_bw, intra_lat=None, inter_
         # Aggregate-egress fairness: within-panel link bw = per-direction-per-link x
         # degree (all of a GPU's WG links carry the all-to-all), so the per-pair cost
         # reflects the GPU's full optical egress, comparable to NVL72's aggregate-900.
-        # Inter-panel egress is already one per-GPU optical link, so inter_bw is left.
         degree = (rows - 1) + (cols - 1)
         agg = per_dir * WG_BW * degree
         tc.pop("wg_count"); tc.pop("wg_bw")
         tc["intra_opt_bw"] = agg
         tc["elec_bw"] = agg
+        # Inter-panel egress is ALSO multi-port: a GPU's optical uplink is the same
+        # fungible optical I/O routed off-panel, so credit the cross-panel link the
+        # full aggregate egress too (vs NVL72's inter-rack stuck on the IB NIC ~50).
+        # This is the optimistic "fully-provisioned glass uplink" bound; per-link (no
+        # AGG) is the conservative one.
+        if tc["inter_bw"] > 0:
+            tc["inter_bw"] = agg
     cfg = {"num_nodes": 1, "topology_config": tc, "nodes": [_node(ep)]}
     if POWER:
         cfg["nodes"][0]["power"] = _power_spec("glass", ep * TP)
