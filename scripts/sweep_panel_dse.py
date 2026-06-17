@@ -190,25 +190,30 @@ def _node(ep):
 def make_panel_config(rows, cols, ep, wg_count, inter_bw, intra_lat=None, inter_lat=None):
     """fb_2d config with the electrical/optical split. inter_bw=0 → single panel.
     intra_lat / inter_lat override the default optical link latencies (ns) — used
-    by the latency-radix sweep; default to the module constants."""
+    by the latency-radix sweep; default to the module constants.
+
+    CONVENTION: ``wg_count`` (= --fixed-wg) is the TOTAL bundle WG per link (both
+    directions); it must be EVEN. A WG is unidirectional (128 GB/s one way), so the
+    per-direction count = wg_count/2 and the unidirectional link bandwidth that
+    ASTRA consumes = (wg_count/2) * 128. config_builder's wg_count is per-direction,
+    so we pass wg_count/2 down. (NVL72's 900 is likewise unidirectional = 1800/2.)"""
+    per_dir = float(wg_count) / 2.0                          # total bundle -> per-direction
     tc = {
         "type": "fb_2d",
         "panel_rows": rows, "panel_cols": cols,
         "elec_bw": ELEC_BW, "elec_latency": ELEC_LAT,        # adjacent (fixed)
-        "wg_count": wg_count, "wg_bw": WG_BW,                # optical far (swept)
+        "wg_count": per_dir, "wg_bw": WG_BW,                 # per-direction WG (optical far, swept)
         "intra_opt_latency": (INTRA_OPT_LAT if intra_lat is None else float(intra_lat)),
         "inter_bw": float(inter_bw),
         "inter_lat": (INTER_LAT if inter_lat is None else float(inter_lat)),  # inter-panel
     }
     if AGG_BW:
-        # Aggregate-egress fairness: the within-panel link bw = per-link x degree
-        # (all of a GPU's WG links carry the all-to-all). Set intra_opt_bw directly
-        # (overriding wg_count) and lift the electrical link to match, so the per-pair
-        # cost reflects the GPU's full optical egress, comparable to NVL72's
-        # aggregate-900 modeled as per-pair. Inter-panel egress is already one
-        # per-GPU optical link, so inter_bw is left as the aggregate it already is.
+        # Aggregate-egress fairness: within-panel link bw = per-direction-per-link x
+        # degree (all of a GPU's WG links carry the all-to-all), so the per-pair cost
+        # reflects the GPU's full optical egress, comparable to NVL72's aggregate-900.
+        # Inter-panel egress is already one per-GPU optical link, so inter_bw is left.
         degree = (rows - 1) + (cols - 1)
-        agg = float(wg_count) * WG_BW * degree
+        agg = per_dir * WG_BW * degree
         tc.pop("wg_count"); tc.pop("wg_bw")
         tc["intra_opt_bw"] = agg
         tc["elec_bw"] = agg
@@ -695,7 +700,7 @@ def build_intra_runs(panels, wg_counts, mode, isl, osl):
         for wg in wg_counts:
             cfg = make_panel_config(rows, cols, ep, wg_count=wg, inter_bw=0.0)
             meta = {"sweep": "intra", "mode": mode, "topology": pname, "panel": ep,
-                    "ep": ep, "wg_count": wg, "intra_opt_bw": int(wg * WG_BW), "inter_bw": 0}
+                    "ep": ep, "wg_count": wg, "intra_opt_bw": int((wg / 2) * WG_BW), "inter_bw": 0}
             runs.append((f"intra_{pname}_ep{ep}_wg{wg}", cfg, ep, meta))
         # NVL72 baseline at this EP
         runs.append((f"intra_{pname}_ep{ep}_nvl72", make_nvl72_config(ep), ep,
@@ -716,7 +721,7 @@ def build_epscale_runs(panel, wg, inter_opt_bw, ep_list, mode):
         multi = ep > panel_size
         cfg = make_panel_config(rows, cols, ep, wg_count=wg,
                                 inter_bw=(inter_opt_bw if multi else 0.0))
-        _intra = cfg["topology_config"]["intra_opt_bw"] if AGG_BW else int(wg * WG_BW)
+        _intra = cfg["topology_config"]["intra_opt_bw"] if AGG_BW else int((wg / 2) * WG_BW)
         runs.append((f"epscale_fb_ep{ep}", cfg, ep,
                      {"sweep": "epscale", "mode": mode, "topology": "glass_fb", "panel": panel_size,
                       "ep": ep, "wg_count": wg, "intra_opt_bw": _intra,
@@ -740,7 +745,7 @@ def build_inter_runs(panels, inter_bws, fixed_wg, mode, isl, osl):
             for ibw in inter_bws:
                 cfg = make_panel_config(rows, cols, ep, wg_count=fixed_wg, inter_bw=ibw)
                 meta = {"sweep": "inter", "mode": mode, "topology": pname, "panel": panel,
-                        "ep": ep, "wg_count": fixed_wg, "intra_opt_bw": int(fixed_wg * WG_BW),
+                        "ep": ep, "wg_count": fixed_wg, "intra_opt_bw": int((fixed_wg / 2) * WG_BW),
                         "inter_bw": ibw}
                 runs.append((f"inter_{pname}_ep{ep}_wg{fixed_wg}_ib{ibw}", cfg, ep, meta))
             runs.append((f"inter_{pname}_ep{ep}_nvl72", make_nvl72_config(ep), ep,
@@ -774,7 +779,7 @@ def build_latency_runs(panel, wg, lat_list, axis, mode, inter_opt_bw):
                                     inter_bw=inter_opt_bw, inter_lat=lat)
         meta = {"sweep": "latency", "mode": mode, "topology": "glass_fb", "fabric": "glass_fb",
                 "panel": panel_size, "ep": ep, "wg_count": wg, "lat_axis": axis,
-                "link_lat": lat, "intra_opt_bw": int(wg * WG_BW),
+                "link_lat": lat, "intra_opt_bw": int((wg / 2) * WG_BW),
                 "inter_bw": (inter_opt_bw if multi else 0)}
         runs.append((f"latency_{axis}_ep{ep}_lat{int(lat)}", cfg, ep, meta))
     # NVL72 reference (fixed NVL72_LAT hop)
@@ -800,7 +805,7 @@ def _fabric_pair(sweep_name, panel, wg, inter_opt_bw, ep, batch, mode):
                                inter_bw=(inter_opt_bw if multi else 0.0))
     fb_meta = {"sweep": sweep_name, "mode": mode, "topology": "glass_fb", "fabric": "glass_fb",
                "panel": panel_size, "ep": ep, "per_device_batch": batch, "wg_count": wg,
-               "intra_opt_bw": int(wg * WG_BW), "inter_bw": (inter_opt_bw if multi else 0)}
+               "intra_opt_bw": int((wg / 2) * WG_BW), "inter_bw": (inter_opt_bw if multi else 0)}
     nvl_meta = {"sweep": sweep_name, "mode": mode, "topology": "nvl72", "fabric": "nvl72",
                 "panel": NVL72_RACK, "ep": ep, "per_device_batch": batch, "wg_count": 0,
                 "intra_opt_bw": int(NVL72_ELEC_BW),

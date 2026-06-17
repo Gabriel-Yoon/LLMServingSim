@@ -493,13 +493,16 @@ These must match the C++ enum in `astra-sim/astra-sim/system/AstraMemoryAPI.hh`.
 - bundle 매핑: x{K} bundle = K WG total = K/2 per direction.
   예: 6×6-4c cap **x6 = 3 TX + 3 RX = N_WG=3** (단방향 384 GB/s); 4×4 cap **x10 = N_WG=5**
   (640 GB/s). **cap은 격자마다 다르다** (아래 표) — N_WG=3은 6×6 cap이지 보편값 아님.
-- **⚠️ N_WG(=`--fixed-wg`/`wg_count`)는 반드시 짝수로 쓴다 (TX/RX 대칭 제약).** RX와 TX
-  waveguide가 대칭이어야 물리적으로 구현 가능하므로 홀수 N_WG(예: wg5, wg3)는 비대칭이라
-  **물리적으로 비실현**이다 — 분석/그래프선으로만 등장할 수 있고 실제 구성·헤드라인에는 쓰지 않는다.
-- **wg5는 기본값이 아니다.** wg5/wg3은 홀수 aggressive ceil(그래프선)일 뿐. 헤드라인·재측정은
-  각 격자의 **짝수 feasible floor**를 쓴다: **4×4 → wg4** (cap floor=4, 짝수, 512 GB/s),
-  **6×6/6×6-4c → wg2** (cap floor=2, 짝수, 256 GB/s). 우연히도 두 격자의 cap floor가 모두
-  짝수라 "짝수 + feasible"이 동시에 성립한다.
+- **⚠️ 두 가지 수를 구분하라 (CRITICAL):**
+  - **`--fixed-wg` (sweep CLI) = TOTAL bundle WG/link (양방향 합)** = x{K}의 K. WG는 단방향이라
+    양방향이려면 TX/RX 별도 → **TOTAL은 반드시 짝수**(홀수면 TX/RX로 못 쪼갬). per-direction = TOTAL/2.
+  - **config_builder `wg_count` = per-direction (= TOTAL/2)**, `intra_opt_bw = wg_count × 128`
+    (단방향). sweep의 make_panel_config이 `--fixed-wg/2`를 내부로 넘긴다.
+  - 즉 `--fixed-wg 8` → per-dir 4 → **512 GB/s** 단방향. `--fixed-wg 10` → per-dir 5 → 640.
+- **N_WG(per-direction)은 홀수여도 됨** — 제약은 TOTAL이 짝수인 것. 예: x10(total 10 짝수) = per-dir 5 =
+  640 = 물리적 OK. (이전 "wg5 홀수=비실현"은 per-direction을 --fixed-wg로 오인한 것; 정정됨.)
+- **헤드라인/feasible (4×4)**: micro-bump cap = per-direction 4~5 → **TOTAL bundle `--fixed-wg 8`(512,
+  floor) ~ `10`(640, ceil)**. 6×6/6×6-4c: per-dir 2~3 → `--fixed-wg 4`(256) ~ `6`(384).
 
 ### Micro-bump 제약 → 격자별 N_WG 상한 (CRITICAL)
 WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 (격자별로 다름).
@@ -554,9 +557,10 @@ WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 
 | 우리 inter-panel | 500 ns | edge transceiver + 짧은 fiber (intra의 5배; <1% 영향) |
 
 ### Sweep & NVL72 baseline
-- **N_WG sweep = [2, 4, 6, 8]** (짝수만 물리적; 홀수 5/3은 분석용 그래프선으로만, 실측 구성 제외)
-- **epscale/headline은 각 패널을 자기 짝수 feasible floor로 실행**: 4×4 → `--fixed-wg 4`
-  (512 GB/s), 6×6-4c → `--fixed-wg 2` (256 GB/s). ⚠️ wg5/wg3은 홀수라 비실현 — 헤드라인 금지.
+- **`--fixed-wg` sweep = [4, 6, 8, 10] (TOTAL bundle, 짝수)** → per-dir [2,3,4,5] → [256,384,512,640].
+- **epscale/headline은 각 패널의 feasible를 TOTAL bundle로 실행**: 4×4 → `--fixed-wg 8`
+  (per-dir 4 = 512 GB/s, floor) 또는 `10` (640, ceil); 6×6-4c → `--fixed-wg 4` (256). ⚠️ 기존
+  run_cliff_wg4.sh 등은 WG=8로 갱신됨 (= 512, 이전 "wg4" 라벨과 같은 물리).
   ⚠️ 단일 N_WG를 모든 패널에 쓰지 말 것 — 격자마다 floor가 다르다.
 - intra latency 고정 = 100 ns
 - NVL72 baseline: **BW 900 GB/s unidirectional** (1800 bidir ÷2), **latency 500 ns**,

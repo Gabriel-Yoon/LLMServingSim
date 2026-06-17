@@ -6,7 +6,7 @@ glass-photonic FlattenedButterfly interconnect (ASP-DAC 2027).
 Derives, from a single tile geometry, the per-GPU micro-bump budget ->
 microring (MRR) count -> waveguide-group (WG) count -> aggregate optical
 bandwidth, and the per-topology WG-per-pair bundle each grid can afford.
-This is the single source of truth for the "60 WG / 7.68 TB/s / 8.5x NVLink"
+This is the single source of truth for the "60 WG / 7.68 TB/s bidir / 4.3x NVLink"
 headline numbers; everything downstream (panel DSE caps, bundle labels) should
 trace back here.
 
@@ -79,15 +79,22 @@ def compute_budget(tile_w=TILE_W, tile_h=TILE_H, tile_area=None,
     area = float(tile_area) if tile_area is not None else tile_w * tile_h
     bump_max = area * bump_density
     mrr = bump_max                              # 1 MRR per lambda == 1 bump per lambda
-    wg_max = bump_max / lambda_per_wg
-    per_gpu_bw = wg_max * wg_bw_gbps / 1000.0   # TB/s
-    ratio = per_gpu_bw / nvlink_h100
+    wg_max = bump_max / lambda_per_wg           # TOTAL WG/GPU (TX + RX)
+    per_gpu_bw = wg_max * wg_bw_gbps / 1000.0   # TB/s, BIDIRECTIONAL aggregate IO (all WG)
+    # CONVENTION-CONSISTENT ratio: a WG is unidirectional, so half the WG are RX;
+    # the per-direction EGRESS = (wg_max/2) x 128. Compare that to NVLink's
+    # per-direction spec (nvlink_h100). Comparing the bidir-aggregate 7.68 against
+    # the unidir 0.9 was a mixed-convention error (gave a spurious 8.5x); like-for-
+    # like (unidir egress vs unidir NVLink) is 4.3x — matching the bidir/bidir ratio
+    # (7.68 / 1.8) too.
+    per_gpu_egress = per_gpu_bw / 2.0           # TB/s, per-direction (unidirectional)
+    ratio = per_gpu_egress / nvlink_h100
     # periphery-coupling headroom (only meaningful for w/h geometry)
     periphery_mm = 2.0 * (tile_w + tile_h) if tile_area is None else None
     fldw_slots = int(periphery_mm * 1000.0 / FLDW_PITCH_UM) if periphery_mm else None
     return {
         "area": area, "bump_max": bump_max, "mrr": mrr, "wg_max": wg_max,
-        "per_gpu_bw": per_gpu_bw, "ratio": ratio,
+        "per_gpu_bw": per_gpu_bw, "per_gpu_egress": per_gpu_egress, "ratio": ratio,
         "periphery_mm": periphery_mm, "fldw_slots": fldw_slots,
         "wg_bw_gbps": wg_bw_gbps,
     }
@@ -111,8 +118,9 @@ def report(b, grids):
     print(f"  bump_max         : {g['bump_max']:.0f}   (= area x {BUMP_DENSITY} bumps/mm^2)")
     print(f"  MRR count        : {g['mrr']:.0f}   (1 microring per lambda)")
     print(f"  wg_max / GPU     : {g['wg_max']:.1f}   (= bump_max / {LAMBDA_PER_WG} lambda)")
-    print(f"  per-GPU optical  : {g['per_gpu_bw']:.2f} TB/s")
-    print(f"  vs H100 NVLink   : {g['ratio']:.2f}x   ({NVLINK_H100} TB/s/GPU)")
+    print(f"  per-GPU optical  : {g['per_gpu_bw']:.2f} TB/s bidir aggregate "
+          f"({g['per_gpu_egress']:.2f} TB/s per-direction egress)")
+    print(f"  vs H100 NVLink   : {g['ratio']:.2f}x   (unidir egress vs {NVLINK_H100} TB/s/GPU unidir)")
     if g["fldw_slots"] is not None:
         util = 100.0 * g["wg_max"] / g["fldw_slots"]
         print(f"  FLDW coupling    : periphery {g['periphery_mm']:.0f} mm @ {FLDW_PITCH_UM:.0f} um "
@@ -132,8 +140,8 @@ def run_check():
     checks = [
         ("bump_max~1900", abs(h["bump_max"] - 1900) < 60),
         ("wg_max~60",     abs(h["wg_max"] - 60) < 2),
-        ("per_gpu_bw~7.68", abs(h["per_gpu_bw"] - 7.68) < 0.15),
-        ("ratio~8.5",     abs(h["ratio"] - 8.5) < 0.3),
+        ("per_gpu_bw~7.68(bidir)", abs(h["per_gpu_bw"] - 7.68) < 0.15),
+        ("ratio~4.3",     abs(h["ratio"] - 4.3) < 0.3),
     ]
     wpp44 = per_topology(h["wg_max"], grid_degree(4, 4))[0]
     wpp48 = per_topology(h["wg_max"], grid_degree(4, 8))[0]

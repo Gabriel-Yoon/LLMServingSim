@@ -19,9 +19,10 @@ cd "$(dirname "$0")/.."
 
 EP_LIST="8 16 32 64 128"
 PANEL="4 4"
-WG=4                 # per-direction N_WG (feasible floor cap for 4x4; even TX/RX).
-                     # This is now the PRIMARY/physical config (wg5 is odd = non-physical;
-                     # see feedback_wg_even). The wg5 framing in older comments is historical.
+WG=8                 # --fixed-wg = TOTAL bundle WG/link (both directions), must be EVEN.
+                     # x8 = per-direction 4 = 512 GB/s unidirectional = 4x4 feasible FLOOR.
+                     # (per_dir = WG/2; intra_opt_bw = per_dir x 128. x10 = per-dir 5 = 640
+                     # = the aggressive ceil.) Older "wg4/per-direction" comments are historical.
 RACK=64
 BATCH=64             # decode concurrency/instance. batch16 leaves the MoE a2a ~3% of the
                      # step (compute-bound) -> cliff is MUTED in TPOT; batch64 lifts the

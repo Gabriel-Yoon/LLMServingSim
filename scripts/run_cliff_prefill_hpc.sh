@@ -18,7 +18,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 EP_LIST="8 32 64 128"
-PANEL="4 4"; WG=4; RACK=64
+PANEL="4 4"; WG=8; RACK=64   # --fixed-wg = TOTAL bundle (x8 = per-direction 4 = 512 GB/s, feasible 4x4 floor)
 ISL=2048          # large prompt -> large prefill MoE all-to-all
 OSL=4             # few decode steps (prefill is the focus; TTFT is the metric)
 MAXTOK=8192       # prefill chunk budget >= ISL -> one big chunk -> full 2048-token a2a

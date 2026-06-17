@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 
 EP_LIST="8 16 32 64 128"
 PANEL="4 4"          # glass panel 4x4 (16 GPUs); WG cap 5
-WG=5
+WG=10
 RACK=64              # NVL72 NVLink-domain boundary (real)
 BATCH=16             # decode concurrency per instance (ViBE-matched). batch=4 was
                      # too small: tiny all-to-all volume muted the NVL72 IB cliff.
