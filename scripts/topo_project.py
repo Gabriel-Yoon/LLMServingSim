@@ -54,11 +54,14 @@ def grid_for_n(n):
 
 
 def dragonfly_params(n):
-    """Balanced Dragonfly (Kim et al. 2008), 1 GPU/router: group size
-    a ~ (2N)^(1/3), groups g = ceil(N/a), global links/router h = ceil((g-1)/a).
-    Returns (a, g, h)."""
-    a = max(2, round((2 * n) ** (1.0 / 3.0)))
-    g = max(1, -(-n // a))                         # ceil(N/a)
+    """Balanced Dragonfly (Kim et al. 2008), 1 GPU/router: target group size
+    a ~ (2N)^(1/3); pick the DIVISOR of N closest to that target (so groups are
+    equal-sized and not degenerate, e.g. a=4 not a=2 for N=16). groups g = N/a,
+    global links/router h = ceil((g-1)/a). Returns (a, g, h)."""
+    target = (2 * n) ** (1.0 / 3.0)
+    divisors = [d for d in range(2, n + 1) if n % d == 0]
+    a = min(divisors, key=lambda d: abs(d - target)) if divisors else max(2, round(target))
+    g = max(1, n // a)
     h = 0 if g <= 1 else -(-(g - 1) // a)          # ceil((g-1)/a)
     return a, g, h
 
@@ -77,31 +80,72 @@ def degree(topo, rows, cols):
     raise ValueError(topo)
 
 
-def latency_hops(topo, rows, cols):
-    """Hop count that sets the collective's latency term."""
-    n = rows * cols
-    if topo == "fb":
-        return 2                                   # <=2 hops for any pair
-    if topo == "mesh":
-        return (rows - 1) + (cols - 1)             # direct all-to-all diameter
-    if topo == "torus":
-        return rows // 2 + cols // 2               # wrap-around diameter
+def _pair_hops(topo, n, i, j, rows, cols, group_size=None):
+    """Minimal-route hop count between distinct nodes i, j for each topology."""
     if topo == "ring":
-        return n - 1                               # ring algorithm: N-1 steps
+        d = abs(i - j)
+        return min(d, n - d)
     if topo == "dragonfly":
-        _, g, _ = dragonfly_params(n)
-        return 1 if g <= 1 else 3                  # local-global-local, diameter 3
+        return 1 if (i // group_size) == (j // group_size) else 3   # local | local-global-local
+    ri, ci = divmod(i, cols)
+    rj, cj = divmod(j, cols)
+    dr, dc = abs(ri - rj), abs(ci - cj)
+    if topo == "fb":
+        return 1 if (ri == rj or ci == cj) else 2  # same row/col 1 hop, else 2
+    if topo == "mesh":
+        return dr + dc                              # Manhattan
+    if topo == "torus":
+        return min(dr, rows - dr) + min(dc, cols - dc)
     raise ValueError(topo)
 
 
-def collective_latency_ns(topo, n, msg_bytes, wg_budget=WG_BUDGET, t_hop=T_HOP_NS):
-    """alpha-beta all-to-all latency. aggregate_BW is iso-budget (common to all
-    topologies), so only the hop term differentiates them."""
+def avg_hops(topo, n):
+    """Traffic-weighted AVERAGE hop count over all ordered pairs of an all-to-all.
+
+    This (not the diameter) is what sets the congestion-unaware collective cost:
+    every pair exchanges data, so the mean path length drives total movement. It is
+    why measured Dragonfly (groups-of-2 at small N -> almost all pairs at 3 hops)
+    loses to Torus despite a smaller diameter, yet wins at large N where Torus's
+    mean grows ~sqrt(N) while Dragonfly stays ~3."""
+    if topo == "ring":
+        rows, cols = 1, n
+    else:
+        rows, cols = grid_for_n(n)
+    gs = dragonfly_params(n)[0] if topo == "dragonfly" else None
+    total, cnt = 0, 0
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            total += _pair_hops(topo, n, i, j, rows, cols, gs)
+            cnt += 1
+    return total / cnt if cnt else 0.0
+
+
+def collective_latency_ns(topo, n, msg_bytes, wg_budget=WG_BUDGET, t_hop=T_HOP_NS,
+                          equal_link_bw=None):
+    """alpha-beta all-to-all latency, faithful to ASTRA's congestion-unaware
+    "direct" send (cost = worst pair = diameter*t_hop + per-pair_chunk/link_bw):
+
+        T = hops * t_hop  +  (msg_bytes / n) / link_bw
+
+    where the per-pair chunk is msg/n (each GPU's egress split across its peers)
+    over ONE link at the per-link BW. Under iso-budget link_bw = (wg_budget/degree/2)
+    *WG_BW, so a higher-degree topology has THINNER links — its bw term scales with
+    degree. So iso-budget trades off BOTH diameter (hops) and degree (link width);
+    that is why measured Dragonfly (degree>torus) can lose to Torus at large msg
+    despite a smaller diameter. iso-bandwidth ablation (equal_link_bw) fixes the
+    per-link BW for every topology, so the bw term is common and ONLY diameter
+    differentiates them (pure-structure view)."""
     rows, cols = (1, n) if topo == "ring" else grid_for_n(n)
-    agg_bw_Bpns = (wg_budget / 2.0) * WG_BW         # GB/s == B/ns
-    lat_term = latency_hops(topo, rows, cols) * t_hop
-    bw_term = (msg_bytes / agg_bw_Bpns) if agg_bw_Bpns > 0 else 0.0
-    return lat_term + bw_term, latency_hops(topo, rows, cols), degree(topo, rows, cols)
+    deg = degree(topo, rows, cols)
+    if equal_link_bw is not None:
+        link_bw_Bpns = float(equal_link_bw)             # GB/s == B/ns, common to all
+    else:
+        link_bw_Bpns = max(1.0, (wg_budget / deg / 2.0) * WG_BW)
+    hops = avg_hops(topo, n)                             # traffic-weighted mean path
+    bw_term = (msg_bytes / n) / link_bw_Bpns if link_bw_Bpns > 0 else 0.0
+    return hops * t_hop + bw_term, hops, deg
 
 
 TOPOS = ["fb", "dragonfly", "torus", "mesh", "ring"]
@@ -115,15 +159,24 @@ def main():
                          "(topology matters most); large = bandwidth-bound (common offset grows).")
     ap.add_argument("--wg-budget", type=float, default=WG_BUDGET)
     ap.add_argument("--t-hop", type=float, default=T_HOP_NS)
+    ap.add_argument("--equal-link-bw", type=float, default=None,
+                    help="iso-bandwidth ablation: fixed per-link BW (GB/s) for every topology "
+                         "instead of the budget/degree split (isolates pure structure)")
     ap.add_argument("--measured", nargs="*", default=[],
                     help="topo_compare CSVs to overlay (measured exposed%% / tpot at 16/32)")
     ap.add_argument("--out", default=None, help="plot path (default outputs/panel_dse/topo_projection.png)")
     args = ap.parse_args()
 
     msg_bytes = args.msg_kb * 1024.0
+    eqbw = args.equal_link_bw
+    mode_str = (f"iso-bandwidth {eqbw} GB/s/link" if eqbw is not None
+                else f"iso-budget {args.wg_budget} WG/GPU")
+
+    def cl(topo, n):
+        return collective_latency_ns(topo, n, msg_bytes, args.wg_budget, args.t_hop, eqbw)
 
     # ---- analytical table -----------------------------------------------------
-    print(f"\nAnalytical all-to-all latency (alpha-beta, iso-budget {args.wg_budget} WG/GPU, "
+    print(f"\nAnalytical all-to-all latency (alpha-beta, {mode_str}, "
           f"msg {args.msg_kb} KB, t_hop {args.t_hop} ns)")
     print(f"{'N':>5} " + "".join(f"{t:>16}" for t in TOPOS))
     print(f"{'':>5} " + "".join(f"{'(hops|ns)':>16}" for _ in TOPOS))
@@ -131,17 +184,16 @@ def main():
     for n in args.n_list:
         cells = []
         for t in TOPOS:
-            ns, hops, deg = collective_latency_ns(t, n, msg_bytes, args.wg_budget, args.t_hop)
+            ns, hops, deg = cl(t, n)
             curves[t].append(ns)
-            cells.append(f"{hops:>4}|{ns:>8.0f}")
+            cells.append(f"{hops:>5.2f}|{ns:>8.0f}")
         print(f"{n:>5} " + "".join(f"{c:>16}" for c in cells))
 
     # FB advantage at the largest N
     nmax = args.n_list[-1]
-    fb_ns = collective_latency_ns("fb", nmax, msg_bytes, args.wg_budget, args.t_hop)[0]
+    fb_ns = cl("fb", nmax)[0]
     print(f"\nAt N={nmax}: FB collective latency {fb_ns:.0f} ns; "
-          + ", ".join(f"{t} {collective_latency_ns(t, nmax, msg_bytes, args.wg_budget, args.t_hop)[0]/fb_ns:.1f}x"
-                      for t in TOPOS if t != "fb"))
+          + ", ".join(f"{t} {cl(t, nmax)[0]/fb_ns:.1f}x" for t in TOPOS if t != "fb"))
 
     # ---- measured overlay (validation) ---------------------------------------
     measured = {}  # n -> {fabric: exposed%}
@@ -165,8 +217,9 @@ def main():
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        _suffix = "_isobw" if eqbw is not None else ""
         out = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       "..", "outputs", "panel_dse", "topo_projection.png")
+                                       "..", "outputs", "panel_dse", f"topo_projection{_suffix}.png")
         out = os.path.abspath(out)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         color = {"fb": "tab:green", "dragonfly": "tab:purple", "torus": "tab:blue",
@@ -184,9 +237,8 @@ def main():
         ax.set_xticklabels([str(n) for n in args.n_list])
         ax.set_xlabel("GPUs (EP)")
         ax.set_ylabel("all-to-all collective latency (ns, log)")
-        ax.set_title(f"Topology scale projection (iso-budget {args.wg_budget:.0f} WG/GPU, "
-                     f"{args.msg_kb:.0f} KB msg)\nFB (diam 2) & Dragonfly (diam 3) stay flat; "
-                     f"mesh/torus/ring diverge")
+        ax.set_title(f"Topology scale projection ({mode_str}, {args.msg_kb:.0f} KB msg)\n"
+                     f"FB (diam 2) & Dragonfly (diam 3) stay flat; mesh/torus/ring diverge")
         ax.legend()
         ax.grid(True, alpha=0.3)
         fig.tight_layout()

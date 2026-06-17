@@ -159,6 +159,10 @@ TopologyBuildingBlock NetworkParser::parse_topology_name(const std::string& topo
         return TopologyBuildingBlock::Torus2D;
     }
 
+    if (topology_name == "Dragonfly") {
+        return TopologyBuildingBlock::Dragonfly;
+    }
+
     // shouldn't reach here
     std::cerr << "[Error] (network/analytical) " << "Topology name " << topology_name << " not supported" << std::endl;
     std::exit(-1);

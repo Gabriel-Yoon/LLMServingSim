@@ -99,11 +99,14 @@ def _resolve_parallelism(instance, model_config):
 # dim) and differ only in the ASTRA topology name + per-hop model. hierarchical_fb
 # is the older 3-level FB. Everything here gets the FB collective-dim treatment.
 _GRID2D_TYPES = ("fb_2d", "mesh_2d", "torus_2d")          # 2D grids (use panel_rows/cols + fb_rows)
-_GRID2D_RING = _GRID2D_TYPES + ("ring_1d",)               # all types routed to _compute_fb2d_dims
+# ring_1d (1-D Ring) and dragonfly (group_size) are 1-domain special cases, also
+# routed to _compute_fb2d_dims but without panel_rows/cols.
+_GRID2D_RING = _GRID2D_TYPES + ("ring_1d", "dragonfly")   # all types routed to _compute_fb2d_dims
 _FB_FAMILY = ("hierarchical_fb",) + _GRID2D_RING          # all special-cased grid topologies
-_GRID_TOPO_NAME = {"fb_2d": "FlattenedButterfly", "mesh_2d": "Mesh2D", "torus_2d": "Torus2D"}
-# ASTRA topology names that carry a grid row count via the fb_rows field.
-_FB_ROWS_TOPOS = ("FlattenedButterfly", "Mesh2D", "Torus2D")
+_GRID_TOPO_NAME = {"fb_2d": "FlattenedButterfly", "mesh_2d": "Mesh2D",
+                   "torus_2d": "Torus2D", "dragonfly": "Dragonfly"}
+# ASTRA topology names that carry a structural row/group count via the fb_rows field.
+_FB_ROWS_TOPOS = ("FlattenedButterfly", "Mesh2D", "Torus2D", "Dragonfly")
 
 
 def _resolve_dp_groups(all_instances, topology_config=None):
@@ -645,6 +648,16 @@ def _validate_fb_topology_config(tc):
                 "via 'wg_count' (×128 GB/s), 'intra_opt_bw', or legacy 'intra_bw'"
             )
         return
+    if tc_type == "dragonfly":
+        # Dragonfly: needs a group_size and a per-link bandwidth knob.
+        if int(tc.get("group_size", 0)) < 1:
+            raise ValueError("dragonfly topology_config requires group_size >= 1")
+        if not any(k in tc for k in ("wg_count", "intra_opt_bw", "intra_bw")):
+            raise KeyError(
+                "dragonfly topology_config must specify the link bandwidth "
+                "via 'wg_count' (×128 GB/s), 'intra_opt_bw', or legacy 'intra_bw'"
+            )
+        return
     # hierarchical_fb validation
     if tc.get("panel_size", 0) < 2:
         raise ValueError(f"topology_config.panel_size must be >= 2, got {tc.get('panel_size')}")
@@ -726,23 +739,33 @@ def _compute_fb2d_dims(dp_size, topology_config):
     Raises ValueError if dp_size cannot be mapped.
 
     Also serves mesh_2d / torus_2d (same 2D-grid machinery, ASTRA topology name
-    swapped via _GRID_TOPO_NAME) and ring_1d (a single 1-D Ring dim).
+    swapped via _GRID_TOPO_NAME), ring_1d (a single 1-D Ring dim), and dragonfly
+    (a single Dragonfly dim, fb_rows = group_size).
     """
     tc_type = topology_config.get("type", "fb_2d")
 
-    # Ring: 1-D topology, a single Ring dim spanning all EP ranks (no panel
-    # geometry). Per-link bandwidth comes from the same WG knob as the grids.
-    if tc_type == "ring_1d":
+    def _link_bw():
         wg_count = topology_config.get("wg_count")
         if wg_count is not None:
-            link_bw = float(wg_count) * float(topology_config.get("wg_bw", _WG_BW_GBPS))
-        elif "intra_opt_bw" in topology_config:
-            link_bw = float(topology_config["intra_opt_bw"])
-        else:
-            link_bw = float(topology_config["intra_bw"])
-        link_lat = float(topology_config.get("intra_opt_latency",
-                                             topology_config.get("intra_lat", 300.0)))
-        return ([dp_size], [link_bw], [link_lat], ["Ring"], [0], [link_bw], [link_lat])
+            return float(wg_count) * float(topology_config.get("wg_bw", _WG_BW_GBPS))
+        if "intra_opt_bw" in topology_config:
+            return float(topology_config["intra_opt_bw"])
+        return float(topology_config["intra_bw"])
+
+    def _link_lat():
+        return float(topology_config.get("intra_opt_latency",
+                                         topology_config.get("intra_lat", 300.0)))
+
+    # Ring: 1-D topology, a single Ring dim spanning all EP ranks (no panel geometry).
+    if tc_type == "ring_1d":
+        bw, lat = _link_bw(), _link_lat()
+        return ([dp_size], [bw], [lat], ["Ring"], [0], [bw], [lat])
+
+    # Dragonfly: single dim spanning all EP ranks; fb_rows carries the group size.
+    if tc_type == "dragonfly":
+        bw, lat = _link_bw(), _link_lat()
+        gs = int(topology_config["group_size"])
+        return ([dp_size], [bw], [lat], ["Dragonfly"], [gs], [bw], [lat])
 
     grid_topo = _GRID_TOPO_NAME[tc_type]   # FlattenedButterfly / Mesh2D / Torus2D
     rows = int(topology_config["panel_rows"])

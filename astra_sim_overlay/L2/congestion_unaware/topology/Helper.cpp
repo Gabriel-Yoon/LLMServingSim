@@ -6,6 +6,7 @@ LICENSE file in the root directory of this source tree.
 #include "congestion_unaware/Helper.h"
 #include "congestion_unaware/BasicTopology.h"
 #include "congestion_unaware/FlattenedButterfly.h"
+#include "congestion_unaware/Dragonfly.h"
 #include "congestion_unaware/FullyConnected.h"
 #include "congestion_unaware/Mesh2D.h"
 #include "congestion_unaware/MultiDimTopology.h"
@@ -56,6 +57,12 @@ static std::unique_ptr<BasicTopology> make_basic_topology(
         const int rows = fb_rows;
         const int cols = (rows > 0) ? (npus_count / rows) : 0;
         return std::make_unique<Torus2D>(rows, cols, bandwidth, latency);
+    }
+    case TopologyBuildingBlock::Dragonfly: {
+        // fb_rows carries num_per_group (group size); num_groups = npus / group_size.
+        const int per_group = fb_rows;
+        const int groups = (per_group > 0) ? (npus_count / per_group) : 0;
+        return std::make_unique<Dragonfly>(per_group, groups, bandwidth, latency);
     }
     default:
         std::cerr << "[Error] (network/analytical/congestion_unaware) Not supported basic-topology" << std::endl;
