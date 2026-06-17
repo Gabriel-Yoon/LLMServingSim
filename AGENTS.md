@@ -591,6 +591,24 @@ WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 
   a fraction of the wiring, uniquely glass-realizable."* 기여 = feasibility + Pareto
   positioning (scaling 기록 아님) → 16/32 실측 + analytical 규모 논증으로 충분.
 
+### Topology 비교 (FB vs Torus/Mesh/Ring) 제반
+- **ASTRA basic-topology**: 기존 Ring/FullyConnected/Switch/FlattenedButterfly에 **Mesh2D,
+  Torus2D 신규 추가** (`congestion_unaware/basic-topology/{Mesh2D,Torus2D}.{cpp,h}`,
+  `Type.h` enum, `NetworkParser.cpp` 이름, `Helper.cpp` dispatch). Ring처럼
+  `compute_hops_count`만 override(BasicTopology의 alpha-beta `hops×lat + chunk/bw` 재사용):
+  Mesh=Manhattan(랩 없음), Torus=랩 Manhattan(각 차원 ring). fb_rows 필드를 grid rows로 재사용.
+  **이 C++ 변경은 `astra_sim_overlay/`에 미러링** — HPC는 `git pull && bash
+  scripts/apply_astra_overlay.sh`로 적용(스크립트가 GLOB 재구성 위해 `cmake .` 후 빌드).
+- **config_builder**: topology_config `type`에 `mesh_2d`/`torus_2d`/`ring_1d` 추가. fb_2d와
+  같은 multi-dim 기계 공유(`_GRID2D_RING`, `_compute_fb2d_dims`가 `_GRID_TOPO_NAME`으로
+  ASTRA 이름 스왑; ring은 1D 단일 Ring dim). collective impl은 `Ring→"ring", 그 외→"direct"`라
+  Mesh/Torus는 자동 "direct"이고 send()의 hop이 diameter를 반영.
+- **sweep**: `--sweep topo_compare --topologies fb mesh torus ring --wg-budget 60`.
+  공정 비교 = **같은 per-GPU WG 예산을 degree로 분할**(per-link BW=(budget/degree/2)×128) +
+  **같은 per-hop latency**(INTRA_OPT_LAT). 4×4/EP16: fb 640(deg6,⌀2) / mesh·torus 960(deg4) /
+  ring 1920(deg2,⌀8) GB/s. NVL72는 미포함(이건 glass 토폴로지끼리 비교). 검증 완료:
+  ring이 굵은 링크에도 ⌀ 때문에 exposed 최대. diameter 효과는 **prefill/대batch에서 증폭**.
+
 ### MoE collective 모델 (해결 — reach 헤드라인의 핵심)
 - **근본 원인**: MoE dispatch/combine을 vLLM 기본 **AllGather/ReduceScatter**로 모델하면
   multi-dim에서 계층 분해돼 느린 inter-domain(IB / inter-panel)에 데이터가 조금만 실려

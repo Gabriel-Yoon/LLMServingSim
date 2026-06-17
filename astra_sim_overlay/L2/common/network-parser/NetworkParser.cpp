@@ -151,6 +151,14 @@ TopologyBuildingBlock NetworkParser::parse_topology_name(const std::string& topo
         return TopologyBuildingBlock::FlattenedButterfly;
     }
 
+    if (topology_name == "Mesh2D") {
+        return TopologyBuildingBlock::Mesh2D;
+    }
+
+    if (topology_name == "Torus2D") {
+        return TopologyBuildingBlock::Torus2D;
+    }
+
     // shouldn't reach here
     std::cerr << "[Error] (network/analytical) " << "Topology name " << topology_name << " not supported" << std::endl;
     std::exit(-1);

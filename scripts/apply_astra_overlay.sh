@@ -15,7 +15,8 @@
 # Files overwritten:
 #   astra-sim (L1):           astra-sim/.../congestion_unaware/main.cc
 #   astra-network-analytical: FlattenedButterfly.{cpp,h}, NetworkParser.{cpp,h},
-#                             Helper.cpp, Type.h
+#                             Helper.cpp, Type.h, plus the new topology-comparison
+#                             classes Mesh2D.{cpp,h} / Torus2D.{cpp,h}
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."   # repo root
@@ -33,8 +34,11 @@ cp -rv "$OV/L1/." "astra-sim/"
 echo "[overlay] copying L2 (astra-network-analytical) files..."
 cp -rv "$OV/L2/." "$L2/"
 
-echo "[overlay] rebuilding ASTRA-Sim (incremental)..."
+echo "[overlay] rebuilding ASTRA-Sim..."
 NUM_THREADS="${NUM_THREADS:-$(nproc 2>/dev/null || echo 8)}"
-( cd astra-sim/build/astra_analytical/build && cmake --build . -j "$NUM_THREADS" )
+# Re-run cmake configure FIRST: the analytical CMakeLists globs sources with
+# file(GLOB ...), so newly added files (Mesh2D.cpp / Torus2D.cpp) are only picked
+# up after a fresh configure — a bare `cmake --build .` would silently skip them.
+( cd astra-sim/build/astra_analytical/build && cmake . && cmake --build . -j "$NUM_THREADS" )
 
-echo "[overlay] done — FlattenedButterfly electrical/optical + main.cc fix applied & rebuilt."
+echo "[overlay] done — FlattenedButterfly + Mesh2D/Torus2D + main.cc fix applied & rebuilt."

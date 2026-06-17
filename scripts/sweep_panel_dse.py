@@ -220,6 +220,80 @@ def make_nvl72_config(ep):
     return cfg
 
 
+# ──────────────────── Topology comparison (FB vs Torus/Mesh/Ring) ──────────────
+# All four are GLASS-realizable topologies; the question is which spends the same
+# per-GPU waveguide budget best. For a FAIR comparison we hold three things equal:
+#   (1) total per-GPU WG budget  (wg_budget, both directions, from wg_budget.py)
+#   (2) per-hop link latency       (INTRA_OPT_LAT, same optical CPO hop for all)
+#   (3) the model / EP / batch     (driven by the sweep)
+# and let only the TOPOLOGY differ. Topology sets (a) the node DEGREE — how many
+# neighbour links share the budget, so per-link BW = (wg_budget/degree/2)×WG_BW —
+# and (b) the DIAMETER (hop count), captured by each ASTRA topology's send().
+#   FB:    degree (rows-1)+(cols-1), diameter 2  — many thin links, low diameter
+#   Mesh:  degree 4,                 diameter (r-1)+(c-1)
+#   Torus: degree 4,                 diameter floor(r/2)+floor(c/2)
+#   Ring:  degree 2,                 diameter N/2 — two fat links, high diameter
+_TOPO_TYPE = {"fb": "fb_2d", "mesh": "mesh_2d", "torus": "torus_2d", "ring": "ring_1d"}
+
+
+def _topology_degree(topo, rows, cols):
+    if topo == "fb":
+        return (rows - 1) + (cols - 1)
+    if topo in ("mesh", "torus"):
+        return 4                       # 2-D nominal interior degree (±row, ±col)
+    if topo == "ring":
+        return 2
+    raise ValueError(f"unknown topology {topo}")
+
+
+def make_topology_config(topo, rows, cols, ep, wg_budget, inter_bw):
+    """Build a GLASS cluster config for one topology under a shared WG budget.
+
+    Per-link unidirectional BW = (wg_budget / degree / 2) × WG_BW, so a richer
+    topology (higher degree) gets thinner links — the cost side of the Pareto.
+    Links are uniform (elec == optical) so this is a pure connectivity/diameter
+    comparison. Per-hop latency is INTRA_OPT_LAT for every topology.
+    """
+    degree = _topology_degree(topo, rows, cols)
+    wg_per_pair_dir = (wg_budget / degree) / 2.0          # per-direction WG per neighbour
+    link_bw = max(1.0, wg_per_pair_dir * WG_BW)           # GB/s, unidirectional
+    panel_size = rows * cols
+    multi = ep > panel_size
+    tc = {
+        "type": _TOPO_TYPE[topo],
+        "intra_opt_bw": link_bw,
+        "intra_opt_latency": INTRA_OPT_LAT,
+    }
+    if topo != "ring":
+        tc["panel_rows"] = rows
+        tc["panel_cols"] = cols
+        tc["elec_bw"] = link_bw                           # uniform link (pure topo comparison)
+        tc["elec_latency"] = INTRA_OPT_LAT
+        tc["inter_bw"] = float(inter_bw) if multi else 0.0
+        tc["inter_lat"] = INTER_LAT
+    cfg = {"num_nodes": 1, "topology_config": tc, "nodes": [_node(ep)]}
+    if POWER:
+        cfg["nodes"][0]["power"] = _power_spec("glass", ep * TP)
+    return cfg, link_bw, degree
+
+
+def build_topo_compare_runs(panel, ep_list, wg_budget, inter_bw, topologies, batch, mode):
+    """For each (topology, EP), one glass run under the shared WG budget. No NVL72
+    here — this isolates topology-vs-topology on the same glass silicon."""
+    rows, cols = panel
+    runs = []
+    for ep in ep_list:
+        for topo in topologies:
+            cfg, link_bw, degree = make_topology_config(topo, rows, cols, ep, wg_budget, inter_bw)
+            meta = {"sweep": "topo_compare", "mode": mode, "topology": _TOPO_TYPE[topo],
+                    "fabric": topo, "panel": rows * cols, "ep": ep, "per_device_batch": batch,
+                    "wg_count": round(wg_budget / degree / 2.0, 2),
+                    "intra_opt_bw": round(link_bw, 1),
+                    "inter_bw": (inter_bw if ep > rows * cols else 0)}
+            runs.append((f"topo_{topo}_ep{ep}_b{batch}", cfg, ep, meta))
+    return runs
+
+
 # ─────────────────────────── Workload ─────────────────────────────────────────
 def make_workload(ep, batch_per_inst, mode, isl, osl):
     """N = ep × batch_per_inst requests. With controlled (all arrive t=0) and a
@@ -697,8 +771,15 @@ def build_batch_x_ep_runs(panel, wg, inter_opt_bw, batch_list, ep_list, mode):
 def main():
     global MODEL_NAME, HARDWARE, NVL72_RACK, INTER_LAT, TP, POWER
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sweep", choices=["intra", "inter", "epscale", "batch", "batch_x_ep", "latency"],
+    ap.add_argument("--sweep", choices=["intra", "inter", "epscale", "batch", "batch_x_ep", "latency",
+                                        "topo_compare"],
                     required=True)
+    ap.add_argument("--topologies", nargs="+", default=["fb", "mesh", "torus", "ring"],
+                    choices=["fb", "mesh", "torus", "ring"],
+                    help="topo_compare: glass topologies to compare under a shared WG budget")
+    ap.add_argument("--wg-budget", type=float, default=60.0,
+                    help="topo_compare: total per-GPU WG budget (both directions) split by each "
+                         "topology's degree (default 60, the 52x34 full-tile PIC from wg_budget.py)")
     ap.add_argument("--lat-list", nargs="+", type=float, default=[30, 100, 300, 500, 1000],
                     help="latency sweep: optical link latencies in ns (glass ~100 intra/500 inter "
                          "vs NVL72 500 hop)")
@@ -783,6 +864,10 @@ def main():
     elif args.sweep == "latency":
         runs = build_latency_runs(tuple(args.epscale_panel), args.fixed_wg, args.lat_list,
                                   args.lat_axis, args.mode, args.inter_opt_bw)
+    elif args.sweep == "topo_compare":
+        runs = build_topo_compare_runs(tuple(args.epscale_panel), args.ep_list, args.wg_budget,
+                                       args.inter_opt_bw, args.topologies, args.batch_per_instance,
+                                       args.mode)
     else:
         runs = build_inter_runs(args.panels, args.inter_bw, args.fixed_wg, args.mode, args.isl, args.osl)
 
@@ -806,6 +891,10 @@ def main():
     elif args.sweep == "latency":
         print(f"  latency-radix ({args.lat_axis}): link latency sweep {args.lat_list} ns  "
               f"glass panel {args.epscale_panel} wg{args.fixed_wg}  vs  NVL72 ({NVL72_LAT:.0f} ns hop)")
+    elif args.sweep == "topo_compare":
+        print(f"  topology comparison: {args.topologies}  panel {args.epscale_panel}  EP {args.ep_list}  "
+              f"shared WG budget {args.wg_budget}/GPU split by degree; per-hop {INTRA_OPT_LAT} ns; "
+              f"inter-panel {args.inter_opt_bw} GB/s")
     else:
         print(f"  fixed intra WG: {args.fixed_wg} (={int(args.fixed_wg*WG_BW)} GB/s)  inter_bw sweep: {args.inter_bw}")
     _wl_b = "per-run" if args.sweep in ("batch", "batch_x_ep") else args.batch_per_instance

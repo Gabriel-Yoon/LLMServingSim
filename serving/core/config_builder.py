@@ -94,10 +94,22 @@ def _resolve_parallelism(instance, model_config):
     return num_npus, tp_size, pp_size, ep_size, dp_group
 
 
+# Grid/diameter topology family. fb_2d, mesh_2d, torus_2d, ring_1d all share the
+# fb_2d multi-dim machinery (single spatial dim, optional FullyConnected inter-panel
+# dim) and differ only in the ASTRA topology name + per-hop model. hierarchical_fb
+# is the older 3-level FB. Everything here gets the FB collective-dim treatment.
+_GRID2D_TYPES = ("fb_2d", "mesh_2d", "torus_2d")          # 2D grids (use panel_rows/cols + fb_rows)
+_GRID2D_RING = _GRID2D_TYPES + ("ring_1d",)               # all types routed to _compute_fb2d_dims
+_FB_FAMILY = ("hierarchical_fb",) + _GRID2D_RING          # all special-cased grid topologies
+_GRID_TOPO_NAME = {"fb_2d": "FlattenedButterfly", "mesh_2d": "Mesh2D", "torus_2d": "Torus2D"}
+# ASTRA topology names that carry a grid row count via the fb_rows field.
+_FB_ROWS_TOPOS = ("FlattenedButterfly", "Mesh2D", "Torus2D")
+
+
 def _resolve_dp_groups(all_instances, topology_config=None):
     """Validate DP groups and compute dp_group_size and ep_total for each instance."""
     tc_type = topology_config.get("type") if topology_config else None
-    is_fb = tc_type in ("hierarchical_fb", "fb_2d")
+    is_fb = tc_type in _FB_FAMILY
 
     dp_groups = {}
     for inst in all_instances:
@@ -196,11 +208,11 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
 
     topology_config = cluster_config.get("topology_config")
     tc_type = topology_config.get("type") if topology_config else None
-    is_fb = tc_type in ("hierarchical_fb", "fb_2d")
+    is_fb = tc_type in _FB_FAMILY
 
     if is_fb:
         # For FB topology, link_bw/link_latency default to intra-panel values
-        if tc_type == "fb_2d":
+        if tc_type in _GRID2D_RING:
             link_bw = cluster_config.get("link_bw", topology_config.get("intra_bw", 0))
             link_latency = cluster_config.get("link_latency", topology_config.get("intra_lat", 0))
         else:
@@ -456,7 +468,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                 # inter-rack IB bandwidth boundary (EP>64). With "direct", in-domain
                 # collectives are bandwidth-bound (cheap on fast NVLink/optical) and
                 # the cost rises where the slow link is actually crossed.
-                if is_fb and topology_config.get("type") == "fb_2d":
+                if is_fb and topology_config.get("type") in _GRID2D_RING:
                     _, _, _, topo_names, _, _, _ = _compute_fb2d_dims(
                         max_dp if has_dp else 1, topology_config)
                 else:
@@ -615,13 +627,21 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
 
 def _validate_fb_topology_config(tc):
     tc_type = tc.get("type", "hierarchical_fb")
-    if tc_type == "fb_2d":
+    if tc_type in _GRID2D_TYPES:
+        # fb_2d / mesh_2d / torus_2d: 2-D grid, needs panel geometry + a link-bw knob.
         if tc.get("panel_rows", 0) < 2 or tc.get("panel_cols", 0) < 2:
-            raise ValueError(f"fb_2d topology_config requires panel_rows>=2 and panel_cols>=2")
-        # Optical (far) intra-panel bandwidth: wg_count, intra_opt_bw, or legacy intra_bw.
+            raise ValueError(f"{tc_type} topology_config requires panel_rows>=2 and panel_cols>=2")
         if not any(k in tc for k in ("wg_count", "intra_opt_bw", "intra_bw")):
             raise KeyError(
-                "fb_2d topology_config must specify the optical intra-panel bandwidth "
+                f"{tc_type} topology_config must specify the intra-panel link bandwidth "
+                "via 'wg_count' (×128 GB/s), 'intra_opt_bw', or legacy 'intra_bw'"
+            )
+        return
+    if tc_type == "ring_1d":
+        # 1-D Ring: only needs a per-link bandwidth knob (no panel geometry).
+        if not any(k in tc for k in ("wg_count", "intra_opt_bw", "intra_bw")):
+            raise KeyError(
+                "ring_1d topology_config must specify the link bandwidth "
                 "via 'wg_count' (×128 GB/s), 'intra_opt_bw', or legacy 'intra_bw'"
             )
         return
@@ -704,7 +724,27 @@ def _compute_fb2d_dims(dp_size, topology_config):
     arrays carry the electrical (adjacent) link. For non-FB dims (Ring) the
     elec_* entries equal the regular bandwidth/latency.
     Raises ValueError if dp_size cannot be mapped.
+
+    Also serves mesh_2d / torus_2d (same 2D-grid machinery, ASTRA topology name
+    swapped via _GRID_TOPO_NAME) and ring_1d (a single 1-D Ring dim).
     """
+    tc_type = topology_config.get("type", "fb_2d")
+
+    # Ring: 1-D topology, a single Ring dim spanning all EP ranks (no panel
+    # geometry). Per-link bandwidth comes from the same WG knob as the grids.
+    if tc_type == "ring_1d":
+        wg_count = topology_config.get("wg_count")
+        if wg_count is not None:
+            link_bw = float(wg_count) * float(topology_config.get("wg_bw", _WG_BW_GBPS))
+        elif "intra_opt_bw" in topology_config:
+            link_bw = float(topology_config["intra_opt_bw"])
+        else:
+            link_bw = float(topology_config["intra_bw"])
+        link_lat = float(topology_config.get("intra_opt_latency",
+                                             topology_config.get("intra_lat", 300.0)))
+        return ([dp_size], [link_bw], [link_lat], ["Ring"], [0], [link_bw], [link_lat])
+
+    grid_topo = _GRID_TOPO_NAME[tc_type]   # FlattenedButterfly / Mesh2D / Torus2D
     rows = int(topology_config["panel_rows"])
     cols = int(topology_config["panel_cols"])
     panel_size = rows * cols
@@ -714,10 +754,11 @@ def _compute_fb2d_dims(dp_size, topology_config):
     if wg_count is not None:
         wg_bw = float(topology_config.get("wg_bw", _WG_BW_GBPS))
         intra_opt_bw = float(wg_count) * wg_bw
+    elif "intra_opt_bw" in topology_config:
+        intra_opt_bw = float(topology_config["intra_opt_bw"])
     else:
-        # accept intra_opt_bw, else fall back to legacy intra_bw
-        intra_opt_bw = float(topology_config.get("intra_opt_bw",
-                                                 topology_config["intra_bw"]))
+        # legacy intra_bw fallback
+        intra_opt_bw = float(topology_config["intra_bw"])
     intra_opt_lat = float(topology_config.get("intra_opt_latency",
                                               topology_config.get("intra_lat", 300.0)))
 
@@ -736,7 +777,7 @@ def _compute_fb2d_dims(dp_size, topology_config):
         lats = [intra_opt_lat]
         elec_bws = [intra_elec_bw]
         elec_lats = [intra_elec_lat]
-        topos   = ["FlattenedButterfly"]
+        topos   = [grid_topo]
         fb_rows = [fb_r]
     elif dp_size % panel_size == 0:
         # Multi-panel: FlattenedButterfly for intra-panel + a FullyConnected
@@ -752,7 +793,7 @@ def _compute_fb2d_dims(dp_size, topology_config):
         lats = [intra_opt_lat, inter_lat]
         elec_bws = [intra_elec_bw, inter_bw]
         elec_lats = [intra_elec_lat, inter_lat]
-        topos   = ["FlattenedButterfly", "FullyConnected"]
+        topos   = [grid_topo, "FullyConnected"]
         fb_rows = [rows, 0]  # 0 = not applicable for the inter-panel dim
     else:
         raise ValueError(
@@ -784,7 +825,7 @@ def _compute_fb_dims(dp_size, topology_config):
     For fb_2d, also returns topologies and fb_rows (5-tuple), but callers that
     only unpack 3 values still work because Python tuple unpacking is positional.
     """
-    if topology_config.get("type") == "fb_2d":
+    if topology_config.get("type") in _GRID2D_RING:
         dims, bws, lats, _topos, _fb_rows, _ebws, _elats = _compute_fb2d_dims(dp_size, topology_config)
         return dims, bws, lats
 
@@ -858,7 +899,7 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
         if dg is not None:
             dp_groups.setdefault(dg, []).append(inst)
 
-    is_fb = topology_config is not None and topology_config.get("type") in ("hierarchical_fb", "fb_2d")
+    is_fb = topology_config is not None and topology_config.get("type") in _FB_FAMILY
 
     # Per-dim electrical (adjacent-tile) link params for FlattenedButterfly.
     # None → no split; ASTRA-Sim falls back to uniform bandwidth/latency.
@@ -870,7 +911,7 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
         dp_size = len(first_group)
         tp_size = first_group[0]["tp_size"]
         tc_type = topology_config.get("type")
-        if tc_type == "fb_2d":
+        if tc_type in _GRID2D_RING:
             dims, bandwidths, latencies, topology_names, fb_rows_list, elec_bandwidths, elec_latencies = \
                 _compute_fb2d_dims(dp_size, topology_config)
         else:
@@ -929,8 +970,9 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
         "bandwidth":  FlowStyleList(bandwidths),
         "latency":    FlowStyleList(latencies),
     }
-    # Write fb_rows when any dimension is FlattenedButterfly
-    if fb_rows_list is not None and any(t == "FlattenedButterfly" for t in final_topo_names):
+    # Write fb_rows when any dimension is a grid topology that uses it
+    # (FlattenedButterfly / Mesh2D / Torus2D). Ring/FullyConnected ignore it.
+    if fb_rows_list is not None and any(t in _FB_ROWS_TOPOS for t in final_topo_names):
         topology_data["fb_rows"] = FlowStyleList(fb_rows_list)
 
     # Write electrical RDL link params only when the split is active (elec

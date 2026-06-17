@@ -7,9 +7,11 @@ LICENSE file in the root directory of this source tree.
 #include "congestion_unaware/BasicTopology.h"
 #include "congestion_unaware/FlattenedButterfly.h"
 #include "congestion_unaware/FullyConnected.h"
+#include "congestion_unaware/Mesh2D.h"
 #include "congestion_unaware/MultiDimTopology.h"
 #include "congestion_unaware/Ring.h"
 #include "congestion_unaware/Switch.h"
+#include "congestion_unaware/Torus2D.h"
 #include <cstdlib>
 #include <iostream>
 
@@ -43,6 +45,17 @@ static std::unique_ptr<BasicTopology> make_basic_topology(
         // default when no elec fields are present), this reproduces the legacy
         // uniform FlattenedButterfly behaviour.
         return std::make_unique<FlattenedButterfly>(rows, cols, elec_bandwidth, elec_latency, bandwidth, latency);
+    }
+    case TopologyBuildingBlock::Mesh2D: {
+        // fb_rows carries the grid row count for Mesh/Torus (cols = npus / rows).
+        const int rows = fb_rows;
+        const int cols = (rows > 0) ? (npus_count / rows) : 0;
+        return std::make_unique<Mesh2D>(rows, cols, bandwidth, latency);
+    }
+    case TopologyBuildingBlock::Torus2D: {
+        const int rows = fb_rows;
+        const int cols = (rows > 0) ? (npus_count / rows) : 0;
+        return std::make_unique<Torus2D>(rows, cols, bandwidth, latency);
     }
     default:
         std::cerr << "[Error] (network/analytical/congestion_unaware) Not supported basic-topology" << std::endl;
