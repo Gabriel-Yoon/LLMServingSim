@@ -216,14 +216,13 @@ def make_panel_config(rows, cols, ep, wg_count, inter_bw, intra_lat=None, inter_
         tc.pop("wg_count"); tc.pop("wg_bw")
         tc["intra_opt_bw"] = agg
         tc["elec_bw"] = agg
-        # Inter-panel egress is ALSO multi-port: a GPU's optical uplink is the same
-        # fungible optical I/O routed off-panel, so credit the cross-panel link the
-        # full aggregate egress too (vs NVL72's inter-rack stuck on the IB NIC ~50).
-        # This is the optimistic "fully-provisioned glass uplink" bound; per-link (no
-        # AGG) is the conservative one.
-        if tc["inter_bw"] > 0:
-            tc["inter_bw"] = agg
-    cfg = {"num_nodes": 1, "topology_config": tc, "nodes": [_node(ep)]}
+        # NOTE: inter-panel is NOT aggregated. Per [8''] (fb_physical_design.py),
+        # off-panel fiber sits only on BORDER tiles (12/16), shared by the whole
+        # panel -> realistic per-GPU inter-panel BW ~= 528 GB/s, i.e. ~ the per-link
+        # inter_bw (512), NOT the within-panel aggregate. So inter_bw is left as
+        # passed. (An earlier commit aggregated it to 3072 -- physically unjustified;
+        # reverted.) AGG thus credits glass's many within-panel WG (legit) but keeps
+        # the border-limited cross-panel link realistic.
     if POWER:
         cfg["nodes"][0]["power"] = _power_spec("glass", ep * TP)
     return cfg

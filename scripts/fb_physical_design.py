@@ -207,11 +207,39 @@ def main():
     for name, (ok, detail) in gates(args.w_compare[-1], d).items():
         print(f"  [{'PASS' if ok else 'FAIL'}] {name:13} {detail}")
 
+    # [8''] inter-panel I/O placement (BORDER tiles only) + panel-level inter BW
+    W = args.w_compare[-1]
+    # tile multiplicity in a 4x4 panel: 4 corners, 8 edges, 4 interior(center)
+    mult = {"corner": 4, "edge": 8, "center": 4}
+    free_perim_mm = {"corner": TILE_W + TILE_H, "edge": TILE_W, "center": 0.0}  # free panel-edge length
+    panel_inter_total = 0.0   # GB/s, both directions, summed over border tiles
+    print(f"\n[8''] inter-panel I/O placement @ W={W} (off-panel fiber on BORDER tiles only):")
+    print(f"  {'pos':7}{'#':>3}{'role':>9}{'free_edge':>10}{'intra_bump':>11}{'headroom':>9}{'offWG':>7}{'offBW/dir':>10}")
+    for name, (r, c) in POSITIONS.items():
+        E, O = node_eo(r, c)
+        b = tile_budget(E, O, W, d)
+        is_border = free_perim_mm[name] > 0
+        headroom = d["n_bump"] - b["bump"]
+        slot_cap = int(free_perim_mm[name] / FLDW_PITCH)                  # FLDW launch slots
+        off_wg = max(0, min(slot_cap, int(headroom / BUMP_PER_WG))) if is_border else 0
+        off_bw_dir = (off_wg / 2.0) * d["bw_wg"]
+        panel_inter_total += mult[name] * off_wg * d["bw_wg"]             # both-dir, all tiles of this type
+        role = "border" if is_border else "interior(relay)"
+        print(f"  {name:7}{mult[name]:>3}{role:>9}{slot_cap if is_border else 0:>10}"
+              f"{b['bump']:>11.0f}{headroom:>9.0f}{off_wg:>7}{off_bw_dir:>10.0f}")
+    panel_inter_dir = panel_inter_total / 2.0
+    per_gpu_inter = panel_inter_dir / (ROWS * COLS)
+    print(f"  M2 panel inter-BW (border sum) = {panel_inter_dir:.0f} GB/s/dir  -> per-GPU share "
+          f"= {per_gpu_inter:.0f} GB/s/dir (16 GPUs share it; NOT the within-panel aggregate {DEGREE*W//2*int(d['bw_wg'])})")
+    print(f"  M1 interior(2x2 center) cross-panel = +2 intra hops (relay to border) -> extra "
+          f"{2*link_latency_ns(1):.2f} ns latency asymmetry vs border.")
+    print(f"  M3 gate: each border tile intra+offpanel bump <= N_bump (offWG is headroom-capped, so PASS by construction).")
+    print(f"  => realistic per-GPU inter-panel BW ~ {per_gpu_inter:.0f} GB/s (near the per-link 512, NOT a"
+          f" uniform aggregate); use this for the sweep inter_bw under --agg-bw.")
+
     # loss / latency reference
     print(f"\n[9] link model: IOX {LOSS_IOX} dB + FLDW {LOSS_FLDW} dB + glass {LOSS_GLASS_DB_CM} dB/cm; "
           f"latency {link_latency_ns(2):.2f} ns (dist-2) .. {link_latency_ns(3):.2f} ns (dist-3), n={N_GLASS}")
-    print(f"[8] inter-panel: free panel-edge sides per tile -> corner 2, edge 1, center 0 "
-          f"(uplink WG x {d['bw_wg']:.0f} GB/s; place off-panel links on free edges).")
 
 
 if __name__ == "__main__":
