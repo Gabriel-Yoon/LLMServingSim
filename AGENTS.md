@@ -493,6 +493,13 @@ These must match the C++ enum in `astra-sim/astra-sim/system/AstraMemoryAPI.hh`.
 - bundle 매핑: x{K} bundle = K WG total = K/2 per direction.
   예: 6×6-4c cap **x6 = 3 TX + 3 RX = N_WG=3** (단방향 384 GB/s); 4×4 cap **x10 = N_WG=5**
   (640 GB/s). **cap은 격자마다 다르다** (아래 표) — N_WG=3은 6×6 cap이지 보편값 아님.
+- **⚠️ N_WG(=`--fixed-wg`/`wg_count`)는 반드시 짝수로 쓴다 (TX/RX 대칭 제약).** RX와 TX
+  waveguide가 대칭이어야 물리적으로 구현 가능하므로 홀수 N_WG(예: wg5, wg3)는 비대칭이라
+  **물리적으로 비실현**이다 — 분석/그래프선으로만 등장할 수 있고 실제 구성·헤드라인에는 쓰지 않는다.
+- **wg5는 기본값이 아니다.** wg5/wg3은 홀수 aggressive ceil(그래프선)일 뿐. 헤드라인·재측정은
+  각 격자의 **짝수 feasible floor**를 쓴다: **4×4 → wg4** (cap floor=4, 짝수, 512 GB/s),
+  **6×6/6×6-4c → wg2** (cap floor=2, 짝수, 256 GB/s). 우연히도 두 격자의 cap floor가 모두
+  짝수라 "짝수 + feasible"이 동시에 성립한다.
 
 ### Micro-bump 제약 → 격자별 N_WG 상한 (CRITICAL)
 WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 (격자별로 다름).
@@ -542,22 +549,47 @@ WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 
 ### Latency 비교 (시뮬레이션 입력)
 | 연결 | latency | 근거 |
 |------|---------|------|
-| NVL72 intra-rack | 1000 ns | NVSwitch hop |
-| 우리 intra-panel | 100 ns | TeraPHY CPO (switch 없음, 10× 낮음) |
+| NVL72 intra-rack | 500 ns | NVSwitch hardware hop (one-way; ~1-2us cited figures include SW/kernel overhead) |
+| 우리 intra-panel | 100 ns | TeraPHY CPO (switch 없음, 5× 낮음) |
 | 우리 inter-panel | 500 ns | edge transceiver + 짧은 fiber (intra의 5배; <1% 영향) |
 
 ### Sweep & NVL72 baseline
-- **N_WG sweep = [1, 2, 3, 4, 5, 6, 8]** (각 격자 cap선 포함: 4×4→5, 6×6→3)
-- **epscale/headline은 각 패널을 자기 cap의 N_WG로 실행**: 4×4 → `--fixed-wg 5`,
-  6×6-4c → `--fixed-wg 3`. ⚠️ 단일 N_WG를 모든 패널에 쓰지 말 것 — 4×4를 wg3로 돌리면
-  intra optical 384 GB/s(제대로면 640)로 glass 과소provisioning.
+- **N_WG sweep = [2, 4, 6, 8]** (짝수만 물리적; 홀수 5/3은 분석용 그래프선으로만, 실측 구성 제외)
+- **epscale/headline은 각 패널을 자기 짝수 feasible floor로 실행**: 4×4 → `--fixed-wg 4`
+  (512 GB/s), 6×6-4c → `--fixed-wg 2` (256 GB/s). ⚠️ wg5/wg3은 홀수라 비실현 — 헤드라인 금지.
+  ⚠️ 단일 N_WG를 모든 패널에 쓰지 말 것 — 격자마다 floor가 다르다.
 - intra latency 고정 = 100 ns
-- NVL72 baseline: **BW 900 GB/s unidirectional** (1800 bidir ÷2), **latency 1000 ns**,
+- NVL72 baseline: **BW 900 GB/s unidirectional** (1800 bidir ÷2), **latency 500 ns**,
   inter-rack IB 50 GB/s @EP>64
 
 ### Convention 주의 (uni/bi)
 - ASTRA BW 입력은 **unidirectional**. NVL72·글래스 모두 단방향으로 통일 적용.
 - 양쪽 동일 convention이면 절대값과 무관하게 비율(4.3×)·breakeven 유지.
+
+### WG budget 산출 (재현 가능)
+- `scripts/wg_budget.py` = max-waveguide 도출의 단일 source of truth. tile 기하 →
+  bump → MRR → WG → per-GPU BW → 격자별 bundle. `--check`로 헤드라인/보수 케이스 검증.
+- 헤드라인 (52×34 full-tile PIC): bump≈1915, **wg_max≈60/GPU, 7.68 TB/s, vs H100
+  NVLink 8.5×**. 4×4(deg6)→x10 bundle, 4×8(deg10)→x6. 보수(die-only 814mm²)→wg≈27.
+- 가정: PIC=tile 전면(3D EIC-PIC stack, TX=periphery/RX=bottom); GPU die→EIC는
+  fine-pitch hybrid bonding(814mm² 깔때기 회피); PIC-glass는 FLDW 250µm(periphery
+  172mm=688 WG slot, 60은 9%); bump_density 1.083은 XPU 기준 보수 하한.
+- per-direction N_WG = bundle/2이고 **짝수여야** 함(TX/RX 대칭, [[feedback_wg_even]]).
+  이 스크립트는 물리 **cap**을 내고, 짝수 feasible-floor는 운영 선택으로 덧씌운다.
+
+### Topology 평가 원칙 & framing (확정 — 상세는 private `notes/topology_eval_design.md`)
+- **1급 지표 = collective latency / exposed communication** (decode TPOT 아님).
+  decode A2A는 step의 ~5%라 compute에 숨어 TPOT가 fabric에 무감. 실측: Qwen3-30B
+  batch128에서 cross-IB a2a 534µs vs 10ms step.
+- **topology 이점은 prefill에서 측정** — 큰 메시지 → A2A 노출 → diameter/hop-count 차이가 드러남.
+- **scale은 projection**: 패널 물리 한계로 16(4×4)/32(4×8)만 실측, 64–256은 analytical
+  hop-count/α-β 모델로 투영하고 16/32 점으로 검증 (ViBE rack-scale projection 기법).
+- **32노드 = 정규 4×8 FB = ASTRA `FC(4)×FC(8)`** ("6×6 minus corners" 같은 불규칙 금지).
+- **framing**: FB 셀링포인트는 "mesh보다 빠르다"가 아니라 **FC(빠르나 degree 폭발)와
+  mesh(싸나 hop 많음) 사이 cost-performance Pareto sweet spot이며 glass 3D
+  distance-layered routing으로만 long-wire 실현 가능**. 한 줄: *"near-FC performance at
+  a fraction of the wiring, uniquely glass-realizable."* 기여 = feasibility + Pareto
+  positioning (scaling 기록 아님) → 16/32 실측 + analytical 규모 논증으로 충분.
 
 ### MoE collective 모델 (해결 — reach 헤드라인의 핵심)
 - **근본 원인**: MoE dispatch/combine을 vLLM 기본 **AllGather/ReduceScatter**로 모델하면
@@ -567,10 +599,15 @@ WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 
   expert rank로 직접 가 locality가 없으니 cross-domain 전량이 느린 링크를 탄다.
   `MOE_ALLTOALL=1` env로 dispatch/combine을 ALLTOALL로 전환 (`trace_generator._emit_moe_block`),
   default off (기존 동작 보존).
-- **검증 (mini rack=4, EP 4→32, batch128, glass wg5)**: NVL72/glass TPOT 비 =
-  1.05 → 1.47 → 3.23 → **6.39×**. NVL72 exposed 4%→95%(IB 폭발), glass 3%→69%(평탄). crossover 확정.
-- **부수 결론**: glass inter-panel은 **Ring 유지로 충분** — cross-domain 대역차(optical 512
-  vs IB 50 = 10×)가 Ring 홉수차를 압도해 glass가 Ring인데도 이김. crossbar로 바꿀 필요 없음.
+- **검증 상태**: cliff 재측정 필요. 이전 mini-rack/rack64 cliff 수치(예: TPOT 6.39×,
+  NVL72 exposed 95%)는 **ring→direct 수정(commit 89951cb) 이전의 ring 아티팩트라 무효** —
+  FullyConnected/NVSwitch dim을 ring(N-1홉)으로 모델해 in-domain exposure가 부풀려졌다
+  (NVL72 EP32 in-domain exposed 25.1%→2.7%). cliff는 decode TPOT에서 나타나며(짧은 step이
+  a2a에 민감), prefill TTFT는 compute-bound라 평탄. direct 기준 재측정은 HPC
+  rack64+EP128+대형모델 필요.
+- **inter-panel 토폴로지**: **FullyConnected(direct)** — optical circuit switch는 1 스위치 홉.
+  과거 Ring 모델은 도메인 수만큼 홉을 부과해 EP>rack cliff를 뒤집었다(소형 다패널을 부당하게
+  벌점). cross-domain 비용은 도메인 수가 아니라 inter-domain **대역폭**(optical vs IB)이 결정.
 - TODO: `MOE_ALLTOALL` env를 정식 config/CLI 플래그로 승격; 大EP=all2all 근거(DeepEP) 본문 명시.
 
 ## README and docs split

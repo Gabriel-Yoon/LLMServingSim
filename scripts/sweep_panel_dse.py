@@ -82,8 +82,8 @@ INTER_LAT      = 500.0    # ns  inter-panel: edge transceiver (~50-200ns) + shor
                           # co-located fiber (1-2m, ~5-10ns); 5x the in-package
                           # intra CPO. (5000ns would imply ~1km fiber — not co-located.)
 
-# NVL72 baseline. Switch-hop removal gives the glass panel a ~10x latency
-# advantage (1000 ns NVSwitch hop vs 100 ns CPO); since the MoE AllToAll is
+# NVL72 baseline. Switch-hop removal gives the glass panel a ~5x latency
+# advantage (500 ns NVSwitch hop vs 100 ns CPO); since the MoE AllToAll is
 # latency-bound this is a core strength, not a neutralized axis. Bandwidth is
 # unidirectional: NVL72's 1800 GB/s is the bidirectional spec → 900 unidir,
 # matching our N_WG×128 unidirectional convention.
@@ -618,12 +618,12 @@ def build_latency_runs(panel, wg, lat_list, axis, mode, inter_opt_bw):
     """Latency-radix sweep: hold BW (WG) and EP fixed, sweep the optical LINK
     LATENCY and watch decode TPOT / TTFT. At sufficient WG the collective is
     latency-bound (not BW-bound), so this isolates the glass switch-free hop
-    (~100 ns intra / ~500 ns inter) vs the NVL72 switched hop (1000 ns).
+    (~100 ns intra / ~500 ns inter) vs the NVL72 switched hop (500 ns).
 
       axis='intra' : single panel (EP=panel_size), sweep intra_opt_latency.
       axis='inter' : two panels  (EP=2*panel_size), sweep inter_lat.
 
-    A single NVL72 run (fixed 1000 ns hop) is the horizontal reference.
+    A single NVL72 run (fixed 500 ns hop) is the horizontal reference.
     """
     rows, cols = panel
     panel_size = rows * cols
@@ -701,7 +701,7 @@ def main():
                     required=True)
     ap.add_argument("--lat-list", nargs="+", type=float, default=[30, 100, 300, 500, 1000],
                     help="latency sweep: optical link latencies in ns (glass ~100 intra/500 inter "
-                         "vs NVL72 1000 hop)")
+                         "vs NVL72 500 hop)")
     ap.add_argument("--lat-axis", choices=["intra", "inter"], default="intra",
                     help="latency sweep: which optical link latency to vary (intra single-panel "
                          "or inter multi-panel)")

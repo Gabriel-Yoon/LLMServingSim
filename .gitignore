@@ -26,3 +26,8 @@ outputs/
 
 # Backup files
 profiler/profile.sh.orig
+
+# Private research notes / manuscript drafts (do not publish)
+paper_summary.txt
+paper_*.txt
+notes/
