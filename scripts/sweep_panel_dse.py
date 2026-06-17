@@ -62,6 +62,16 @@ TP         = 1     # tensor-parallel degree per EP rank (shards dense; ALLREDUCE
                    # prepended FullyConnected TP dim, EP all-to-all on the FB dims)
 POWER      = False # when True, attach a node "power" spec so the simulator
                    # integrates real NPU+HBM+link energy (see _power_spec)
+AGG_BW     = False # FAIRNESS MODE. ASTRA's congestion-unaware send() charges the
+                   # PER-LINK bandwidth per pairwise transfer (no aggregate/contention
+                   # cap), so it rewards a fat single link (NVLink 900 = per-GPU
+                   # AGGREGATE modeled as per-pair) but NOT a many-thin-link fabric
+                   # (glass: 6x512 = 3072 aggregate, but each pair only sees 512<900).
+                   # An MoE all-to-all saturates ALL of a GPU's links, so the right
+                   # bandwidth-bound cost uses AGGREGATE egress. With AGG_BW the glass
+                   # within-panel link bw is set to per-link x degree (= aggregate
+                   # egress), matching how NVL72's 900 aggregate is already modeled.
+                   # Flips the per-pair under-crediting of glass (the 6x swing).
 
 BLOCK_SIZE = 16
 MAX_SEQS   = 128
@@ -181,19 +191,28 @@ def make_panel_config(rows, cols, ep, wg_count, inter_bw, intra_lat=None, inter_
     """fb_2d config with the electrical/optical split. inter_bw=0 → single panel.
     intra_lat / inter_lat override the default optical link latencies (ns) — used
     by the latency-radix sweep; default to the module constants."""
-    cfg = {
-        "num_nodes": 1,
-        "topology_config": {
-            "type": "fb_2d",
-            "panel_rows": rows, "panel_cols": cols,
-            "elec_bw": ELEC_BW, "elec_latency": ELEC_LAT,        # adjacent (fixed)
-            "wg_count": wg_count, "wg_bw": WG_BW,                # optical far (swept)
-            "intra_opt_latency": (INTRA_OPT_LAT if intra_lat is None else float(intra_lat)),
-            "inter_bw": float(inter_bw),
-            "inter_lat": (INTER_LAT if inter_lat is None else float(inter_lat)),  # inter-panel
-        },
-        "nodes": [_node(ep)],
+    tc = {
+        "type": "fb_2d",
+        "panel_rows": rows, "panel_cols": cols,
+        "elec_bw": ELEC_BW, "elec_latency": ELEC_LAT,        # adjacent (fixed)
+        "wg_count": wg_count, "wg_bw": WG_BW,                # optical far (swept)
+        "intra_opt_latency": (INTRA_OPT_LAT if intra_lat is None else float(intra_lat)),
+        "inter_bw": float(inter_bw),
+        "inter_lat": (INTER_LAT if inter_lat is None else float(inter_lat)),  # inter-panel
     }
+    if AGG_BW:
+        # Aggregate-egress fairness: the within-panel link bw = per-link x degree
+        # (all of a GPU's WG links carry the all-to-all). Set intra_opt_bw directly
+        # (overriding wg_count) and lift the electrical link to match, so the per-pair
+        # cost reflects the GPU's full optical egress, comparable to NVL72's
+        # aggregate-900 modeled as per-pair. Inter-panel egress is already one
+        # per-GPU optical link, so inter_bw is left as the aggregate it already is.
+        degree = (rows - 1) + (cols - 1)
+        agg = float(wg_count) * WG_BW * degree
+        tc.pop("wg_count"); tc.pop("wg_bw")
+        tc["intra_opt_bw"] = agg
+        tc["elec_bw"] = agg
+    cfg = {"num_nodes": 1, "topology_config": tc, "nodes": [_node(ep)]}
     if POWER:
         cfg["nodes"][0]["power"] = _power_spec("glass", ep * TP)
     return cfg
@@ -451,6 +470,20 @@ def parse_steady_decode(text):
         return None, None
     binned = collections.Counter(round(dt / 1e5) / 10.0 for dt, _ in pairs)
     mode_ms = float(binned.most_common(1)[0][0])
+    # Robustness guard: the steady decode step is the SMALL repeated value; prefill
+    # and ramp/wave-sync-stalled iterations are large and fewer. When a cluster of
+    # large iterations forms the most-common 0.1 ms bin (observed at glass EP32 with
+    # 2-panel wave sync -> a spurious 167 ms "mode" while TTFT was normal), the mode
+    # lands far above the median. In that case re-take the mode among the sub-median
+    # (decode-like) iterations. Triggers only on the outlier case; normal runs where
+    # mode ~= median are unchanged.
+    deltas_ms = sorted(dt / 1e6 for dt, _ in pairs)
+    median_ms = deltas_ms[len(deltas_ms) // 2]
+    if mode_ms > 1.5 * median_ms and median_ms > 0:
+        lower = [(dt, de) for dt, de in pairs if (dt / 1e6) <= median_ms]
+        if lower:
+            b2 = collections.Counter(round(dt / 1e5) / 10.0 for dt, _ in lower)
+            mode_ms = float(b2.most_common(1)[0][0])
     # exposed fraction over only the steady (mode-bin) iterations
     sel = [(dt, de) for dt, de in pairs if round(dt / 1e5) / 10.0 == mode_ms]
     sum_dt = sum(dt for dt, _ in sel)
@@ -683,9 +716,10 @@ def build_epscale_runs(panel, wg, inter_opt_bw, ep_list, mode):
         multi = ep > panel_size
         cfg = make_panel_config(rows, cols, ep, wg_count=wg,
                                 inter_bw=(inter_opt_bw if multi else 0.0))
+        _intra = cfg["topology_config"]["intra_opt_bw"] if AGG_BW else int(wg * WG_BW)
         runs.append((f"epscale_fb_ep{ep}", cfg, ep,
                      {"sweep": "epscale", "mode": mode, "topology": "glass_fb", "panel": panel_size,
-                      "ep": ep, "wg_count": wg, "intra_opt_bw": int(wg * WG_BW),
+                      "ep": ep, "wg_count": wg, "intra_opt_bw": _intra,
                       "inter_bw": (inter_opt_bw if multi else 0)}))
         runs.append((f"epscale_nvl72_ep{ep}", make_nvl72_config(ep), ep,
                      {"sweep": "epscale", "mode": mode, "topology": "nvl72", "panel": NVL72_RACK,
@@ -797,7 +831,7 @@ def build_batch_x_ep_runs(panel, wg, inter_opt_bw, batch_list, ep_list, mode):
 
 
 def main():
-    global MODEL_NAME, HARDWARE, NVL72_RACK, INTER_LAT, TP, POWER
+    global MODEL_NAME, HARDWARE, NVL72_RACK, INTER_LAT, TP, POWER, AGG_BW
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sweep", choices=["intra", "inter", "epscale", "batch", "batch_x_ep", "latency",
                                         "topo_compare"],
@@ -849,6 +883,10 @@ def main():
     ap.add_argument("--power", action="store_true",
                     help="attach a node power spec so the simulator integrates real "
                          "NPU+HBM+link energy (glass optical vs NVL72 NVLink+NVSwitch).")
+    ap.add_argument("--agg-bw", action="store_true",
+                    help="FAIRNESS: model glass within-panel link as AGGREGATE egress "
+                         "(per-link x degree), comparable to NVL72's aggregate-900. "
+                         "Corrects congestion-unaware per-pair under-crediting of glass.")
     ap.add_argument("--npu-mem-gb", type=int, default=NPU_MEM["mem_size"],
                     help="per-NPU memory capacity (GB). Raise for large models like DeepSeek-V3 at tp=1 "
                          "(671B replicates dense weights per GPU); only gates the weight-fit/KV check, "
@@ -870,6 +908,7 @@ def main():
     HARDWARE = args.hardware
     TP = args.tp
     POWER = args.power
+    AGG_BW = args.agg_bw
     NPU_MEM["mem_size"] = args.npu_mem_gb
     NVL72_RACK = args.nvl72_rack
     INTER_LAT = args.inter_lat
