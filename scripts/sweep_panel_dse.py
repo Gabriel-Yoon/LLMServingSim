@@ -223,6 +223,7 @@ def make_panel_config(rows, cols, ep, wg_count, inter_bw, intra_lat=None, inter_
         # passed. (An earlier commit aggregated it to 3072 -- physically unjustified;
         # reverted.) AGG thus credits glass's many within-panel WG (legit) but keeps
         # the border-limited cross-panel link realistic.
+    cfg = {"num_nodes": 1, "topology_config": tc, "nodes": [_node(ep)]}
     if POWER:
         cfg["nodes"][0]["power"] = _power_spec("glass", ep * TP)
     return cfg
