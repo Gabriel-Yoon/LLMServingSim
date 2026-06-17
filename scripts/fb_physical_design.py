@@ -26,6 +26,8 @@ LAMBDA_PER_WG  = 32              # WDM: 1 WG = 32 lambda
 R_LAMBDA       = 32.0            # Gb/s per lambda
 BUMP_PER_WG    = 32              # 1 lambda = 1 bump = 1 MRR
 R_ELEC         = 112.0           # Gb/s  high-speed short-reach electrical RDL lane
+ELEC_RDL_BW    = 1800.0          # GB/s  electrical RDL link bandwidth, FIXED (inherited from
+                                 # the sweep's ELEC_BW; dist-1 adjacent links). Unidirectional.
 FLDW_PITCH     = 0.25            # mm    glass waveguide lateral pitch
 GLASS_LAYERS   = 3               # L1 50um / L2 300um / L3 550um
 NVLINK_H100    = 900.0           # GB/s  in-domain baseline
@@ -72,15 +74,21 @@ POSITIONS = {"corner": (0, 0), "edge": (0, 1), "center": (1, 1)}
 # ── [5] per-tile budget at design var W (optical WG/pair) ───────────────────────
 def tile_budget(E, O, W, d):
     bw_wg = d["bw_wg"]
-    opt_bump  = O * BUMP_PER_WG * W                  # 32W per optical link
-    # electrical link matched to the optical link's BIDIR bw (W*bw_wg):
-    elec_bump = E * (W * bw_wg) / d["bw_per_elec_bump"]   # ~9.14W per elec link
+    opt_bump  = O * BUMP_PER_WG * W                  # 32W per optical link (both directions; W=TX+RX)
+    # Electrical RDL is FIXED at ELEC_RDL_BW (1800 GB/s unidir, inherited), NOT matched
+    # to optical. Bumps (both directions) = 2 * 1800 / 14 ~= 257 per elec link, W-INDEPENDENT.
+    elec_bump_per_link = 2.0 * ELEC_RDL_BW / d["bw_per_elec_bump"]
+    elec_bump = E * elec_bump_per_link
+    # per-direction aggregate egress: electrical links @ 1800, optical @ (W/2)*128.
+    agg_dir = E * ELEC_RDL_BW + O * (W / 2.0) * bw_wg
     return {
         "E": E, "O": O,
         "opt_bump": opt_bump, "elec_bump": elec_bump, "bump": opt_bump + elec_bump,
         "mrr": O * W * BUMP_PER_WG,                  # 1 MRR per optical bump
-        "opt_wg": O * W, "elec_wg_equiv": E * W,
-        "bw_agg": DEGREE * W * bw_wg,                # bidir aggregate across 6 links (768W)
+        "opt_wg": O * W, "elec_link_bw": ELEC_RDL_BW,
+        "opt_link_bw_dir": (W / 2.0) * bw_wg,        # optical per-direction (W=8 -> 512)
+        "bw_agg_dir": agg_dir,                       # per-direction egress (electrical fatter)
+        "bw_agg": 2.0 * agg_dir,                     # bidirectional aggregate
     }
 
 
@@ -176,19 +184,23 @@ def main():
     Ec, Oc = node_eo(*POSITIONS["corner"])
     rows = []
     bs = [tile_budget(Ec, Oc, W, d) for W in args.w_compare]
-    rows.append(("link BW bidir (GB/s)", [W * d["bw_wg"] for W in args.w_compare], "{:.0f}"))
-    rows.append(("optical bump/link",    [W * BUMP_PER_WG for W in args.w_compare], "{:.0f}"))
-    rows.append(("corner total bump",    [b["bump"] for b in bs], "{:.0f}"))
-    rows.append(("corner util %",        [100 * b["bump"] / d["n_bump"] for b in bs], "{:.0f}%"))
-    rows.append(("corner MRR",           [b["mrr"] for b in bs], "{:.0f}"))
-    rows.append(("aggregate/GPU (TB/s)", [b["bw_agg"] / 1000 for b in bs], "{:.2f}"))
-    rows.append(("vs NVLink 900*",       [b["bw_agg"] / NVLINK_H100 for b in bs], "{:.1f}x"))
-    rows.append(("therm-optic tune (W)", [thermal(b["mrr"])["thermo_optic_W"] for b in bs], "{:.2f}"))
-    rows.append(("III-V MOS tune (W)",   [thermal(b["mrr"])["iii_v_mos_W"] * 1e9 for b in bs], "{:.1e} nW"))
+    rows.append(("optical link /dir (GB/s)", [b["opt_link_bw_dir"] for b in bs], "{:.0f}"))
+    rows.append(("electrical link (GB/s)",   [b["elec_link_bw"] for b in bs], "{:.0f}"))
+    rows.append(("optical bump/link",        [W * BUMP_PER_WG for W in args.w_compare], "{:.0f}"))
+    rows.append(("elec bump/link (fixed)",   [b["elec_bump"] / max(b["E"], 1) for b in bs], "{:.0f}"))
+    rows.append(("corner total bump",        [b["bump"] for b in bs], "{:.0f}"))
+    rows.append(("corner util %",            [100 * b["bump"] / d["n_bump"] for b in bs], "{:.0f}%"))
+    rows.append(("corner MRR",               [b["mrr"] for b in bs], "{:.0f}"))
+    rows.append(("corner agg /dir (TB/s)",   [b["bw_agg_dir"] / 1000 for b in bs], "{:.2f}"))
+    rows.append(("corner vs NVLink 900*",    [b["bw_agg_dir"] / NVLINK_H100 for b in bs], "{:.1f}x"))
+    rows.append(("therm-optic tune (W)",     [thermal(b["mrr"])["thermo_optic_W"] for b in bs], "{:.2f}"))
+    rows.append(("III-V MOS tune (W)",       [thermal(b["mrr"])["iii_v_mos_W"] * 1e9 for b in bs], "{:.1e} nW"))
     for label, vals, fmt in rows:
         print(f"  {label:22}" + "".join(f"{fmt.format(v):>12}" for v in vals))
-    print("  * aggregate is BIDIRECTIONAL across 6 links vs NVLink's 900 GB/s; like-for-like")
-    print("    (per-direction egress vs NVLink unidir) is half this (see wg_budget.py 4.3x at WG-ceiling).")
+    print("  * per-DIRECTION egress (E x 1800 elec + O x opt/dir) vs NVLink 900 unidir (like-for-like).")
+    print("    Electrical RDL is now FIXED at 1800 GB/s (> optical for W<14), so links are UNBALANCED;")
+    print("    the MoE all-to-all is bottlenecked by the slower OPTICAL links, and aggregate is")
+    print("    position-dependent (electrical-heavy center has MORE egress than corner).")
 
     # (d) feasibility verdict
     print(f"\n(d) feasibility gates @ W={args.w_compare[-1]} (worst case = corner):")
