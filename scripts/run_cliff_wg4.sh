@@ -30,17 +30,24 @@ ISL=256
 OSL=24
 TIMEOUT=10800
 
+# AGG=1 -> fairness mode: glass within-panel link = aggregate egress (per-link x
+# degree), comparable to NVL72's aggregate-900. Corrects the congestion-unaware
+# per-pair under-crediting of glass's many-link bandwidth. Outputs to *_wg4_aggbw.csv
+# so it does not overwrite the per-link (conservative) CSVs.
+AGGFLAG="${AGG:+--agg-bw}"
+SUF="wg4${AGG:+_aggbw}"
+
 run_model () {
   local model="$1" tag="$2"
-  echo "=== reach cliff @ wg=4 (feasible cap): $model ==="
+  echo "=== reach cliff @ wg=4 ($SUF): $model ==="
   MOE_ALLTOALL=1 python scripts/sweep_panel_dse.py --sweep epscale \
     --ep-list $EP_LIST --nvl72-rack $RACK --epscale-panel $PANEL --fixed-wg $WG \
-    --batch-per-instance $BATCH --isl $ISL --osl $OSL --mode controlled \
+    --batch-per-instance $BATCH --isl $ISL --osl $OSL --mode controlled $AGGFLAG \
     --model "$model" --hardware H100 --tp 1 --npu-mem-gb 1024 \
-    --out "outputs/panel_dse/reach_${tag}_wg4.csv" --timeout $TIMEOUT
-  python scripts/check_reach.py --csv "outputs/panel_dse/reach_${tag}_wg4.csv" --rack $RACK
-  python scripts/plot_reach.py --csv "outputs/panel_dse/reach_${tag}_wg4.csv" --rack $RACK \
-    --name "f3_reach_${tag}_wg4"
+    --out "outputs/panel_dse/reach_${tag}_${SUF}.csv" --timeout $TIMEOUT
+  python scripts/check_reach.py --csv "outputs/panel_dse/reach_${tag}_${SUF}.csv" --rack $RACK
+  python scripts/plot_reach.py --csv "outputs/panel_dse/reach_${tag}_${SUF}.csv" --rack $RACK \
+    --name "f3_reach_${tag}_${SUF}"
 }
 
 run_model "Qwen/Qwen3-235B-A22B"          qwen235b
