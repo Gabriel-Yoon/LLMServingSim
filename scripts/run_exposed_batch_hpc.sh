@@ -40,6 +40,27 @@ run () {  # model tag ep phase isl osl
     --out "$out"
 }
 
+# PREFILL: the per-step work is set by the prefill CHUNK (= --max-tokens), NOT by the
+# per-device batch. parse_steady_decode picks the MODE iteration; with osl=4 that mode
+# is the prefill chunk, so a BATCH sweep returns identical numbers (the chunk is
+# batch-invariant). To characterise prefill we sweep MAX_TOKENS (the chunk/message
+# size) at a fixed small batch instead. osl=2 keeps the mode firmly on the prefill
+# chunk; isl >= max_tokens so each chunk is full.
+MT_LIST="512 1024 2048 4096 8192"
+run_prefill () {  # model tag ep
+  local model="$1" tag="$2" ep="$3"
+  local out="outputs/panel_dse/expB_${tag}_prefill_ep${ep}.csv"
+  if [ -s "$out" ] && [ "$(wc -l < "$out")" -gt 1 ]; then echo "SKIP $out"; return; fi
+  echo "=== prefill chunk sweep (max-tokens): $tag EP=$ep ==="
+  for mt in $MT_LIST; do
+    MOE_ALLTOALL=1 python scripts/sweep_panel_dse.py --sweep batch \
+      --batch-ep "$ep" --batch-list 8 --epscale-panel $PANEL --fixed-wg $WG \
+      --nvl72-rack $RACK --nvl72-bw $NVLBW --agg-bw --isl "$mt" --osl 2 --max-tokens "$mt" \
+      --model "$model" --hardware H100 --tp 1 --npu-mem-gb $MEM --timeout $TIMEOUT \
+      --out "outputs/panel_dse/expB_${tag}_prefill_ep${ep}_mt${mt}.csv"
+  done
+}
+
 for m in "deepseek-ai/DeepSeek-V3-0324:deepseek_v3" "Qwen/Qwen3-235B-A22B:qwen235b"; do
   model="${m%%:*}"; tag="${m#*:}"
   # EP=8 (in-domain control: 1 glass panel, 1 H100 island, no IB). EP=128 (cliff,
@@ -47,7 +68,7 @@ for m in "deepseek-ai/DeepSeek-V3-0324:deepseek_v3" "Qwen/Qwen3-235B-A22B:qwen23
   # NOTE: EP=128 x B=8192 is heavy; if it OOMs, drop 8192 (and 4096) for EP=128.
   run "$model" "$tag" 8   decode  256  24
   run "$model" "$tag" 128 decode  256  24
-  run "$model" "$tag" 128 prefill 2048 4
+  run_prefill "$model" "$tag" 128
 done
 
 echo "=== done. Analyse: python scripts/exposed_verdict.py outputs/panel_dse/expB_*.csv ==="
