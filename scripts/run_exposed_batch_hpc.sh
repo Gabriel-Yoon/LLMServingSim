@@ -20,7 +20,11 @@ cd "$(dirname "$0")/.."
 WG=8; PANEL="4 4"; RACK=8; NVLBW=450
 BATCH_LIST="256 1024 2048 4096 8192"
 MAXTOK=16384      # >= max batch so a DECODE step isn't capped by the token budget
-MEM=1024
+# --npu-mem-gb only gates the weight-fit/KV check, NOT network timing, so a large
+# value lets the high-batch points complete (DeepSeek KV is modelled as standard MHA
+# ~4 MB/tok -> b>=1024 x isl256 exceeds 1 TB and crashes). The exposed%/comm we measure
+# is unchanged; the verdict notes which batches are memory-realistic (~b256 @1 TB GPU).
+MEM=32768
 TIMEOUT=14400
 
 run () {  # model tag ep phase isl osl
