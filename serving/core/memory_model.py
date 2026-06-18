@@ -151,7 +151,7 @@ class MemoryModel():
         # 2*kv_dim sharded by TP like standard MHA/GQA. Modelling MLA as MHA
         # over-counts KV ~50x (e.g. DeepSeek-V3: 2*16384 vs 512+64).
         lora = self.config.get('kv_lora_rank')
-        if lora:
+        if lora and os.environ.get('MLA_KV_OFF') != '1':   # MLA_KV_OFF=1: diagnostic, old MHA behaviour
             per_tok_layer = lora + self.config.get('qk_rope_head_dim', 0)
             return per_tok_layer * seq * self.n_layer * self.kv_fp
         # standard MHA/GQA: K & V (x2), kv_dim sharded across TP (num_npus)
