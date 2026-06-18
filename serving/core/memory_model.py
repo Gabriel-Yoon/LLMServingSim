@@ -754,8 +754,30 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     # ----------------- QKV Projection (fused) -----------------
     elif layer_name == "qkv_proj":
         input_size = length * n_embd * fp
-        weight_size = n_embd * ((q_dim + 2 * kv_dim) // p) * fp
-        output_size = length * ((q_dim + 2 * kv_dim) // p) * fp
+        kv_lora = config.get("kv_lora_rank")
+        if kv_lora:
+            # MLA (DeepSeek-V3 / Kimi-K2): low-rank compressed Q/KV projections, NOT a
+            # fused hidden->(q_dim+2*kv_dim). down-projs (q_a, kv_a) are replicated across
+            # TP; up-projs (q_b, kv_b) are column-parallel (split heads by p).
+            q_lora = config.get("q_lora_rank")
+            qk_rope = config.get("qk_rope_head_dim", 0)
+            qk_nope = config.get("qk_nope_head_dim", head_dim)
+            v_hd = config.get("v_head_dim", head_dim)
+            qk_hd = qk_nope + qk_rope                      # per-head Q/K dim
+            q_up_out = (n_head * qk_hd) // p
+            kv_up_out = (n_head * (qk_nope + v_hd)) // p
+            if q_lora:                                     # q compressed (DeepSeek/Kimi)
+                q_w = n_embd * q_lora + q_lora * q_up_out
+            else:                                          # smaller MLA: direct q proj
+                q_w = n_embd * q_up_out
+            kv_a = n_embd * (kv_lora + qk_rope)            # kv_a_proj_with_mqa (replicated)
+            kv_b = kv_lora * kv_up_out                     # kv_b_proj (column-parallel)
+            weight_size = (q_w + kv_a + kv_b) * fp
+            output_size = length * (q_up_out + kv_up_out) * fp
+        else:
+            # standard MHA / GQA (Qwen, Mixtral, Llama, ...): fused Q + K + V
+            weight_size = n_embd * ((q_dim + 2 * kv_dim) // p) * fp
+            output_size = length * ((q_dim + 2 * kv_dim) // p) * fp
 
     elif layer_name == "o_proj":
         input_size = length * (q_dim // p) * fp
