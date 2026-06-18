@@ -453,37 +453,51 @@ def parse_exposed_log(text):
 _ITER_RE = re.compile(r"NPU\[(\d+)\] iteration (\d+) finished, (\d+) cycles")
 
 
-def _bin_ms(dt):
-    """Total-delta cycles -> step time binned to 0.1 ms (1 cycle ~= 1 ns)."""
-    return round(dt / 1e5) / 10.0
-
-
-def _mode_step(sub):
-    """(step_ms, exposed_frac) for the modal 0.1 ms bin of an iteration subset."""
+def _phase_stat(sub):
+    """(step_ms, exposed_frac) for one phase cluster, robust to within-cluster
+    spread: step = MEDIAN (not mode -- mode flips across fabrics when decode steps
+    spread from kv growth or dp-sync stalls); exposed is aggregated over the CORE
+    iterations within [0.5, 1.5]x the median, dropping stall bubbles / ramp partials
+    that are in the cluster but not typical steps."""
     if not sub:
         return None, None
-    b = collections.Counter(_bin_ms(dt) for dt, _ in sub)
-    mode_ms = float(b.most_common(1)[0][0])
-    sel = [(dt, de) for dt, de in sub if _bin_ms(dt) == mode_ms]
-    s_dt = sum(dt for dt, _ in sel)
-    s_de = sum(max(0, de) for _, de in sel)
-    return mode_ms, (s_de / s_dt if s_dt > 0 else None)
+    dts = sorted(dt for dt, _ in sub)
+    med = dts[len(dts) // 2]
+    if med <= 0:
+        return None, None
+    lo, hi = 0.5 * med, 1.5 * med
+    core = [(dt, de) for dt, de in sub if lo <= dt <= hi] or sub
+    s_dt = sum(dt for dt, _ in core)
+    s_de = sum(max(0, de) for _, de in core)
+    return med / 1e6, (s_de / s_dt if s_dt > 0 else None)
+
+
+def _phase_split(pairs):
+    """(decode_ms, decode_ef, prefill_ms, prefill_ef) from per-iteration
+    (total_delta_cyc, exposed_delta_cyc). A mixed run is bimodal: small deltas =
+    decode steps (batch tokens), large = prefill chunks (max_tokens). Split by a
+    MIN-ANCHORED band -- decode = within 3x of the p10 step (frequency-independent,
+    robust when prefill outnumbers decode), prefill = the rest -- then take a robust
+    MEDIAN + core-band exposed per cluster (see _phase_stat). Pure decode -> prefill
+    cluster empty -> prefill_*=None."""
+    if not pairs:
+        return None, None, None, None
+    DECODE_BAND = 3.0
+    dts = sorted(dt for dt, _ in pairs)
+    anchor = dts[len(dts) // 10]                      # ~p10 step cycles (robust small)
+    split = anchor * DECODE_BAND
+    decode_sub = [(dt, de) for dt, de in pairs if dt <= split]
+    prefill_sub = [(dt, de) for dt, de in pairs if dt > split]
+    d_ms, d_ef = _phase_stat(decode_sub)
+    p_ms, p_ef = _phase_stat(prefill_sub)
+    return d_ms, d_ef, p_ms, p_ef
 
 
 def parse_steady_decode(text):
     """PHASE-AWARE step extraction from ASTRA's per-iteration controller log.
-    Returns (decode_ms, decode_ef, prefill_ms, prefill_ef).
-
-    Per NPU the 'C cycles' / 'exposed E cycles' are cumulative, so per-iteration
-    total_delta = C[i]-C[i-1], exposed_delta = E[i]-E[i-1]. A mixed run is BIMODAL:
-    small deltas = decode steps (batch tokens), large deltas = prefill chunks
-    (max_tokens). The old mode+median-guard heuristic assumed decode dominates by
-    COUNT and flipped phase across fabrics when prefill iterations outnumbered decode
-    (e.g. prefill runs with small osl). Instead we split the two clusters by the
-    largest multiplicative GAP in the binned step times (frequency-independent):
-    decode = the small cluster, prefill = the large cluster. Each phase's step time
-    is the mode of its cluster; exposed is averaged over that cluster's modal bin.
-    A run with no clear gap (pure decode) returns prefill_*=None."""
+    Returns (decode_ms, decode_ef, prefill_ms, prefill_ef). Per NPU the 'C cycles'
+    / 'exposed E cycles' are cumulative -> per-iteration deltas; the phase split +
+    robust per-cluster stats are in _phase_split (unit-testable)."""
     by_npu = {}
     for m in _EXPOSED_RE.finditer(text or ""):
         npu, it, cyc, exc = int(m[1]), int(m[2]), int(m[3]), int(m[4])
@@ -496,22 +510,7 @@ def parse_steady_decode(text):
             de = iters[b][1] - iters[a][1]
             if dt > 0:
                 pairs.append((dt, de))
-    if not pairs:
-        return None, None, None, None
-    # MIN-ANCHORED split (frequency-independent, robust when prefill iterations
-    # outnumber decode and when prefill chunks spread across bins): the decode step
-    # is the SMALL repeated value, so anchor on a robust small percentile (p5) and
-    # call everything within DECODE_BAND x of it a decode step; the rest is prefill.
-    # Median/mode/gap heuristics flip phase across fabrics on prefill-heavy runs.
-    DECODE_BAND = 3.0
-    dts = sorted(dt for dt, _ in pairs)
-    anchor = dts[len(dts) // 20]                     # ~5th percentile of step cycles
-    split = anchor * DECODE_BAND
-    decode_sub = [(dt, de) for dt, de in pairs if dt <= split]
-    prefill_sub = [(dt, de) for dt, de in pairs if dt > split]
-    d_ms, d_ef = _mode_step(decode_sub)
-    p_ms, p_ef = _mode_step(prefill_sub)
-    return d_ms, d_ef, p_ms, p_ef
+    return _phase_split(pairs)
 
 
 def parse_steady_decode_cycle(text):
