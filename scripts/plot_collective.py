@@ -38,9 +38,13 @@ STYLE = {
 }
 METRICS = {
     "a2a":     ("all_to_all_us",  "collective all-to-all latency (us)", True),   # log-y
-    "exposed": ("exposed_frac",   "exposed communication (%)",          False),
+    "exposed": ("exposed_frac",   "decode exposed communication (%)",   False),
     "tpot":    ("tpot_gt_ms",     "decode TPOT (ms)",                    False),
+    # PREFILL phase (phase-aware parser) — diameter is most exposed in prefill
+    "prefill_exposed": ("prefill_exposed_frac", "prefill exposed communication (%)", False),
+    "prefill_tpot":    ("prefill_step_ms",       "prefill step time (ms)",            False),
 }
+_PCT = {"exposed", "prefill_exposed"}   # metrics reported as a percentage
 
 
 def load(paths, ycol):
@@ -58,7 +62,7 @@ def load(paths, ycol):
                     ep = int(r["ep"]); y = float(r.get(ycol) or 0)
                 except (ValueError, TypeError):
                     continue
-                if y <= 0 and ycol != "exposed_frac":
+                if y <= 0 and ycol not in ("exposed_frac", "prefill_exposed_frac"):
                     continue
                 data[fab][ep].append(y)
     return data
@@ -72,7 +76,7 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     ycol, ylabel, logy = METRICS[args.metric]
-    scale = 100.0 if args.metric == "exposed" else 1.0
+    scale = 100.0 if args.metric in _PCT else 1.0
 
     data = load(args.csvs, ycol)
     if not data:
@@ -95,7 +99,7 @@ def main():
 
     # annotate FB vs NVL72 gap at the largest shared EP
     shared = sorted(set(fb_curve) & set(nvl_curve))
-    if shared and args.metric != "exposed":
+    if shared and args.metric not in _PCT:
         e = shared[-1]; r = nvl_curve[e] / fb_curve[e] if fb_curve[e] else 0
         if r > 1:
             ax.annotate(f"{r:.0f}x  (NVL72 / FB)", xy=(e, nvl_curve[e]),
@@ -109,7 +113,7 @@ def main():
         ax.set_yscale("log")
     ax.set_xlabel("GPUs (EP)"); ax.set_ylabel(ylabel)
     default_title = ("Topology Pareto — exposed communication vs scale\n"
-                     "(FB near fully-connected; Ring pays its diameter)" if args.metric == "exposed"
+                     "(FB near fully-connected; Ring pays its diameter)" if args.metric in _PCT
                      else "Collective all-to-all latency vs scale — glass-FB vs NVL72\n"
                           "(optical vs IB: the inter-domain bandwidth gap)")
     ax.set_title(args.title or default_title)
@@ -125,7 +129,7 @@ def main():
     for fab in sorted(data, key=lambda f: STYLE[f][3]):
         eps = sorted(data[fab])
         print(f"  {STYLE[fab][0]:<22}", " ".join(f"EP{e}={sum(data[fab][e])/len(data[fab][e])*scale:.1f}" for e in eps))
-    if shared and args.metric != "exposed":
+    if shared and args.metric not in _PCT:
         e = shared[-1]
         print(f"  FB vs NVL72 @EP{e}: {nvl_curve[e]/fb_curve[e]:.1f}x")
 
