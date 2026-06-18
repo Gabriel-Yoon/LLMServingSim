@@ -144,11 +144,17 @@ class MemoryModel():
         return block_weight
 
     def get_kv(self, seq):
-        # shape of kv cache
-        # (kv_head, batch_size, n_embd//n_head, seq_len) per layer
-        # return batch_size = 1 to caclulate max batch_size in scheduler
-
-        # K & V multiply 2
+        # KV cache bytes for `seq` tokens across all layers, this NPU's share.
+        # MLA (DeepSeek-V3 / Kimi-K2): the cache holds the compressed latent
+        # (kv_lora_rank) + the decoupled RoPE key (qk_rope_head_dim) per token per
+        # layer, shared across ALL heads and REPLICATED across TP ranks -- NOT
+        # 2*kv_dim sharded by TP like standard MHA/GQA. Modelling MLA as MHA
+        # over-counts KV ~50x (e.g. DeepSeek-V3: 2*16384 vs 512+64).
+        lora = self.config.get('kv_lora_rank')
+        if lora:
+            per_tok_layer = lora + self.config.get('qk_rope_head_dim', 0)
+            return per_tok_layer * seq * self.n_layer * self.kv_fp
+        # standard MHA/GQA: K & V (x2), kv_dim sharded across TP (num_npus)
         return 2 * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
     
     # get the total size of current kv cache for the request
@@ -664,7 +670,12 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     kv_dim = kv_head * head_dim
     n_layer = config['num_hidden_layers']
     kv_fp = 1 if kv_cache_dtype == 'fp8' else fp // 8
-    # 2 (K + V) * kv_dim * n_layer * bytes_per_elem
+    # MLA (DeepSeek-V3 / Kimi-K2): compressed latent (kv_lora_rank) + RoPE key
+    # (qk_rope_head_dim) per token per layer, shared across heads -- not 2*kv_dim.
+    lora = config.get('kv_lora_rank')
+    if lora:
+        return (lora + config.get('qk_rope_head_dim', 0)) * n_layer * kv_fp
+    # standard MHA/GQA: 2 (K + V) * kv_dim * n_layer * bytes_per_elem
     return 2 * kv_dim * n_layer * kv_fp
 
 
