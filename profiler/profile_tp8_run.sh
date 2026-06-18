@@ -35,23 +35,10 @@ SKEW_KVS_FACTOR="${SKEW_KVS_FACTOR:-2.0}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# RUN BARE-METAL, NOT INSIDE APPTAINER. DeepSeek MLA (and others) trigger FlashInfer's
-# runtime JIT, which needs the host CUDA toolkit's nvcc (Spack module). Inside Apptainer
-# that nvcc path is invisible -> "nvcc: not found" -> EngineCore fails to start. The
-# working per-model scripts load the cuda module first; do the same here.
-CUDA_MODULE="${CUDA_MODULE:-cuda/12.6.1}"
-UV_MODULE="${UV_MODULE:-uv/0.9.17}"
-if command -v module >/dev/null 2>&1; then
-    module load "$CUDA_MODULE" 2>/dev/null || echo "[warn] could not 'module load $CUDA_MODULE'" >&2
-    module load "$UV_MODULE"   2>/dev/null || true
-fi
-if ! command -v nvcc >/dev/null 2>&1; then
-    echo "ERROR: nvcc not on PATH. FlashInfer JIT (e.g. DeepSeek MLA rope) will fail." >&2
-    echo "  Run BARE-METAL (not Apptainer) and 'module load $CUDA_MODULE' first." >&2
-    exit 1
-fi
-
-# Auto-activate the bare-metal vLLM venv if vLLM isn't importable (HPC node).
+# Env handling mirrors profile_h200_new.sh (which runs fine in the Apptainer shell):
+# auto-activate the vLLM venv only if vLLM isn't already importable. NOTE: nvcc/CUDA
+# come from however the shell was set up (the Apptainer image / a previously loaded
+# module) -- this script does NOT gate on nvcc, exactly like profile_h200_new.sh.
 if ! python3 -c "import vllm" >/dev/null 2>&1; then
     ENV_SH="$REPO_ROOT/scripts/env.sh"
     if [[ -f "$ENV_SH" ]]; then
@@ -72,7 +59,8 @@ echo "========================================"
 echo "  TP=8 profile  |  $MODEL  @  $HARDWARE"
 echo "  TP sweep : $TP_DEGREES  (resume: only missing tp fired)"
 echo "  MNBT/MSQ : $MAX_NUM_BATCHED_TOKENS / $MAX_NUM_SEQS    maxKV: $ATTENTION_MAX_KV"
-echo "  Phase    : ${SKIP_SKEW:+SKIP_SKEW (main only)}${ONLY_SKEW:+ONLY_SKEW (skew only)}${SKIP_SKEW:-${ONLY_SKEW:-full (main+skew)}}"
+if [[ -n "${SKIP_SKEW:-}" ]]; then _phase="SKIP_SKEW (main only)"; elif [[ -n "${ONLY_SKEW:-}" ]]; then _phase="ONLY_SKEW (skew only)"; else _phase="full (main+skew)"; fi
+echo "  Phase    : $_phase"
 echo "========================================"
 ls "profiler/perf/$HARDWARE/$MODEL"/*/ -d 2>/dev/null | while read -r v; do
     echo "  existing: $(basename "$(dirname "$v")")/$(basename "$v") -> $(ls "$v" | grep '^tp' | tr '\n' ' ')"
