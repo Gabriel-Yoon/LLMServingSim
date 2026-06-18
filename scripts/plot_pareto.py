@@ -80,8 +80,11 @@ def main():
             ax.annotate(f"b{b}", (x, y), textcoords="offset points", xytext=(4, 4), fontsize=7)
     ax.set_xlabel("generation speed  (tokens/s/user = 1000/TPOT)")
     ax.set_ylabel("system throughput  (tokens/s/GPU)")
-    ax.set_title(args.title or ("Throughput vs interactivity Pareto\n"
-                                f"(AIConfigurator axes; TTFT<={args.ttft_budget:.0f} ms, OSL={args.osl})"))
+    if args.decode_only:
+        _sub = f"AIConfigurator axes; decode-steady throughput (TTFT excluded), OSL={args.osl}"
+    else:
+        _sub = f"AIConfigurator axes; TTFT<={args.ttft_budget:.0f} ms, OSL={args.osl}"
+    ax.set_title(args.title or f"Throughput vs interactivity Pareto\n({_sub})")
     ax.grid(True, alpha=0.3); ax.legend()
     fig.tight_layout()
     out = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "outputs",
