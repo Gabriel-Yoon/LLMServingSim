@@ -192,6 +192,14 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
                 f"{type(val).__name__}"
             )
         if val % tp != 0:
+            # GQA replication: when tp > num_key_value_heads, vLLM does not
+            # shard KV heads -- it replicates them (1 KV head per rank, shared
+            # across tp/num_kv_heads ranks). Emulate that per-rank shape so
+            # models with few KV heads (e.g. Qwen3-235B has 4) can profile at
+            # high TP. Only valid when tp is a multiple of num_kv_heads.
+            if field_name == "num_key_value_heads" and val < tp and tp % val == 0:
+                sharded_overrides[field_name] = 1
+                continue
             raise ValueError(
                 f"model config field {field_name!r}={val} is not "
                 f"divisible by tp={tp}; cannot TP-shard for profiling"
