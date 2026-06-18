@@ -22,8 +22,11 @@ import argparse, csv, glob, os
 from collections import defaultdict
 
 
-def load(paths, xkey):
-    # (fabric, xval) -> (tpot_ms, exposed_frac)
+def load(paths, xkey, phase):
+    # phase-aware columns: decode -> (tpot_gt_ms, exposed_frac);
+    #                      prefill -> (prefill_step_ms, prefill_exposed_frac)
+    tcol, ecol = (("prefill_step_ms", "prefill_exposed_frac") if phase == "prefill"
+                  else ("tpot_gt_ms", "exposed_frac"))
     rows = {}
     xs = set()
     for pat in paths:
@@ -34,8 +37,8 @@ def load(paths, xkey):
                 fab = "glass" if (r.get("fabric") or "").startswith(("glass", "fb")) or r.get("fabric") in (
                     "fb", "mesh", "torus", "ring", "dragonfly") else "nvl72"
                 try:
-                    xv = int(float(r[xkey])); tp = float(r.get("tpot_gt_ms") or 0)
-                    ef = float(r.get("exposed_frac") or 0)
+                    xv = int(float(r[xkey])); tp = float(r.get(tcol) or 0)
+                    ef = float(r.get(ecol) or 0)
                 except (ValueError, TypeError, KeyError):
                     continue
                 if tp <= 0:
@@ -48,12 +51,14 @@ def load(paths, xkey):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csvs", nargs="+")
-    ap.add_argument("--x", default="per_device_batch", help="x-axis column (ep / per_device_batch)")
+    ap.add_argument("--x", default="per_device_batch", help="x-axis column (ep / per_device_batch / max_tokens)")
+    ap.add_argument("--phase", choices=["decode", "prefill"], default="decode",
+                    help="decode uses tpot_gt_ms/exposed_frac; prefill uses prefill_step_ms/prefill_exposed_frac")
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    rows, xs = load(args.csvs, args.x)
+    rows, xs = load(args.csvs, args.x, args.phase)
     if not xs:
         raise SystemExit(f"no ok rows with column {args.x!r} in {args.csvs}")
     fabrics = [f for f in ("glass", "nvl72") if any((f, x) in rows for x in xs)]
@@ -75,12 +80,12 @@ def main():
             if tot > 0:
                 ax.text(i + off, tot, fab, ha="center", va="bottom", fontsize=7, rotation=90)
     ax.set_xticks(xi); ax.set_xticklabels([str(x) for x in xs])
-    ax.set_xlabel(args.x); ax.set_ylabel("step time (ms)")
-    ax.set_title(args.title or f"Step-time breakdown (compute vs exposed communication) vs {args.x}")
+    ax.set_xlabel(args.x); ax.set_ylabel(f"{args.phase} step time (ms)")
+    ax.set_title(args.title or f"{args.phase.capitalize()} step-time breakdown (compute vs exposed communication) vs {args.x}")
     ax.legend(loc="upper left"); ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     out = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "outputs",
-                                   "paper_figures", f"fig_step_breakdown_{args.x}.png")
+                                   "paper_figures", f"fig_step_breakdown_{args.phase}_{args.x}.png")
     out = os.path.abspath(out); os.makedirs(os.path.dirname(out), exist_ok=True)
     fig.savefig(out, dpi=140); print(f"wrote {out}")
     print(f"  {'x':>8}{'fab':>7}{'compute':>9}{'comm':>8}{'comm%':>7}")
