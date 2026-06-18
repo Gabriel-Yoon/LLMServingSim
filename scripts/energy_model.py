@@ -35,18 +35,27 @@ MODELS = {
 }
 FP_BYTES = 2  # bf16
 
-# ---- link DYNAMIC energy (pJ/bit) — PLACEHOLDERS, cite & TUNE ----------------
-#   glass optical CPO: driver+mod+det+TIA+EIC ~ 1.15 pJ/bit (PanelScale Tbl1 / Ayar)
-#   NVLink5 electrical SerDes ~ 2 pJ/bit;  IB NDR NIC+optics ~ 5 pJ/bit
-E_DYN = {"glass_intra": 1.15, "glass_inter": 1.15, "nvlink": 2.0, "ib": 5.0}
+# ---- glass optical link DYNAMIC energy (pJ/bit) — SOURCED ---------------------
+#   TX (driver+mod, laser folded in): 1.66 pJ/bit  [QD MLL 8λ×100G, RG 378058284]
+#       aggressive 0.437, conservative 2.81 (AWGR NoC)
+#   RX (PD+TIA): 0.96 pJ/bit  [Raj ISSCC'23 / Li ESSCIRC'18]
+#   link = TX + RX. Laser's amortised pJ/bit (~0.04 @100G full util) is negligible in
+#   the dynamic term; the always-on laser is accounted as STATIC below (correct for
+#   the low-utilisation decode regime that ASTRA's energy hook misses).
+GLASS_EDYN = {"default": 1.66 + 0.96, "aggressive": 0.437 + 0.96, "conservative": 2.81 + 0.96}
+# NVLink electrical SerDes ~2 pJ/bit; IB NDR NIC+optics ~5 pJ/bit (placeholders, cite).
+E_DYN = {"glass_intra": GLASS_EDYN["default"], "glass_inter": GLASS_EDYN["default"],
+         "nvlink": 2.0, "ib": 5.0}
 
-# ---- per-GPU STATIC power (W) — PLACEHOLDERS, cite & TUNE --------------------
-#   glass: comb laser (wall-plug for the WDM lambdas) + microring tuning.
-#     P_laser ~ N_WG*32 lambda * per-lambda wall-plug; here a lumped ~15 W/GPU.
-#     P_tune: III-V MOS 352 fW/ring x ~1000 rings ~ negligible (thermo-optic would be ~W).
-#   NVL72: NVSwitch 540 W/rack / 64 = 8.4 W/GPU  + NVLink SerDes static ~ a few W.
-#   IB: NDR switch+NIC static share ~ a few W/GPU (only when EP crosses racks).
-P_STATIC_GLASS = 15.0    # laser + tuning, always-on
+# ---- glass per-GPU STATIC power (W) — SOURCED, computed from WG count ----------
+#   P_laser = N_lambda * 1 mW/lambda / WPE   [1 mW/λ DFB/QD comb; WPE 17–30%]
+#   P_tune  = N_rings  * per-ring            [thermo-optic 0.75 mW/π (Yang IEEE Access'25)
+#                                             | III-V MOS ~hundreds of fW (Akazawa) ~0]
+#   N_lambda(TX) = wg_per_gpu * 32 (32 λ/WG); N_rings ≈ 2*N_lambda (TX MRM + RX filter).
+WG_LAMBDAS = 32
+LASER_MW_PER_LAMBDA = 1.0
+TUNE_W_PER_RING = {"thermo": 0.75e-3, "mos": 0.0}
+P_STATIC_GLASS = 1.0     # recomputed in main() from --wg-per-gpu/--wpe/--tune
 P_STATIC_NVLINK_SERDES = 3.0
 P_STATIC_IB = 4.0        # per-GPU IB share, only when cross-rack
 
@@ -115,11 +124,27 @@ def main():
     ap.add_argument("--baseline", choices=list(BASELINES), default="h100",
                     help="NVLink baseline: h100 (NVLink4, 8-GPU HGX island; consistent with the "
                          "H100 compute profile) or gb200 (NVL72, 64-GPU domain; forward-looking).")
+    ap.add_argument("--wg-per-gpu", type=int, default=4,
+                    help="per-direction WG/GPU driving the laser+ring static (4x4 feasible floor=4; "
+                         "headline 52x34 PIC ~30). N_lambda = wg*32.")
+    ap.add_argument("--wpe", type=float, default=0.25, help="laser wall-plug efficiency (0.17-0.30, QD comb)")
+    ap.add_argument("--tune", choices=list(TUNE_W_PER_RING), default="thermo",
+                    help="microring tuning: thermo (0.75 mW/ring) or mos (III-V ~0)")
+    ap.add_argument("--glass-edyn", choices=list(GLASS_EDYN), default="default",
+                    help="glass link dynamic energy variant (default 2.62 / aggressive 1.40 / conservative 3.77 pJ/bit)")
     args = ap.parse_args()
     cfg = MODELS[args.model]
-    global RACK, P_STATIC_NVSWITCH
+    global RACK, P_STATIC_NVSWITCH, P_STATIC_GLASS
     RACK = BASELINES[args.baseline]["rack"]
     P_STATIC_NVSWITCH = BASELINES[args.baseline]["p_nvswitch"]
+    E_DYN["glass_intra"] = E_DYN["glass_inter"] = GLASS_EDYN[args.glass_edyn]
+    n_lambda = args.wg_per_gpu * WG_LAMBDAS
+    p_laser = n_lambda * LASER_MW_PER_LAMBDA * 1e-3 / args.wpe          # W
+    p_tune = (2 * n_lambda) * TUNE_W_PER_RING[args.tune]               # W (TX MRM + RX filter)
+    P_STATIC_GLASS = p_laser + p_tune
+    print(f"[glass static] wg/gpu={args.wg_per_gpu} -> {n_lambda} λ; "
+          f"P_laser={p_laser:.2f} W (WPE {args.wpe}), P_tune={p_tune*1e3:.1f} mW ({args.tune}) "
+          f"-> P_static_glass={P_STATIC_GLASS:.2f} W; e_dyn_glass={E_DYN['glass_intra']:.2f} pJ/bit")
     tpot_map = load_tpot(args.reach_csv) if args.reach_csv else {}
 
     bname = args.baseline.upper()
@@ -146,10 +171,13 @@ def main():
             g = rows[(ep, "glass")][0]["total"]; n = rows[(ep, "nvl72")][0]["total"]
             ge = rows[(ep, "glass")][3]; ne = rows[(ep, "nvl72")][3]
             print(f"  {ep:>5}{g/n:>17.2f}x{ge/ne:>15.2f}x")
-    print("\n  NOTE: bytes are ANALYTICAL (model config + domain split); swap in sim-logged"
-          " per-link-class bytes for higher fidelity. Static power (laser+tuning vs NVSwitch)"
-          " is the main glass energy lever; EDP capitalises the latency parity.")
-    print("  All e_dyn / P_static are CITED PLACEHOLDERS — tune before the paper.")
+    print("\n  NOTE: this is INTERCONNECT-only energy. Glass passive optical (laser+tune,"
+          " no switch) vs NVSwitch dominates the static term -> the big ratio. At SYSTEM level"
+          " the GPU compute (~hundreds W) dwarfs interconnect, so total-energy savings are a few %"
+          " -- report the interconnect breakdown AND the system fraction.")
+    print("  Glass e_dyn (TX 1.66 + RX 0.96 pJ/bit) and static (laser 1mW/λ÷WPE, ring tuning) are"
+          " SOURCED; NVLink/IB e_dyn and NVSwitch static are still placeholders to cite. Bytes are"
+          " ANALYTICAL (model config + domain split) -- swap in sim-logged per-link-class bytes for fidelity.")
 
     # plot
     try:
