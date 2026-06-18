@@ -1010,6 +1010,20 @@ def _inter_only_dim(involved_dim):
     return scoped
 
 
+def _domain_size(inner_dim, topology_dims):
+    """Product of the within-domain (inner) topology dim sizes. This is S, the
+    number of EP ranks inside one fast domain (NVLink rack / glass panel); the
+    DeepEP all-to-all keeps (S-1)/(EP-1) of its traffic within the domain and
+    sends (EP-S)/(EP-1) across the slow inter-domain link. Fallback 1."""
+    if not topology_dims or not inner_dim:
+        return 1
+    s = 1
+    for i, on in enumerate(inner_dim):
+        if on and i < len(topology_dims):
+            s *= int(topology_dims[i])
+    return max(1, s)
+
+
 def _inner_only_dim(involved_dim):
     """Complement of _inter_only_dim: the within-domain dims (all involved dims
     EXCEPT the outermost). For a single involved dim, returns it unchanged."""
@@ -1128,33 +1142,47 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # cross-domain (inter) all-to-all, emitted as extra collective layers around
     # the expert block when EP spans >1 topology domain. Default: none.
     cross_dispatch_type = cross_combine_type = 'NONE'
-    cross_comm_size = 0
+    cross_dispatch_size = cross_combine_size = 0
 
     if _moe_a2a and ep_total > 1:
-        # DeepEP volume (each token -> k experts; ~constant in EP).
+        # DeepEP all-to-all: each token -> k experts (volume ~constant in EP). The
+        # routed volume is PARTITIONED by the domain structure: a fraction
+        # within_frac=(S-1)/(EP-1) stays on the fast intra-domain link and
+        # cross_frac=(EP-S)/(EP-1) crosses the slow inter-domain link. Modelling the
+        # whole dispatch as a full-volume AllGather (the old code) over-counted comm
+        # AND, because the intra link bw is ~symmetric (optical 512 vs NVLink 450),
+        # drowned the inter-domain (IB) cliff -> glass~=NVL72 even though the cross
+        # leg is 10x. Splitting the volume lets the slow inter leg dominate as EP
+        # grows (cross_frac -> 1), which is the real DeepEP behaviour.
         k_top = max(1, ctx.config.get('num_experts_per_tok', 1))
         a2a_tokens = bctx.total_len * k_top
-        dispatch_comm_size = a2a_tokens * dispatch_per_token
-        combine_comm_size = a2a_tokens * combine_per_token
-        # WITHIN-domain shuffle over the fast intra-domain link, modelled as the
-        # tractable O(N) AllGather/ReduceScatter (a true intra all-to-all over a
-        # 64-GPU rack is O(N^2) and hangs). For single-domain EP this is the whole
-        # collective; for multi-domain it is the inner dim(s) only.
         within_dim = _inner_only_dim(ctx.ep_dim) if _multi else ctx.ep_dim
+        if _multi:
+            S = _domain_size(within_dim, ctx.topology_dims)
+            cross_frac = (ep_total - S) / (ep_total - 1) if ep_total > 1 else 0.0
+            cross_frac = min(1.0, max(0.0, cross_frac))
+        else:
+            cross_frac = 0.0
+        within_frac = 1.0 - cross_frac
+        # WITHIN-domain leg: fast intra-domain link, modelled as the tractable O(N)
+        # AllGather/ReduceScatter (a true intra all-to-all over a big rack is O(N^2)
+        # and hangs). Carries only within_frac of the routed volume now. Sizes are
+        # byte counts -> keep them int (the trace re-parser splits on \S+).
+        dispatch_comm_size = int(a2a_tokens * dispatch_per_token * within_frac)
+        combine_comm_size = int(a2a_tokens * combine_per_token * within_frac)
         dispatch_comm_type = _with_dim('ALLGATHER', within_dim)
         combine_comm_type = _with_dim('REDUCESCATTER', within_dim)
         if _multi:
-            # CROSS-domain shuffle over the SLOW inter-domain link (IB / inter-panel
-            # optical) as an ALLTOALL scoped to the outermost dim. EP>rack must pay
-            # BOTH legs: the old inter-only-a2a dropped the within-domain leg, which
-            # made NVL72 cheaper at EP=128 (2 racks, 1 hop) than at EP=64 (full
-            # 64-way in-rack) and INVERTED the cliff. With both legs, EP=128 =
-            # within-rack (NVLink) + cross-rack (IB) > EP=64, and the slow IB makes
-            # NVL72 lose to glass optical at the cliff.
+            # CROSS-domain leg over the SLOW inter-domain link (IB / inter-panel
+            # optical), ALLTOALL scoped to the outermost dim, carrying cross_frac of
+            # the routed volume. As EP grows cross_frac -> 1, so the slow IB makes
+            # NVL72 lose to glass optical at the cliff (and the cliff is monotone:
+            # more domains -> larger cross leg, no inversion).
             cross_dim = _inter_only_dim(ctx.ep_dim)
             cross_dispatch_type = _with_dim('ALLTOALL', cross_dim)
             cross_combine_type = _with_dim('ALLTOALL', cross_dim)
-            cross_comm_size = a2a_tokens * dispatch_per_token
+            cross_dispatch_size = int(a2a_tokens * dispatch_per_token * cross_frac)
+            cross_combine_size = int(a2a_tokens * combine_per_token * cross_frac)
     elif ep_total > 1:
         # vLLM allgather_reducescatter backend (MOE_ALLTOALL off): gather all
         # tokens to all ranks, each rank computes its experts, reduce-scatter.
@@ -1184,9 +1212,9 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # block so EP>rack pays the cross-rack/inter-panel leg on top of the within-
     # domain AllGather above. comp_time=1ns: this is a collective-only node.
     if cross_dispatch_type != 'NONE':
-        lines.append(formatter("moe_cross_dispatch", "1", 'LOCAL', str(cross_comm_size),
-            'LOCAL', '0', 'LOCAL', str(cross_comm_size), cross_dispatch_type,
-            str(cross_comm_size), batch_tag))
+        lines.append(formatter("moe_cross_dispatch", "1", 'LOCAL', str(cross_dispatch_size),
+            'LOCAL', '0', 'LOCAL', str(cross_dispatch_size), cross_dispatch_type,
+            str(cross_dispatch_size), batch_tag))
 
     for i in range(emit_ep):
         if i == 0:
@@ -1221,15 +1249,15 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # Cross-domain combine (slow inter-domain link), the mirror of the cross
     # dispatch — emitted after the expert block.
     if cross_combine_type != 'NONE':
-        lines.append(formatter("moe_cross_combine", "1", 'LOCAL', str(cross_comm_size),
-            'LOCAL', '0', 'LOCAL', str(cross_comm_size), cross_combine_type,
-            str(cross_comm_size), batch_tag))
+        lines.append(formatter("moe_cross_combine", "1", 'LOCAL', str(cross_combine_size),
+            'LOCAL', '0', 'LOCAL', str(cross_combine_size), cross_combine_type,
+            str(cross_combine_size), batch_tag))
 
     # Post-expert ReduceScatter power (combine)
     if power_acc is not None and ep_total > 1:
         power_acc.link_data_bytes += total_ring_data(combine_comm_size, ep_total, collective="reducescatter")
-        if cross_comm_size > 0:
-            power_acc.link_data_bytes += total_ring_data(cross_comm_size, ep_total, collective="alltoall")
+        if cross_dispatch_size + cross_combine_size > 0:
+            power_acc.link_data_bytes += total_ring_data(cross_dispatch_size + cross_combine_size, ep_total, collective="alltoall")
 
 
 # ======================================================================
