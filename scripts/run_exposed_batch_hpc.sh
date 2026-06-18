@@ -15,7 +15,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-WG=8; PANEL="4 4"; RACK=64
+# H100-CONSISTENT baseline: NVLink4 450 GB/s unidir, 8-GPU HGX NVLink island (rack=8),
+# IB 50 cross-island. Matches the H100 compute profile (vs the GB200/NVL72 mismatch).
+WG=8; PANEL="4 4"; RACK=8; NVLBW=450
 BATCH_LIST="256 1024 2048 4096 8192"
 MAXTOK=16384      # >= max batch so a DECODE step isn't capped by the token budget
 MEM=1024
@@ -28,16 +30,17 @@ run () {  # model tag ep phase isl osl
   echo "=== exposed-vs-batch: $tag $phase EP=$ep (isl$isl/osl$osl) ==="
   MOE_ALLTOALL=1 python scripts/sweep_panel_dse.py --sweep batch \
     --batch-ep "$ep" --batch-list $BATCH_LIST --epscale-panel $PANEL --fixed-wg $WG \
-    --nvl72-rack $RACK --agg-bw --isl "$isl" --osl "$osl" --max-tokens $MAXTOK \
+    --nvl72-rack $RACK --nvl72-bw $NVLBW --agg-bw --isl "$isl" --osl "$osl" --max-tokens $MAXTOK \
     --model "$model" --hardware H100 --tp 1 --npu-mem-gb $MEM --timeout $TIMEOUT \
     --out "$out"
 }
 
 for m in "deepseek-ai/DeepSeek-V3-0324:deepseek_v3" "Qwen/Qwen3-235B-A22B:qwen235b"; do
   model="${m%%:*}"; tag="${m#*:}"
-  # EP=128 (cliff, NVL72=IB50) — the regime of interest. EP=64 (in-domain) control.
+  # EP=8 (in-domain control: 1 glass panel, 1 H100 island, no IB). EP=128 (cliff,
+  # NVL72 crosses IB since rack=8) — the regime of interest.
   # NOTE: EP=128 x B=8192 is heavy; if it OOMs, drop 8192 (and 4096) for EP=128.
-  run "$model" "$tag" 64  decode  256  24
+  run "$model" "$tag" 8   decode  256  24
   run "$model" "$tag" 128 decode  256  24
   run "$model" "$tag" 128 prefill 2048 4
 done

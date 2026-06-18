@@ -563,8 +563,16 @@ WG 수 상한은 micro-bump 예산과 FlattenedButterfly degree로 결정된다 
   run_cliff_wg4.sh 등은 WG=8로 갱신됨 (= 512, 이전 "wg4" 라벨과 같은 물리).
   ⚠️ 단일 N_WG를 모든 패널에 쓰지 말 것 — 격자마다 floor가 다르다.
 - intra latency 고정 = 100 ns
-- NVL72 baseline: **BW 900 GB/s unidirectional** (1800 bidir ÷2), **latency 500 ns**,
-  inter-rack IB 50 GB/s @EP>64
+- **Baseline 정합 (확정): compute가 H100 프로파일이므로 interconnect도 H100-정합.**
+  - **H100-consistent (primary): NVLink4 = 450 GB/s unidir** (900 bidir ÷2),
+    **NVLink 도메인 = 8 GPU (HGX island)**, IB 50 @EP>8, 500 ns hop.
+    sweep: `--nvl72-bw 450 --nvl72-rack 8`. energy_model: `--baseline h100`.
+    glass가 in-domain bw(optical 512 > 450)·도메인(panel 16 > island 8) 둘 다
+    정당하게 이긴다. cliff가 EP>8로 당겨져 작은 EP에서 fabric 차이가 드러남.
+  - **GB200 NVL72 (forward-looking sensitivity): NVLink5 = 900 GB/s unidir**
+    (1800 bidir ÷2), 도메인 64, IB 50 @EP>64. `--nvl72-bw 900 --nvl72-rack 64`,
+    `--baseline gb200`. ⚠️ compute는 여전히 H100 (근사) — limitation에 명시.
+  - 900은 bidir 원값이 아니라 unidir 환산값임 (둘 다 1800/900 bidir ÷2).
 
 ### Convention 주의 (uni/bi)
 - ASTRA BW 입력은 **unidirectional**. NVL72·글래스 모두 단방향으로 통일 적용.

@@ -47,12 +47,21 @@ E_DYN = {"glass_intra": 1.15, "glass_inter": 1.15, "nvlink": 2.0, "ib": 5.0}
 #   NVL72: NVSwitch 540 W/rack / 64 = 8.4 W/GPU  + NVLink SerDes static ~ a few W.
 #   IB: NDR switch+NIC static share ~ a few W/GPU (only when EP crosses racks).
 P_STATIC_GLASS = 15.0    # laser + tuning, always-on
-P_STATIC_NVSWITCH = 540.0 / 64.0   # 8.44 W/GPU
 P_STATIC_NVLINK_SERDES = 3.0
 P_STATIC_IB = 4.0        # per-GPU IB share, only when cross-rack
 
 PANEL = 16   # glass panel size (4x4)
-RACK = 64    # NVL72 NVLink domain
+
+# Baseline NVLink domain + NVSwitch static power per GPU. Default H100-CONSISTENT
+# (compute is profiled on H100): NVLink4, 8-GPU HGX island, 4 NVSwitch3/node. GB200
+# NVL72 (NVLink5, 64-GPU domain, 540 W/rack) is a forward-looking sensitivity --
+# use --baseline gb200 (but note the compute is still H100).
+BASELINES = {
+    "h100":  dict(rack=8,  p_nvswitch=4 * 25.0 / 8.0),   # 4 NVSwitch3 ~25 W /8 GPU = 12.5 W/GPU
+    "gb200": dict(rack=64, p_nvswitch=540.0 / 64.0),     # NVL72 540 W/rack /64 = 8.44 W/GPU
+}
+RACK = 8                       # set from --baseline in main()
+P_STATIC_NVSWITCH = 12.5       # set from --baseline in main()
 
 
 def per_token_bytes(cfg):
@@ -103,12 +112,20 @@ def main():
     ap.add_argument("--model", default="deepseek_v3", choices=list(MODELS))
     ap.add_argument("--tpot-ms", type=float, default=40.0, help="per-token time for static energy (if no --reach-csv)")
     ap.add_argument("--reach-csv", default=None, help="reach CSV to read per-EP TPOT (overrides --tpot-ms)")
+    ap.add_argument("--baseline", choices=list(BASELINES), default="h100",
+                    help="NVLink baseline: h100 (NVLink4, 8-GPU HGX island; consistent with the "
+                         "H100 compute profile) or gb200 (NVL72, 64-GPU domain; forward-looking).")
     args = ap.parse_args()
     cfg = MODELS[args.model]
+    global RACK, P_STATIC_NVSWITCH
+    RACK = BASELINES[args.baseline]["rack"]
+    P_STATIC_NVSWITCH = BASELINES[args.baseline]["p_nvswitch"]
     tpot_map = load_tpot(args.reach_csv) if args.reach_csv else {}
 
-    print(f"=== energy model — {args.model} (hidden {cfg['hidden']}, {cfg['experts']} exp, {cfg['layers']} layers) ===")
-    print(f"e_dyn pJ/bit: {E_DYN}  | P_static/GPU: glass {P_STATIC_GLASS}W, NVL72 "
+    bname = args.baseline.upper()
+    print(f"=== energy model — {args.model} (hidden {cfg['hidden']}, {cfg['experts']} exp, {cfg['layers']} layers) "
+          f"vs {bname} (NVLink domain {RACK}) ===")
+    print(f"e_dyn pJ/bit: {E_DYN}  | P_static/GPU: glass {P_STATIC_GLASS}W, {bname} "
           f"{P_STATIC_NVSWITCH+P_STATIC_NVLINK_SERDES:.1f}W(+IB {P_STATIC_IB} cross)")
     print(f"  {'EP':>5}{'fab':>7}{'cross%':>8}{'E_dyn(mJ)':>11}{'E_stat(mJ)':>11}{'E/tok(mJ)':>11}"
           f"{'pJ/bit':>9}{'EDP':>10}")
@@ -144,11 +161,11 @@ def main():
         n = [rows[(e, "nvl72")][0]["total"]*1e3 for e in eps]
         fig, ax = plt.subplots(figsize=(7, 4.5))
         ax.plot(eps, g, "o-", color="tab:green", label="glass-FB")
-        ax.plot(eps, n, "s-", color="tab:red", label="NVL72")
-        ax.axvline(RACK, ls="--", color="gray", alpha=0.6); ax.text(RACK, max(n)*0.9, " EP>rack (IB)", fontsize=8)
+        ax.plot(eps, n, "s-", color="tab:red", label=bname)
+        ax.axvline(RACK, ls="--", color="gray", alpha=0.6); ax.text(RACK, max(n)*0.9, f" EP>{RACK} (IB)", fontsize=8)
         ax.set_xscale("log", base=2); ax.set_xticks(eps); ax.set_xticklabels([str(e) for e in eps])
         ax.set_xlabel("GPUs (EP)"); ax.set_ylabel("energy / token (mJ)")
-        ax.set_title(f"Energy/token vs EP — {args.model}\nglass passive optical vs NVL72 NVSwitch (540W/rack)")
+        ax.set_title(f"Energy/token vs EP — {args.model}\nglass optical vs {bname} (NVLink domain {RACK})")
         ax.legend(); ax.grid(True, alpha=0.3); fig.tight_layout(); fig.savefig(out, dpi=130)
         print(f"  plot -> {out}")
     except ImportError:

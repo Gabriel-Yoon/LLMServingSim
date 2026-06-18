@@ -842,7 +842,7 @@ def build_batch_x_ep_runs(panel, wg, inter_opt_bw, batch_list, ep_list, mode):
 
 
 def main():
-    global MODEL_NAME, HARDWARE, NVL72_RACK, INTER_LAT, TP, POWER, AGG_BW
+    global MODEL_NAME, HARDWARE, NVL72_RACK, NVL72_ELEC_BW, INTER_LAT, TP, POWER, AGG_BW
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sweep", choices=["intra", "inter", "epscale", "batch", "batch_x_ep", "latency",
                                         "topo_compare"],
@@ -878,7 +878,12 @@ def main():
     ap.add_argument("--nvl72-rack", type=int, default=NVL72_RACK,
                     help="NVLink domain (rack) size used as the cross-rack boundary. "
                          "Lower it (e.g. 4) so a small EP crosses into the inter-rack IB "
-                         "dim — lets the cliff be reproduced locally without 128 instances.")
+                         "dim — lets the cliff be reproduced locally without 128 instances. "
+                         "H100-consistent baseline: 8 (HGX NVLink island).")
+    ap.add_argument("--nvl72-bw", type=float, default=NVL72_ELEC_BW,
+                    help="NVLink within-domain unidirectional BW (GB/s). Default 900 = "
+                         "GB200 NVLink5 (1800 bidir/2). For H100-CONSISTENT runs (compute is "
+                         "profiled on H100) use 450 = NVLink4 (900 bidir/2) with --nvl72-rack 8.")
     ap.add_argument("--mode", choices=["controlled", "realistic"], default="controlled")
     ap.add_argument("--panels", nargs="+", default=["4x4", "6x6_4c", "6x6"], choices=list(PANELS))
     ap.add_argument("--wg", nargs="+", type=int, default=WG_COUNTS_DEFAULT, help="intra: WG counts")
@@ -922,6 +927,7 @@ def main():
     AGG_BW = args.agg_bw
     NPU_MEM["mem_size"] = args.npu_mem_gb
     NVL72_RACK = args.nvl72_rack
+    NVL72_ELEC_BW = args.nvl72_bw
     INTER_LAT = args.inter_lat
     global _MODEL_CFG
     with open(os.path.join(REPO_ROOT, "configs", "model", MODEL_NAME + ".json")) as f:
@@ -983,7 +989,9 @@ def main():
     _wl_b = "per-run" if args.sweep in ("batch", "batch_x_ep") else args.batch_per_instance
     print(f"  workload: N=EP×{_wl_b}, ISL/OSL {args.isl}/{args.osl}, "
           f"max_tokens={args.max_tokens}, arrivals={'t=0' if args.mode=='controlled' else '1ms staggered'}")
-    print(f"  baseline: NVL72 {NVL72_ELEC_BW} GB/s unidirectional, {NVL72_LAT:.0f} ns hop")
+    _bl = "H100 NVLink4 (HGX)" if NVL72_ELEC_BW <= 450 else "GB200 NVL72 NVLink5"
+    print(f"  baseline: {_bl} {NVL72_ELEC_BW} GB/s unidir, domain {NVL72_RACK} GPUs, "
+          f"{NVL72_LAT:.0f} ns hop, IB {NVL72_IB_BW} cross-domain")
     print(f"  runs: {len(runs)}   results: {results_csv}")
     print(f"{'='*72}\n")
 
