@@ -35,6 +35,22 @@ SKEW_KVS_FACTOR="${SKEW_KVS_FACTOR:-2.0}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# RUN BARE-METAL, NOT INSIDE APPTAINER. DeepSeek MLA (and others) trigger FlashInfer's
+# runtime JIT, which needs the host CUDA toolkit's nvcc (Spack module). Inside Apptainer
+# that nvcc path is invisible -> "nvcc: not found" -> EngineCore fails to start. The
+# working per-model scripts load the cuda module first; do the same here.
+CUDA_MODULE="${CUDA_MODULE:-cuda/12.6.1}"
+UV_MODULE="${UV_MODULE:-uv/0.9.17}"
+if command -v module >/dev/null 2>&1; then
+    module load "$CUDA_MODULE" 2>/dev/null || echo "[warn] could not 'module load $CUDA_MODULE'" >&2
+    module load "$UV_MODULE"   2>/dev/null || true
+fi
+if ! command -v nvcc >/dev/null 2>&1; then
+    echo "ERROR: nvcc not on PATH. FlashInfer JIT (e.g. DeepSeek MLA rope) will fail." >&2
+    echo "  Run BARE-METAL (not Apptainer) and 'module load $CUDA_MODULE' first." >&2
+    exit 1
+fi
+
 # Auto-activate the bare-metal vLLM venv if vLLM isn't importable (HPC node).
 if ! python3 -c "import vllm" >/dev/null 2>&1; then
     ENV_SH="$REPO_ROOT/scripts/env.sh"
