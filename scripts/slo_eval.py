@@ -180,6 +180,9 @@ def main():
     ap.add_argument("--fixed-wg", type=int, default=5)
     ap.add_argument("--inter-opt-bw", type=float, default=512.0)
     ap.add_argument("--nvl72-rack", type=int, default=64)
+    ap.add_argument("--nvl72-bw", type=float, default=None,
+                    help="NVLink within-domain unidir BW (GB/s). H100-consistent: 450 with "
+                         "--nvl72-rack 8; default (None) keeps the module value (GB200 900).")
     ap.add_argument("--fabrics", nargs="+", default=["glass", "nvl72"])
     ap.add_argument("--qps-list", type=float, nargs="+", default=[1, 2, 4])
     ap.add_argument("--n-req", type=int, default=128)
@@ -199,6 +202,8 @@ def main():
     S.TP = args.tp
     S.NPU_MEM["mem_size"] = args.npu_mem_gb
     S.NVL72_RACK = args.nvl72_rack
+    if args.nvl72_bw is not None:
+        S.NVL72_ELEC_BW = args.nvl72_bw
 
     ttft_slo, tpot_slo = get_slo(args.model, args.dataset)
     print(f"# model={args.model} hw={args.hardware} tp={args.tp} ds={args.dataset} "

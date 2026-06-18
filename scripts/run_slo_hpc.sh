@@ -21,7 +21,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PANEL="4 4"; WG=8; RACK=64; INTER_BW=512   # --fixed-wg = TOTAL bundle (even); x8 = per-dir 4 = 512 GB/s, feasible 4x4 floor
+PANEL="4 4"; WG=8; RACK=8; NVLBW=450; INTER_BW=512   # H100-consistent: NVLink4 450, HGX domain 8   # --fixed-wg = TOTAL bundle (even); x8 = per-dir 4 = 512 GB/s, feasible 4x4 floor
 NREQ=96           # requests per QPS point (sim cost ~ NREQ x MAXOSL iterations)
 MAXOSL=24         # cap decode tokens: steady TPOT is reached in a few tokens, so
                   # this bounds per-run iterations without changing per-token latency.
@@ -53,7 +53,7 @@ run () {
   MOE_ALLTOALL=1 python scripts/slo_eval.py \
     --model "$model" --hardware H100 --tp 1 \
     --dataset "$ds" --pd-mode "$pd" --ep "$ep" \
-    --panel $PANEL --fixed-wg $WG --inter-opt-bw $INTER_BW --nvl72-rack $RACK \
+    --panel $PANEL --fixed-wg $WG --inter-opt-bw $INTER_BW --nvl72-rack $RACK --nvl72-bw $NVLBW \
     --fabrics glass nvl72 --qps-list $sqps --n-req $nreq --max-osl $MAXOSL \
     --npu-mem-gb $MEMGB --timeout $TIMEOUT \
     --out "$out"
