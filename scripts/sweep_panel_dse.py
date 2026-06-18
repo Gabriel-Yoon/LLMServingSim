@@ -453,23 +453,42 @@ def parse_exposed_log(text):
 _ITER_RE = re.compile(r"NPU\[(\d+)\] iteration (\d+) finished, (\d+) cycles")
 
 
-def parse_steady_decode(text):
-    """Ground-truth STEADY-STATE DECODE step from ASTRA's per-iteration controller
-    log. Returns (tpot_gt_ms, exposed_frac) computed on the SAME steady-decode
-    iterations, so the two are consistent (the old parse_exposed_log gave a
-    CUMULATIVE run-average exposed_frac — prefill included — which did not match
-    the steady-decode tpot_gt).
+def _bin_ms(dt):
+    """Total-delta cycles -> step time binned to 0.1 ms (1 cycle ~= 1 ns)."""
+    return round(dt / 1e5) / 10.0
 
-    Both 'C cycles' and 'exposed E cycles' are cumulative per NPU, so per-iteration
-    total_delta = C[i]-C[i-1] and exposed_delta = E[i]-E[i-1]. The decode step
-    repeats every iteration, so the MODE of total_delta (binned to 0.1 ms) is the
-    steady decode step (tpot_gt); the exposed fraction is averaged over exactly the
-    iterations that land in that mode bin (prefill / ramp iterations excluded)."""
-    by_npu = {}  # npu -> {iter: (total_cyc, exposed_cyc)}
+
+def _mode_step(sub):
+    """(step_ms, exposed_frac) for the modal 0.1 ms bin of an iteration subset."""
+    if not sub:
+        return None, None
+    b = collections.Counter(_bin_ms(dt) for dt, _ in sub)
+    mode_ms = float(b.most_common(1)[0][0])
+    sel = [(dt, de) for dt, de in sub if _bin_ms(dt) == mode_ms]
+    s_dt = sum(dt for dt, _ in sel)
+    s_de = sum(max(0, de) for _, de in sel)
+    return mode_ms, (s_de / s_dt if s_dt > 0 else None)
+
+
+def parse_steady_decode(text):
+    """PHASE-AWARE step extraction from ASTRA's per-iteration controller log.
+    Returns (decode_ms, decode_ef, prefill_ms, prefill_ef).
+
+    Per NPU the 'C cycles' / 'exposed E cycles' are cumulative, so per-iteration
+    total_delta = C[i]-C[i-1], exposed_delta = E[i]-E[i-1]. A mixed run is BIMODAL:
+    small deltas = decode steps (batch tokens), large deltas = prefill chunks
+    (max_tokens). The old mode+median-guard heuristic assumed decode dominates by
+    COUNT and flipped phase across fabrics when prefill iterations outnumbered decode
+    (e.g. prefill runs with small osl). Instead we split the two clusters by the
+    largest multiplicative GAP in the binned step times (frequency-independent):
+    decode = the small cluster, prefill = the large cluster. Each phase's step time
+    is the mode of its cluster; exposed is averaged over that cluster's modal bin.
+    A run with no clear gap (pure decode) returns prefill_*=None."""
+    by_npu = {}
     for m in _EXPOSED_RE.finditer(text or ""):
         npu, it, cyc, exc = int(m[1]), int(m[2]), int(m[3]), int(m[4])
         by_npu.setdefault(npu, {})[it] = (cyc, exc)
-    pairs = []  # (total_delta, exposed_delta) per iteration
+    pairs = []
     for iters in by_npu.values():
         ks = sorted(iters)
         for a, b in zip(ks, ks[1:]):
@@ -478,35 +497,26 @@ def parse_steady_decode(text):
             if dt > 0:
                 pairs.append((dt, de))
     if not pairs:
-        return None, None
-    binned = collections.Counter(round(dt / 1e5) / 10.0 for dt, _ in pairs)
-    mode_ms = float(binned.most_common(1)[0][0])
-    # Robustness guard: the steady decode step is the SMALL repeated value; prefill
-    # and ramp/wave-sync-stalled iterations are large and fewer. When a cluster of
-    # large iterations forms the most-common 0.1 ms bin (observed at glass EP32 with
-    # 2-panel wave sync -> a spurious 167 ms "mode" while TTFT was normal), the mode
-    # lands far above the median. In that case re-take the mode among the sub-median
-    # (decode-like) iterations. Triggers only on the outlier case; normal runs where
-    # mode ~= median are unchanged.
-    deltas_ms = sorted(dt / 1e6 for dt, _ in pairs)
-    median_ms = deltas_ms[len(deltas_ms) // 2]
-    if mode_ms > 1.5 * median_ms and median_ms > 0:
-        lower = [(dt, de) for dt, de in pairs if (dt / 1e6) <= median_ms]
-        if lower:
-            b2 = collections.Counter(round(dt / 1e5) / 10.0 for dt, _ in lower)
-            mode_ms = float(b2.most_common(1)[0][0])
-    # exposed fraction over only the steady (mode-bin) iterations
-    sel = [(dt, de) for dt, de in pairs if round(dt / 1e5) / 10.0 == mode_ms]
-    sum_dt = sum(dt for dt, _ in sel)
-    sum_de = sum(max(0, de) for _, de in sel)
-    ef = (sum_de / sum_dt) if sum_dt > 0 else None
-    return mode_ms, ef
+        return None, None, None, None
+    # MIN-ANCHORED split (frequency-independent, robust when prefill iterations
+    # outnumber decode and when prefill chunks spread across bins): the decode step
+    # is the SMALL repeated value, so anchor on a robust small percentile (p5) and
+    # call everything within DECODE_BAND x of it a decode step; the rest is prefill.
+    # Median/mode/gap heuristics flip phase across fabrics on prefill-heavy runs.
+    DECODE_BAND = 3.0
+    dts = sorted(dt for dt, _ in pairs)
+    anchor = dts[len(dts) // 20]                     # ~5th percentile of step cycles
+    split = anchor * DECODE_BAND
+    decode_sub = [(dt, de) for dt, de in pairs if dt <= split]
+    prefill_sub = [(dt, de) for dt, de in pairs if dt > split]
+    d_ms, d_ef = _mode_step(decode_sub)
+    p_ms, p_ef = _mode_step(prefill_sub)
+    return d_ms, d_ef, p_ms, p_ef
 
 
 def parse_steady_decode_cycle(text):
-    """Back-compat shim: steady decode tpot_gt only."""
-    gt, _ = parse_steady_decode(text)
-    return gt
+    """Back-compat shim: steady decode step (ms) only."""
+    return parse_steady_decode(text)[0]
 
 
 OVERLAP_EFFICIENCY = 0.8   # eta: fraction of the overlappable comm a real
@@ -605,6 +615,7 @@ def parse_power(text):
 CSV_FIELDS = ["label", "sweep", "mode", "topology", "fabric", "panel", "ep",
               "per_device_batch", "wg_count", "intra_opt_bw", "inter_bw", "status",
               "ttft_ms", "e2e_latency_ms", "tpot_avg_ms", "tpot_steady_ms", "tpot_gt_ms",
+              "prefill_step_ms", "prefill_exposed_frac",
               "tpot_gt_overlap_ms", "exposed_frac_overlap",
               "interactivity_tok_s_user", "n_completed",
               "total_cycles", "exposed_cycles", "compute_cycles", "exposed_frac",
@@ -665,13 +676,18 @@ def run_one(label, cfg, ep, meta, mode, isl, osl, max_tokens, batch_per_inst, ou
         m = parse_metrics(out_csv) or {}
         _log = (proc.stdout or "") + (proc.stderr or "")
         exposed = parse_exposed_log(_log) or {}   # cumulative total/exposed (reference cols)
-        gt, ef = parse_steady_decode(_log)         # steady-decode tpot_gt + consistent exposed_frac
+        # phase-aware: decode step (tpot_gt) + prefill chunk, split by step-size gap.
+        gt, ef, p_ms, p_ef = parse_steady_decode(_log)
         if gt is not None:
             m["tpot_gt_ms"] = gt
         if ef is not None:
-            # use the STEADY-DECODE exposed (same iterations as tpot_gt), not the
-            # cumulative run-average (which folds in prefill) — they must share a basis.
+            # STEADY-DECODE exposed (same iterations as tpot_gt), not the cumulative
+            # run-average (which folds in prefill) — they must share a basis.
             exposed["exposed_frac"] = ef
+        if p_ms is not None:
+            m["prefill_step_ms"] = p_ms          # prefill-chunk step time (max_tokens prefill)
+        if p_ef is not None:
+            m["prefill_exposed_frac"] = p_ef     # exposed comm fraction of the prefill chunk
         # Analytical comp-comm overlap (DeepEP/AIC++): hide the all-to-all behind
         # the other micro-batch's compute. Reported alongside the serial tpot_gt.
         if gt is not None and ef is not None:
