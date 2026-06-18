@@ -52,7 +52,8 @@ run () {
   local ep="$1" rows="$2" cols="$3"
   local tag="isobudget"; local eqarg=""
   if [ -n "$EQBW" ]; then tag="isobw_${EQBW}"; eqarg="--equal-link-bw $EQBW"; fi
-  local out="outputs/panel_dse/topo_scale_ep${ep}_${tag}.csv"
+  local mtag=$(echo "$MODEL" | sed 's#.*/##; s/[^A-Za-z0-9]/_/g' | tr 'A-Z' 'a-z')
+  local out="outputs/panel_dse/topo_scale_${mtag}_ep${ep}_${tag}.csv"
   if [ -s "$out" ] && [ "$(wc -l < "$out")" -gt 1 ]; then
     echo "=== SKIP (exists): $out ==="; return
   fi
@@ -69,6 +70,7 @@ for pc in "${PANELS[@]}"; do
   run "$ep" ${rc}
 done
 
-echo "=== topo_scale done. CSVs: outputs/panel_dse/topo_scale_ep*_*.csv ==="
-echo "Plot/validate: python scripts/topo_project.py --measured outputs/panel_dse/topo_scale_ep*_isobudget.csv"
+_mtag=$(echo "$MODEL" | sed 's#.*/##; s/[^A-Za-z0-9]/_/g' | tr 'A-Z' 'a-z')
+echo "=== topo_scale done. CSVs: outputs/panel_dse/topo_scale_${_mtag}_ep*_*.csv ==="
+echo "Plot/validate: python scripts/topo_project.py --measured outputs/panel_dse/topo_scale_${_mtag}_ep*_isobudget.csv"
 echo "(re-run with EQBW=512 for the iso-bandwidth ablation set.)"

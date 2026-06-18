@@ -38,10 +38,12 @@ MODEL="${MODEL:-deepseek-ai/DeepSeek-V3-0324}"
 MEM="${MEM:-141}"; ISL="${ISL:-256}"; OSL="${OSL:-16}"; MTOK="${MTOK:-2048}"
 TIMEOUT="${TIMEOUT:-10800}"
 export MOE_ALLTOALL="${MOE_ALLTOALL:-1}"
+# model tag in the filename so different models do NOT collide (resume-skip across models)
+MTAG=$(echo "$MODEL" | sed 's#.*/##; s/[^A-Za-z0-9]/_/g' | tr 'A-Z' 'a-z')
 
 for ep in $EPS; do
   for b in $BATCHES; do
-    out="outputs/panel_dse/topo_pareto_ep${ep}_b${b}.csv"
+    out="outputs/panel_dse/topo_pareto_${MTAG}_ep${ep}_b${b}.csv"
     if [ -s "$out" ] && [ "$(wc -l < "$out")" -gt 1 ]; then echo "SKIP $out"; continue; fi
     echo "=== topo Pareto EP=$ep batch=$b  {$TOPOS} ==="
     python scripts/sweep_panel_dse.py --sweep topo_compare \
@@ -55,6 +57,6 @@ done
 echo ""
 echo "=== done. Plot the per-EP frontiers: ==="
 for ep in $EPS; do
-  echo "  python scripts/plot_pareto.py --osl $OSL --decode-only outputs/panel_dse/topo_pareto_ep${ep}_b*.csv \\"
-  echo "    --title 'Topology Pareto EP${ep} (cross-domain)' --out outputs/paper_figures/fig_topology_pareto_ep${ep}.png"
+  echo "  python scripts/plot_pareto.py --osl $OSL --decode-only outputs/panel_dse/topo_pareto_${MTAG}_ep${ep}_b*.csv \\"
+  echo "    --title 'Topology Pareto ${MTAG} EP${ep}' --out outputs/paper_figures/fig_topology_pareto_${MTAG}_ep${ep}.png"
 done
