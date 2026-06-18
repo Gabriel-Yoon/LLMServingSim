@@ -1,0 +1,31 @@
+{
+    "_comment": "ViBE-aligned config: TP=8 (dense) + EP=8 (MoE) on 8 GPUs in ONE node, single instance (no dp_group). TP ALLREDUCE on non-MoE layers + EP AllGather/ReduceScatter on MoE -- all 8 GPUs in lockstep, exactly ViBE Table 2a. This uses the independent-instance path (NOT the multi-instance dp_group path that deadlocks at TP>1), so it runs cleanly once tp8 perf data exists (profiler/perf/H100/.../tp8/). Set link_bw/link_latency to the 8-GPU fabric under test (e.g. glass panel 512/100 or H100 NVLink4 450/500).",
+    "num_nodes": 1,
+    "link_bw": 450,
+    "link_latency": 500,
+    "nodes": [
+        {
+            "num_instances": 1,
+            "cpu_mem": {
+                "mem_size": 1024,
+                "mem_bw": 256,
+                "mem_latency": 0
+            },
+            "instances": [
+                {
+                    "model_name": "Qwen/Qwen3-235B-A22B",
+                    "hardware": "H100",
+                    "npu_mem": {
+                        "mem_size": 4096,
+                        "mem_bw": 3350,
+                        "mem_latency": 0
+                    },
+                    "num_npus": 8,
+                    "tp_size": 8,
+                    "ep_size": 8,
+                    "pd_type": null
+                }
+            ]
+        }
+    ]
+}
