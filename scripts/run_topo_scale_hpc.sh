@@ -24,16 +24,29 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507"   # light MoE; topology compare is medium-agnostic
-TOPOS="fb dragonfly torus mesh ring"
-WGB=60                # per-GPU WG budget (52x34 full-tile PIC, from wg_budget.py)
-BATCH=64
-MEM=1024
-TIMEOUT=14400
+# Headline = a BIG MoE (the paper's models). Topology ordering is model-agnostic
+# (diameter), but the figure must be on a credible large model. DeepSeek-V3 (MLA,
+# bandwidth-bound) by default; override for Qwen3-235B / Kimi-K2:
+#   MODEL=Qwen/Qwen3-235B-A22B MEM=141 bash scripts/run_topo_scale_hpc.sh
+#   MODEL=moonshotai/Kimi-K2-Instruct MEM=200 PANELS="64:8,8 128:8,16" ...
+# A big model only fits at higher EP (weights shard by EP): DeepSeek EP16=113GB,
+# EP32=67, EP64=38 GB. Default measures EP 16/32/64 and you PROJECT 128/256 with
+# topo_project.py (panel physics caps direct scale anyway). For the FULL measured
+# 16->256 curve use the light model + full panel list (PANELS tuples are "EP:rows,cols",
+# space-separated):
+#   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 MEM=96 PANELS="16:4,4 32:4,8 64:8,8 128:8,16 256:16,16" ...
+MODEL="${MODEL:-deepseek-ai/DeepSeek-V3-0324}"
+TOPOS="${TOPOS:-fb dragonfly torus mesh ring}"
+WGB="${WGB:-60}"      # per-GPU WG budget (52x34 full-tile PIC, from wg_budget.py)
+BATCH="${BATCH:-64}"  # lifts exposed-comm so topology shows (batch=4 hides it)
+MEM="${MEM:-141}"
+TIMEOUT="${TIMEOUT:-14400}"
 EQBW="${EQBW:-}"      # set EQBW=512 to run the iso-bandwidth ablation instead
 
 # EP -> single-panel (rows cols) so panel size == EP (no inter-panel mixing).
-PANELS=("16:4 4" "32:4 8" "64:8 8" "128:8 16" "256:16 16")
+# Default = the big-model-feasible subset (16/32/64); override PANELS for full scale.
+read -r -a PANELS <<< "${PANELS:-16:4,4 32:4,8 64:8,8}"
+PANELS=("${PANELS[@]//,/ }")
 
 run () {
   local ep="$1" rows="$2" cols="$3"

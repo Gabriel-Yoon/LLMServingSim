@@ -28,12 +28,14 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 TOPOS="${TOPOS:-fb dragonfly torus mesh ring}"
-EPS="${EPS:-32 64}"
+EPS="${EPS:-32 64}"               # cross-domain (EP>panel); DeepSeek fits (EP32=67GB, EP64=38GB)
 BATCHES="${BATCHES:-16 32 64 128 256}"
 WGB="${WGB:-60}"                  # total per-GPU WG budget, split by degree
 PANEL="4 4"
-MODEL="${MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
-MEM="${MEM:-96}"; ISL="${ISL:-256}"; OSL="${OSL:-16}"; MTOK="${MTOK:-2048}"
+# Headline = big MoE. DeepSeek-V3 default; override for Qwen3-235B / Kimi-K2 / Qwen3-30B:
+#   MODEL=Qwen/Qwen3-235B-A22B MEM=141 ...   |   MODEL=moonshotai/Kimi-K2-Instruct MEM=200 ...
+MODEL="${MODEL:-deepseek-ai/DeepSeek-V3-0324}"
+MEM="${MEM:-141}"; ISL="${ISL:-256}"; OSL="${OSL:-16}"; MTOK="${MTOK:-2048}"
 TIMEOUT="${TIMEOUT:-10800}"
 export MOE_ALLTOALL="${MOE_ALLTOALL:-1}"
 
