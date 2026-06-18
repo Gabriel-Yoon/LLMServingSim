@@ -18,14 +18,15 @@ cd "$(dirname "$0")/.."
 # H100-CONSISTENT baseline: NVLink4 450 GB/s unidir, 8-GPU HGX NVLink island (rack=8),
 # IB 50 cross-island. Matches the H100 compute profile (vs the GB200/NVL72 mismatch).
 WG=8; PANEL="4 4"; RACK=8; NVLBW=450
-BATCH_LIST="256 1024 2048 4096 8192"
-MAXTOK=16384      # >= max batch so a DECODE step isn't capped by the token budget
-# --npu-mem-gb only gates the weight-fit/KV check, NOT network timing, so a large
-# value lets the high-batch points complete (DeepSeek KV is modelled as standard MHA
-# ~4 MB/tok -> b>=1024 x isl256 exceeds 1 TB and crashes). The exposed%/comm we measure
-# is unchanged; the verdict notes which batches are memory-realistic (~b256 @1 TB GPU).
-MEM=32768
-TIMEOUT=14400
+# Batch is capped by the PROFILING sweep: DeepSeek/Qwen were profiled at
+# max_num_seqs=256, so decode attention is only gridded to n_decode=256. Beyond that
+# the 4D lookup extrapolates and TPOT blows up (b2048 -> 4.4 s artifact). So the
+# reliable decode batch sweep is <=256; the EP axis (8 control vs 128 cliff) is the
+# real lever (raising re-profiling beyond 256 is out of scope -- perf data is frozen).
+BATCH_LIST="64 128 256"
+MAXTOK=2048       # matches the profiled max_num_batched_tokens
+MEM=2048
+TIMEOUT=10800
 
 run () {  # model tag ep phase isl osl
   local model="$1" tag="$2" ep="$3" phase="$4" isl="$5" osl="$6"
