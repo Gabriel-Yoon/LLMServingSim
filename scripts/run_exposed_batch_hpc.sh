@@ -25,7 +25,12 @@ WG=8; PANEL="4 4"; RACK=8; NVLBW=450
 # real lever (raising re-profiling beyond 256 is out of scope -- perf data is frozen).
 BATCH_LIST="64 128 256"
 MAXTOK=2048       # matches the profiled max_num_batched_tokens
-MEM=2048
+# Realistic GPU memory now that the MLA KV fix removed the phantom 57x KV over-count
+# (no more --npu-mem 32TB workaround). H200=141. NOTE: with correct KV, DeepSeek-V3 bf16
+# needs EP>=16 to fit weights (EP8 = 217 GB); the in-domain control is EP=16 (= 1 glass
+# panel), not EP=8. Qwen3-235B is GQA -> KV fix is a NO-OP, its results are UNCHANGED
+# (no re-run needed); only the MLA models (DeepSeek/Kimi) change.
+MEM=141
 TIMEOUT=10800
 
 run () {  # model tag ep phase isl osl
@@ -63,10 +68,9 @@ run_prefill () {  # model tag ep
 
 for m in "deepseek-ai/DeepSeek-V3-0324:deepseek_v3" "Qwen/Qwen3-235B-A22B:qwen235b"; do
   model="${m%%:*}"; tag="${m#*:}"
-  # EP=8 (in-domain control: 1 glass panel, 1 H100 island, no IB). EP=128 (cliff,
-  # NVL72 crosses IB since rack=8) — the regime of interest.
-  # NOTE: EP=128 x B=8192 is heavy; if it OOMs, drop 8192 (and 4096) for EP=128.
-  run "$model" "$tag" 8   decode  256  24
+  # EP=16 (in-domain control: 1 glass panel; DeepSeek-V3 bf16 fits ~132 GB here, not at
+  # EP8). EP=128 (cliff, NVL72 crosses IB since rack=8) — the regime of interest.
+  run "$model" "$tag" 16  decode  256  24
   run "$model" "$tag" 128 decode  256  24
   run_prefill "$model" "$tag" 128
 done
