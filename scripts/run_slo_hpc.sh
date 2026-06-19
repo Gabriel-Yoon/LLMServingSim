@@ -21,15 +21,18 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PANEL="4 4"; WG=8; RACK=8; NVLBW=450; INTER_BW=512   # H100-consistent: NVLink4 450, HGX domain 8   # --fixed-wg = TOTAL bundle (even); x8 = per-dir 4 = 512 GB/s, feasible 4x4 floor
+HARDWARE="${HARDWARE:-H200}"   # H200 (141GB) lets bf16 fit at the EPs below (no fake mem)
+PANEL="4 4"; WG=8; RACK=8; NVLBW=450; INTER_BW=512   # NVLink4 450, HGX/H200 SXM domain 8   # --fixed-wg = TOTAL bundle (even); x8 = per-dir 4 = 512 GB/s, feasible 4x4 floor
 NREQ="${NREQ:-96}"        # requests per QPS point (sim cost ~ NREQ x MAXOSL iterations)
 MAXOSL="${MAXOSL:-24}"    # cap decode tokens. MAXOSL=24 = fast steady-TPOT view (bounds
                   # iterations); MAXOSL=128 = full Sonnet output -> requests linger ~5x
                   # longer -> ViBE-comparable sustainable QPS (slower; A/B with 24).
 TIMEOUT="${TIMEOUT:-10800}"     # 3h per (model,ds,ep,pd,qps-list) invocation
-MEMGB="${MEMGB:-1024}"    # fake-large isolates interconnect at EP8 (DeepSeek dense replicated
-                  # at TP=1 ~200GB). At large EP (experts shard) set MEMGB=80 for realistic
-                  # KV-admission pressure (ViBE-like).
+MEMGB="${MEMGB:-141}"    # REALISTIC H200 (141GB) so KV-admission limits concurrency like ViBE
+                  # (fake-large hides the KV/queueing TTFT failure mode). bf16 per-GPU fits:
+                  # DeepSeek EP16=113 / EP32=67 / EP128=38; Qwen EP8=58. DeepSeek EP8 (199GB)
+                  # does NOT fit -> not run in bf16 (would need FP8 or fake); Qwen EP8 anchors
+                  # the in-domain parity instead.
 
 # QPS lists below are the EP=8 baseline (cluster-wide). They are SCALED by ep/8
 # inside run() so the PER-INSTANCE load stays constant across EP. Without this,
@@ -53,7 +56,7 @@ run () {
   local nreq=$(( NREQ * f ))
   echo "=== SLO: $tag ds=$ds pd=$pd ep=$ep qps=[$sqps] n_req=$nreq (scaled x$f) ==="
   MOE_ALLTOALL=1 python scripts/slo_eval.py \
-    --model "$model" --hardware H100 --tp 1 \
+    --model "$model" --hardware $HARDWARE --tp 1 \
     --dataset "$ds" --pd-mode "$pd" --ep "$ep" \
     --panel $PANEL --fixed-wg $WG --inter-opt-bw $INTER_BW --nvl72-rack $RACK --nvl72-bw $NVLBW \
     --fabrics glass nvl72 --qps-list $sqps --n-req $nreq --max-osl $MAXOSL \
@@ -61,15 +64,20 @@ run () {
     --out "$out"
 }
 
-# ── DeepSeek-V3 (256 experts; TPOT SLO 125ms) ──
-for ep in 8 128; do
+# ── DeepSeek-V3 (256 experts; TPOT SLO 125ms). bf16 fits H200 at EP>=16; EP8 (199GB)
+#    omitted (would need FP8/fake). EP16 = cliff onset (>domain 8 -> NVL72 on IB),
+#    EP128 = production/deep cliff. ──
+DS_EPS="${DS_EPS:-16 32 128}"
+for ep in $DS_EPS; do
   run "deepseek-ai/DeepSeek-V3-0324" deepseek_v3 sonnet   decode  $ep "0.5 1 2 4 8"
   run "deepseek-ai/DeepSeek-V3-0324" deepseek_v3 sharegpt decode  $ep "2 4 8 16 32"
   run "deepseek-ai/DeepSeek-V3-0324" deepseek_v3 sonnet   prefill $ep "0.5 1 2 4 8"
 done
 
-# ── Qwen-3 235B (128 experts; TPOT SLO 100ms) ──
-for ep in 8 128; do
+# ── Qwen-3 235B (128 experts; TPOT SLO 100ms). bf16 EP8=58GB fits H200 -> EP8 is the
+#    in-domain parity anchor; EP128 = cliff. ──
+QW_EPS="${QW_EPS:-8 128}"
+for ep in $QW_EPS; do
   run "Qwen/Qwen3-235B-A22B" qwen235b sonnet   decode  $ep "1 2 4 8 16"
   run "Qwen/Qwen3-235B-A22B" qwen235b sharegpt decode  $ep "4 8 16 32 64"
   run "Qwen/Qwen3-235B-A22B" qwen235b sonnet   prefill $ep "1 2 4 8 16"
