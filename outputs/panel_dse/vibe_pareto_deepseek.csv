@@ -1,0 +1,11 @@
+label,fabric,ep,per_device_batch,isl,osl,tpot_gt_ms,ttft_ms,status
+vibe_glass_b8,glass,8,8,1024,128,24.46,492.82,ok
+vibe_nvl72_b8,nvl72,8,8,1024,128,24.56,493.79,ok
+vibe_glass_b16,glass,8,16,1024,128,41.58,828.77,ok
+vibe_nvl72_b16,nvl72,8,16,1024,128,41.69,830.38,ok
+vibe_glass_b32,glass,8,32,1024,128,72.47,1501.69,ok
+vibe_nvl72_b32,nvl72,8,32,1024,128,72.59,1504.60,ok
+vibe_glass_b64,glass,8,64,1024,128,82.10,2853.69,ok
+vibe_nvl72_b64,nvl72,8,64,1024,128,82.23,2859.17,ok
+vibe_glass_b128,glass,8,128,1024,128,99.09,5652.39,ok
+vibe_nvl72_b128,nvl72,8,128,1024,128,99.25,5663.20,ok
