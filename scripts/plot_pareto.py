@@ -21,9 +21,9 @@ Run:
 import argparse, csv, glob, os
 from collections import defaultdict
 
-_TOPO = {"fb": "FB (glass)", "glass_fb": "glass-FB", "nvl72": "NVL72",
+_TOPO = {"fb": "FB (glass)", "glass_fb": "glass-FB", "glass": "Glass-FB", "nvl72": "NVL72",
          "mesh": "Mesh", "torus": "Torus", "ring": "Ring", "dragonfly": "Dragonfly"}
-_COLOR = {"fb": "tab:green", "glass_fb": "tab:green", "nvl72": "tab:red",
+_COLOR = {"fb": "tab:green", "glass_fb": "tab:green", "glass": "tab:green", "nvl72": "tab:red",
           "mesh": "tab:cyan", "torus": "tab:blue", "ring": "tab:orange", "dragonfly": "tab:purple"}
 
 
