@@ -565,7 +565,8 @@ def analytical_estimates(model_cfg, ep, batch_per_inst, inter_bw, intra_bw, fp_b
     """
     hidden = model_cfg["hidden_size"]
     n_layers = model_cfg["num_hidden_layers"]
-    n_experts = model_cfg.get("num_local_experts") or model_cfg.get("n_routed_experts") or 0
+    n_experts = (model_cfg.get("num_local_experts") or model_cfg.get("n_routed_experts")
+                 or model_cfg.get("num_experts") or 0)   # Qwen3-MoE uses num_experts
     k = model_cfg.get("num_experts_per_tok", 1)
     moe_ffn = model_cfg.get("moe_intermediate_size", model_cfg.get("intermediate_size", hidden))
     mem_bw = NPU_MEM["mem_bw"]  # GB/s
@@ -576,7 +577,11 @@ def analytical_estimates(model_cfg, ep, batch_per_inst, inter_bw, intra_bw, fp_b
     eff_comm_tok = total_len  # dp_sum anchoring not applied in this single-instance estimate
     dispatch_bytes = max(1, eff_comm_tok // max(ep, 1)) * (hidden + n_experts) * fp_bytes
     combine_bytes = eff_comm_tok * hidden * fp_bytes
-    link_bw_Bpns = max(inter_bw, 1e-9)  # GB/s == B/ns
+    # in-domain (EP fits the domain -> inter_bw=0) runs the a2a on the INTRA-domain
+    # link (optical panel BW / NVLink); cross-domain runs on inter_bw (optical fiber
+    # / IB). This is the cliff: same bytes, link_bw drops to IB when EP > domain.
+    link_bw = inter_bw if (inter_bw and inter_bw > 0) else intra_bw
+    link_bw_Bpns = max(link_bw, 1e-9)  # GB/s == B/ns
     a2a_us_per_layer = (dispatch_bytes + combine_bytes) / link_bw_Bpns / 1000.0
     all_to_all_us = a2a_us_per_layer * n_layers
 
@@ -694,7 +699,7 @@ def run_one(label, cfg, ep, meta, mode, isl, osl, max_tokens, batch_per_inst, ou
             m["tpot_gt_overlap_ms"] = t_ov
             m["exposed_frac_overlap"] = ef_ov
         analyt = analytical_estimates(_MODEL_CFG, ep, batch_per_inst,
-                                      float(meta.get("inter_bw") or NVL72_ELEC_BW),
+                                      float(meta.get("inter_bw") or 0),   # 0 => in-domain (use intra)
                                       float(meta.get("intra_opt_bw") or NVL72_ELEC_BW))
         return {"label": label, "status": "ok", "elapsed_s": elapsed, "error": "",
                 **meta, **m, **exposed, **analyt, **parse_power(_log)}
