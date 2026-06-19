@@ -201,6 +201,10 @@ def main():
     S.HARDWARE = args.hardware
     S.TP = args.tp
     S.NPU_MEM["mem_size"] = args.npu_mem_gb
+    # mem_bw was H100's 3350 even for H200 (cosmetic for decode: LOCAL weights are
+    # compute-bound/profiled, so this does not change TPOT; fixed for correctness of
+    # offloading / analytical weight-load terms). H200 SXM ~4.8 TB/s.
+    S.NPU_MEM["mem_bw"] = 4800 if args.hardware.upper() == "H200" else 3350
     S.NVL72_RACK = args.nvl72_rack
     if args.nvl72_bw is not None:
         S.NVL72_ELEC_BW = args.nvl72_bw
