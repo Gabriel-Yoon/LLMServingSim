@@ -1,0 +1,313 @@
+================================================================================
+ASP-DAC 2027 — Glass-Photonic FlattenedButterfly (FB) Interconnect for
+Large Mixture-of-Experts (MoE) LLM Serving
+Research summary for manuscript writing.  (branch: research/asp-dac-2027)
+Numbers are LLMServingSim (cycle-level) results unless marked ANALYTICAL.
+Last reorganized: 2026-06 session (topology iso-budget vs iso-per-link framing).
+================================================================================
+
+--------------------------------------------------------------------------------
+0. ONE-PARAGRAPH STATE OF THE PROJECT (read this first)
+--------------------------------------------------------------------------------
+We argue a glass-substrate photonic FlattenedButterfly ("glass-FB") is the
+right switchless interconnect for large-EP MoE serving. CRITICAL methodology
+fact: our backend (ASTRA-Sim) is CONGESTION-UNAWARE, so MEASURED end-to-end
+decode/prefill at TP=1 shows glass ~= NVL72 PARITY — the simulator cannot turn
+the inter-domain bandwidth gap into a visible TPOT cliff (the MoE all-to-all is
+~5% of a compute-bound step, and ASTRA divides collective volume by domain count
+so the slow-link penalty washes out). This is the SAME op/collective-composition
+methodology NVIDIA's aiconfigurator uses, so it is defensible, not a weakness.
+The fabric/topology advantage is therefore argued on FOUR axes that do NOT
+require contention modeling: (1) ANALYTICAL collective latency / bisection
+(optical 512 vs IB 50 -> ~10x at the cliff EP), (2) ENERGY-per-token, (3)
+physical FEASIBILITY (micro-bump / WG budget, glass-only long links), and (4)
+TOPOLOGY structure (diameter / avg-hop). The current headline being built is the
+TOPOLOGY one (see Sec 5C) under the "FB is the glass-optimal topology" framing.
+
+--------------------------------------------------------------------------------
+1. THESIS
+--------------------------------------------------------------------------------
+Claim: A glass-photonic FlattenedButterfly fabric lets large-MoE inference scale
+expert parallelism (EP) PAST the NVLink domain boundary without the inter-domain
+InfiniBand (IB) penalty that throttles NVLink-class systems, AND it is the
+cost/feasibility-optimal switchless topology for doing so.
+
+Why it matters: production MoE (DeepSeek-V3 256 experts, Qwen3-235B 128 experts,
+Kimi-K2) is served at very large EP, which spans many NVLink domains. Beyond the
+domain, EP all-to-all falls onto IB (~50 GB/s) — far slower than in-domain
+NVLink. Glass-FB connects panels over optical links (~512 GB/s) + an optical
+circuit switch, keeping the MoE all-to-all cheap as EP scales.
+
+Two related works anchor methodology (both orthogonal to us):
+  - ViBE (Go, Mahajan et al.): co-optimizes expert PLACEMENT under skew +
+    hardware variability, interconnect FIXED. We FIX placement, vary the
+    INTERCONNECT. We sit exactly where their placement lever saturates (>~64 GPU).
+  - NVIDIA aiconfigurator (arXiv 2601.06288): op-level config DSE, a
+    goodput-vs-interactivity Pareto under an SLA. SAME op/collective decomposition
+    as us; we MIRROR its Pareto axes. Our novelty = we OPEN the fabric/topology
+    design axis that aiconfigurator (and ViBE) take as FIXED.
+
+--------------------------------------------------------------------------------
+2. SYSTEM DESIGN (glass-FB) — PHYSICAL DESIGN CONSTANTS (confirmed)
+--------------------------------------------------------------------------------
+- Waveguide: 1 WG = 32 lambda x 32 Gb/s = 1.024 Tb/s = 128 GB/s UNIDIRECTIONAL.
+  WG is unidirectional -> duplex link = N_WG TX + N_WG RX. TOTAL bundle = 2*N_WG
+  (always even; TX/RX symmetric).
+- Convention split (CRITICAL): sweep CLI `--fixed-wg` = TOTAL bundle (even);
+  config_builder `wg_count` = per-direction = TOTAL/2; intra_opt_bw = wg_count*128.
+  e.g. --fixed-wg 8 -> per-dir 4 -> 512 GB/s; --fixed-wg 10 -> 640.
+- Panel = 2D grid of GPUs wired as FlattenedButterfly (1-2 hop intra-panel).
+  4x4 = 16 GPU; 4x8 = 32; 8x8 = 64. Inter-panel = OPTICAL CIRCUIT SWITCH
+  (FullyConnected, single switched hop, 512 GB/s) — NOT a ring.
+- Micro-bump budget: tile 1600 mm^2 x 1.083 bumps/mm^2 ~ 1733 bumps -> ~54-60
+  WG/GPU (both directions). Per-grid N_WG cap = budget/degree/2:
+      4x4 (degree 6): cap 4/dir (floor) .. 5 (ceil) -> bundle x8..x10
+      6x6/6x6-4c (deg 10): cap 2..3/dir -> x4..x6
+      8x8 (deg 14): cap 1..2/dir -> x4
+  Higher-degree grids split the budget thinner (this matters a LOT — see 5C).
+- Power: optical CPO ~1.15 pJ/bit; interconnect_power = total_WG*1.024e12*1.15e-12.
+  x6 (60 WG/GPU) ~71 W/GPU. PASSIVE fabric (no switch power). vs NVL72 active
+  NVSwitch 540 W/rack (15 W * 36). per-GPU aggregate BW glass 7.68 vs NVL72 1.8
+  TB/s = 4.3x.
+- Latency: glass intra-panel optical hop ~100 ns (TeraPHY CPO, switchless);
+  inter-panel fiber ~500 ns; NVL72 NVSwitch hop ~500 ns. (inter-panel 500 vs
+  5000 ns is <1% on TPOT — BW-bound — so robust.)
+
+--------------------------------------------------------------------------------
+3. BASELINE (NVLink) — H100-CONSISTENT primary (compute is H100-profiled)
+--------------------------------------------------------------------------------
+Because per-layer latencies come from an H100 profiler, the interconnect baseline
+must also be H100-consistent (not GB200) for the primary result:
+  - PRIMARY (H100): NVLink4 = 450 GB/s unidir (900 bidir/2), NVLink domain = 8
+    GPU (HGX island), IB 50 GB/s @ EP>8, 500 ns hop.
+    flags: --nvl72-bw 450 --nvl72-rack 8 ; energy --baseline h100.
+    -> glass wins both in-domain BW (optical 512 > 450) and domain size (panel
+    16 > island 8); the cliff is pulled to EP>8 so small-EP fabric differences show.
+  - FORWARD-LOOKING SENSITIVITY (GB200 NVL72): NVLink5 = 900 GB/s unidir, domain
+    64, IB 50 @ EP>64. flags: --nvl72-bw 900 --nvl72-rack 64 ; --baseline gb200.
+    Compute still H100 (approx) -> disclose in limitations.
+NOTE: the topo_scale/topo_prefill runs print a GB200 baseline line, but NVL72 is
+NOT a topology in the topo_compare plots — topology comparison is glass-only
+(switchless regime; NVLink/NVSwitch is a logical fully-connected switch, has no
+"topology"). NVL72 appears only in the FABRIC (FB-vs-NVL72) collective/energy figs.
+
+--------------------------------------------------------------------------------
+4. SIMULATOR & METHODOLOGY
+--------------------------------------------------------------------------------
+Tool: LLMServingSim 2.0 = Python serving frontend (vLLM-style continuous batching,
+chunked prefill, radix prefix cache) + ASTRA-Sim analytical network backend
+(Chakra .et). Per-layer latencies from a vLLM layerwise profiler (real H100/H200
+kernel timings), NOT analytic FLOPs. EP is a runtime/topology knob (MoE profiled
+once at tp=1; per-rank latency = f(local_tokens, activated_experts)).
+
+Models: DeepSeek-V3-0324 (671B, 256 experts, 8 routed, MLA), Qwen3-235B-A22B
+(235B, 128 experts, GQA), Kimi-K2 (MLA), Qwen3-30B-A3B (fast proxy, up to EP256).
+
+MoE collective model (MOE_ALLTOALL=1): large-EP MoE = true DeepEP all-to-all.
+Multi-domain emits BOTH legs: within-domain (AllGather/ReduceScatter over inner
+fast dim) + cross-domain (ALLTOALL over outer slow dim @ IB or inter-panel optical).
+
+Phase-aware parse (sweep_panel_dse._phase_split, REGRESSION-TESTED): decode steps
+(small) and prefill chunks (large) are bimodal; split = small-cluster MEDIAN +
+core-band [0.5,1.5]x median for exposed (robust to spread / dp-sync stalls).
+Outputs decode_step_ms / decode_exposed_frac AND prefill_step_ms /
+prefill_exposed_frac. (Flipped phase 3x before this fix; locked by
+scripts/test_phase_split.py.)
+
+CONTROLLED-burst caveat: all requests arrive t=0 -> TTFT is a thundering-herd
+QUEUE artifact (e.g. 8 requests/instance pile up -> TTFT ~ 8x one prefill chunk).
+TTFT absolute is NOT online TTFT. Use per-CHUNK prefill_step_ms (queue-immune) and
+decode tpot_gt_ms; realistic TTFT needs Poisson (slo_eval). Sanity: DeepSeek
+2048-tok prefill chunk ~290 ms at TP=1 (FLOP-checked, 2*37e9*2048/550TFLOPS~270ms);
+decode step ~35 ms = weight-load-bound (EP16 113 GB / 3350 GB/s = 33.7 ms). Both
+are TP=1-INFLATED (TP=8 ~8x lower) — see Sec 7 TP scope.
+
+Energy: SEPARATE post-hoc model scripts/energy_model.py (NOT a built-in --power
+flag). Sourced glass constants (TX 1.66 + RX 0.96 = 2.62 pJ/bit dynamic, laser
+N_lambda*1mW/WPE, thermal tuning). Baselines {h100: domain8/12.5 W, gb200:
+domain64/8.44 W per-GPU NVSwitch}.
+
+--------------------------------------------------------------------------------
+5. KEY RESULTS
+--------------------------------------------------------------------------------
+
+5A. MEASURED END-TO-END (decode & prefill, TP=1) = PARITY, BY DESIGN OF THE SIM.
+    glass ~= NVL72 within ~1-2% on decode TPOT and on prefill chunk time at TP=1.
+    This is EXPECTED and CORRECT: congestion-unaware ASTRA cannot convert the
+    inter-domain bandwidth gap into a measured cliff. CONCLUSION: do NOT headline
+    a measured TPOT cliff. (The old Sec-5a "reach cliff" table in prior versions
+    of this file was a RING-artifact + congestion-unaware over-read; DISCARDED.)
+
+5B. FABRIC (glass-FB vs NVL72) — ANALYTICAL collective latency. The IB cliff
+    lives in the collective-latency metric (msg / link-bw), not in TPOT:
+      all_to_all_us(NVL72) / all_to_all_us(FB) ~ 10x at the EP where NVL72 crosses
+      its NVLink domain onto IB (optical 512 vs IB 50). Plot: plot_collective.py
+      --metric a2a on a reach CSV (Fig B). This + energy + feasibility carry the
+      FB-vs-NVL72 story since measured TPOT is parity.
+
+5C. TOPOLOGY (glass-only: FB vs Dragonfly/Torus/Mesh/Ring) — THE CURRENT HEADLINE.
+    Two fairness regimes (this is the crux):
+
+    (i) iso-BUDGET (same total WG/GPU = 60, split by degree). High-degree FB gets
+        THIN per-link BW; low-degree mesh/ring get FAT links.
+        MEASURED (DeepSeek, prefill chunk 2048, single-panel-per-EP):
+          prefill_exposed: FB 14.0% > mesh/torus 11.6%, ring 37.1%  (EP16)
+          TTFT(diameter proxy) FB vs mesh: +3% (EP16) -> +8.5% (EP32) -> +14% (EP64)
+        => Under iso-budget in a BANDWIDTH-BOUND congestion-unaware sim, FB
+        actually FALLS BEHIND mesh as EP grows (its degree (rows-1)+(cols-1) climbs
+        6->10->14, thinning links), while only RING clearly loses (diameter).
+        This is the conservative/cost-fair view and it does NOT favor FB.
+
+    (ii) iso-PER-LINK (--equal-link-bw 512). Every topology same per-link BW; this
+        is what glass ENABLES (abundant cheap long links -> FB can afford its high
+        radix). MEASURED (DeepSeek, decode regime so endpoints only):
+          decode_exposed: FB 2.5% ~= mesh 2.6% (EP16), 4.5 ~= 4.8 (EP32);
+          RING 19.9% (EP16) -> 40.4% (EP32) — diameter laid BARE (verified: ring
+          diameter 16 hops * msg/512 * 61 layers * 2 ~ 27 ms exposed @ EP32).
+        => Stripping the fat-link crutch crushes low-radix RING and removes FB's
+        penalty. decode still can't separate FB-vs-mesh (compute-bound ~2.5%);
+        the FB<mesh separation needs PREFILL+iso-per-link (PENDING run:
+        EQBW=512 run_topo_prefill_hpc.sh).
+
+    (iii) ANALYTICAL avg-hop (topo_project.py): FB diameter ->2, Dragonfly ->3
+        (scale-FLAT); Torus/Mesh ~sqrt(N), Ring ~N/4 (DIVERGE). FB lowest
+        throughout; at N=256 FB 1x / Dragonfly 1.5x / Torus 3.9x / Mesh 5.2x /
+        Ring 31.5x. Congestion-unaware ASTRA's per-pair send == avg-hop model, so
+        this projection is faithful and sidesteps the bandwidth-bound measured limit.
+
+    *** FRAMING (confirmed direction) ***
+    "Under an artificial equal-budget cap, glass's wiring abundance is hidden and
+     mesh/ring stay competitive. Under equal per-link bandwidth — what glass
+     actually enables (abundant cheap long links) — high-radix FB dominates while
+     low-radix ring cannot exploit the abundance. FB is the glass-optimal topology."
+    Supporting sub-claims: FB is diameter-optimal (2, below even Dragonfly's 3) AND
+    uniquely in-package glass-realizable (long uniform row/col links need glass 3D
+    distance-layered routing; Dragonfly globals are inter-package cables). RING is
+    the cautionary opposite — it cannot exploit glass's abundance. Contribution =
+    feasibility + Pareto positioning, NOT a naive "FB beats mesh at any cost".
+
+5D. ENERGY (post-hoc energy_model.py). Glass interconnect energy is a small
+    fraction of NVSwitch on the LINK component; combined with faster completion the
+    TOTAL energy-per-token favors glass at scale. (Re-run pending under the
+    H100-consistent baseline; --baseline h100. Needs a defensible NVSwitch W cite.)
+
+5E. SLO / Pareto (aiconfigurator axes: x = tok/s/user = 1000/TPOT, y = tok/s/GPU).
+    DEFERRED to TP=8 — at TP=1 the dense/MLA compute is unsharded so TPOT ~35 ms ->
+    interactivity ~28 tok/s/user, below AFD's ~100+. The RELATIVE ordering is
+    TP-robust but ABSOLUTE interactivity needs TP=8 (see Sec 7).
+
+--------------------------------------------------------------------------------
+6. KEY MODELING DECISIONS & REVISIONS (threats-to-validity / methodology section)
+--------------------------------------------------------------------------------
+(a) MLA KV fix (CRITICAL, this session). DeepSeek/Kimi KV was modeled as MHA
+    (2*kv_dim = 32768/tok/layer) — a 57x OVER-count. MLA stores a compressed latent
+    (kv_lora_rank 512 + qk_rope_head_dim 64 = 576/tok/layer, replicated, no
+    //num_npus). Fixed in memory_model get_kv / full_cluster_kv_bytes_per_token and
+    calculate_sizes('qkv_proj') (MLA q_a/kv_a/kv_b branch, 5x weight over-count
+    also fixed). Result: DeepSeek now FITS at EP>=16 (EP8 ~199 GB, EP16 113, EP32
+    67, EP128 38). Qwen (GQA) path unchanged. MLA_KV_OFF env toggle kept for A/B.
+    Must keep dense/GQA/MLA ALL working (not MLA-only).
+(b) Congestion-unaware acceptance (CRITICAL reframe). ASTRA divides collective
+    volume by domain count and has no link contention -> measured end-to-end can't
+    show the IB/topology bandwidth advantage. This is STANDARD (aiconfigurator does
+    the same). Pivot: ANALYTICAL collective-latency / avg-hop headline + MEASURED
+    as supporting (resolves endpoints: ring loses, FB best at iso-per-link).
+(c) H100-consistent baseline (this session). Switched primary NVLink baseline from
+    GB200 NVL72 (900/domain64) to H100 NVLink4 (450/domain8) because compute is
+    H100-profiled; GB200 kept as forward-looking sensitivity. --nvl72-bw/--nvl72-
+    rack/--baseline flags.
+(d) Metric pivot to collective-latency / prefill exposed (this session). Decode
+    TPOT hides the fabric (comm ~5% of a compute-bound step). 1st-class metric =
+    collective latency / exposed comm, measured in PREFILL (large msgs expose
+    diameter). plot_collective.py adds prefill_exposed / prefill_tpot metrics.
+(e) Phase-split robustness (this session). The decode/prefill split flipped phase
+    across fabrics 3x (median-guard -> min-anchor -> mode-on-spread). Final: small-
+    cluster MEDIAN + core-band [0.5,1.5]x. Locked by test_phase_split.py.
+(f) TP>1 deadlock scope. TP>1 deadlocks ONLY the dp_group MULTI-INSTANCE path
+    (cross-instance .et stream misalign). Single-instance TP+EP (ViBE 8-GPU
+    num_npus=8/tp8/ep8) WORKS — needs only tp8 profiling. Topology comparison is
+    inherently multi-instance (panel of instances) -> TP=1 only.
+(g) Older fixes retained: glass inter-panel Ring->FullyConnected (optical switch =
+    1 hop, bandwidth-bound, not hop-count); within+cross a2a legs; add_done DP+EP
+    completion flag (bench-vs-vLLM EP=2 TPOT +1.1%); EP128 needs HPC (OOM, .et graph
+    super-linear in NPU count); float comm_size wrapped int() for the re-parser.
+
+--------------------------------------------------------------------------------
+7. TP SCOPE (why most absolute numbers are TP=1, what TP=8 unlocks)
+--------------------------------------------------------------------------------
+- Topology comparison = a PANEL of single-GPU instances => inherently multi-
+  instance => TP=1 (TP>1 multi-instance deadlocks, 6f). The RELATIVE topology
+  ordering (ring loses; FB-vs-mesh) is TP-ROBUST, so the topology headline is valid
+  at TP=1.
+- Absolute step times are TP=1-INFLATED: decode ~35 ms (weight-load), prefill chunk
+  ~290 ms (compute) -> interactivity ~28 tok/s/user. TP=8 shards dense/MLA -> ~8x
+  lower -> production-realistic interactivity / SLO.
+- DEFERRED to when TP=8 profiling lands: ViBE single-instance tp8/ep8 serving runs,
+  SLO/Pareto absolute interactivity (run_slo_hpc.sh, run_exposed_batch_hpc.sh).
+  configs/cluster/vibe_tp8_ep8_{deepseek,qwen}.json are ready. Multi-panel TP>1
+  would additionally need the deadlock fix (option B: single-instance multi-dim).
+
+--------------------------------------------------------------------------------
+8. FIGURE PLAN & STATUS
+--------------------------------------------------------------------------------
+  F-TOPO (HEADLINE, glass-only switchless):
+    Fa  avg-hop vs scale (ANALYTICAL, topo_project)   FB flat / ring diverge   READY
+    Fb  prefill_exposed vs EP, iso-budget (MEASURED)  ring loses, FB~mesh      DONE EP16/32/64
+    Fc  prefill_exposed vs EP, iso-per-link (MEASURED) FB<mesh, ring crushed   PENDING (EQBW=512 prefill)
+    Fd  iso-budget vs iso-per-link contrast (the 4-quadrant story)             compose from Fb+Fc
+  F-FABRIC (FB vs NVL72):
+    a2a collective latency vs EP (ANALYTICAL, ~10x)   plot_collective --metric a2a   needs reach CSV
+    energy-per-token (post-hoc energy_model.py)        --baseline h100               needs NVSwitch W
+  F-FEASIBILITY: N_WG vs micro-bump cap (plot_feasibility.py, wg_budget.py)     DONE
+  F-PARETO / SLO (aiconfigurator axes)                                          DEFER TP=8
+  F-ROBUSTNESS: prefill/decode matrix (test_prefill_decode_hpc.sh)             sanity, re-run w/ phase-aware
+  Figures land in outputs/paper_figures/ (gitignored, local; HPC mirrors via git).
+
+--------------------------------------------------------------------------------
+9. CAVEATS / LIMITATIONS (disclose)
+--------------------------------------------------------------------------------
+- Congestion-unaware backend: measured end-to-end is bandwidth/avg-hop, no link
+  contention -> measured glass~=NVL72 parity; fabric/topology advantage argued
+  analytically + structurally. (Same as aiconfigurator.)
+- TP=1 for topology/absolute numbers (TP>1 multi-instance deadlocks). Absolute
+  TPOT/interactivity inflated ~8x vs TP=8; the glass:baseline RATIO / topology
+  ORDERING is the result. SLO absolutes deferred to TP=8.
+- Controlled-burst TTFT = queue artifact; use prefill_step_ms + Poisson slo_eval.
+- Engine validated vs real vLLM only at EP=2 (+1.1% TPOT); EP>2 are projections.
+- iso-budget vs iso-per-link are TWO fairness lenses; we report BOTH and argue the
+  glass premise (cheap abundant links) justifies iso-per-link as the operative one.
+- Energy/power constants first-cut/cited (PanelScale, datasheets) — TUNE; NVSwitch
+  W needs a firm cite.
+
+--------------------------------------------------------------------------------
+10. KEY SCRIPTS (branch research/asp-dac-2027)
+--------------------------------------------------------------------------------
+  sweep_panel_dse.py        topo_compare / batch / epscale sweeps; --equal-link-bw,
+                            --nvl72-bw/--nvl72-rack, --agg-bw, phase-aware parse
+  run_topo_prefill_hpc.sh   topology PREFILL (diameter exposed); EQBW= for iso-per-link
+  run_topo_scale_hpc.sh     topology decode vs scale; EQBW= for iso-per-link
+  run_topo_pareto_hpc.sh    topology decode Pareto (batch sweep)
+  topo_project.py           analytical avg-hop projection (measured anchors + 64-256)
+  plot_collective.py        --metric {a2a, exposed, prefill_exposed, prefill_tpot}
+  plot_pareto.py            aiconfigurator axes (--decode-only, --ttft-budget)
+  plot_step_breakdown.py    compute-vs-comm stacked (--phase decode|prefill)
+  plot_feasibility.py / wg_budget.py   N_WG vs micro-bump cap
+  energy_model.py           post-hoc interconnect energy (--baseline h100|gb200)
+  test_phase_split.py       regression test for the decode/prefill split
+  run_slo_hpc.sh / run_exposed_batch_hpc.sh   serving (DEFERRED to TP=8)
+  Sim core changed: serving/core/{memory_model,config_builder,trace_generator}.py
+  (MLA KV/weights, mesh_2d/torus_2d/ring_1d topologies, within+cross a2a,
+  FullyConnected inter-panel), serving/__main__.py. ASTRA C++ Mesh2D/Torus2D added
+  via astra_sim_overlay/ (apply_astra_overlay.sh on HPC).
+
+--------------------------------------------------------------------------------
+11. IMMEDIATE NEXT (this session's open thread)
+--------------------------------------------------------------------------------
+- RUN (HPC, TP=1): EQBW=512 run_topo_prefill_hpc.sh  <- fills Fc (FB<mesh, iso-per-
+  link prefill); the one measured run that shows FB's diameter win.
+- RUN: iso-budget topo_scale decode (companion), test_prefill_decode robustness.
+- LOCAL: topo_project avg-hop headline (Fa); plot_collective --metric prefill_exposed
+  on iso-budget (Fb) and iso-per-link (Fc) CSVs (ring dominates y-axis -> may need
+  log-y / ring-separate panel in plot_collective).
+- DEFER to TP=8 profiling: SLO/Pareto absolutes, ViBE tp8/ep8 serving.
+================================================================================
