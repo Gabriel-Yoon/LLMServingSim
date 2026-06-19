@@ -22,12 +22,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PANEL="4 4"; WG=8; RACK=8; NVLBW=450; INTER_BW=512   # H100-consistent: NVLink4 450, HGX domain 8   # --fixed-wg = TOTAL bundle (even); x8 = per-dir 4 = 512 GB/s, feasible 4x4 floor
-NREQ=96           # requests per QPS point (sim cost ~ NREQ x MAXOSL iterations)
-MAXOSL=24         # cap decode tokens: steady TPOT is reached in a few tokens, so
-                  # this bounds per-run iterations without changing per-token latency.
-                  # (Sonnet's native 128-out x 256 reqs x low QPS = ~10^4 iters = effective hang.)
-TIMEOUT=10800     # 3h per (model,ds,ep,pd,qps-list) invocation
-MEMGB=1024
+NREQ="${NREQ:-96}"        # requests per QPS point (sim cost ~ NREQ x MAXOSL iterations)
+MAXOSL="${MAXOSL:-24}"    # cap decode tokens. MAXOSL=24 = fast steady-TPOT view (bounds
+                  # iterations); MAXOSL=128 = full Sonnet output -> requests linger ~5x
+                  # longer -> ViBE-comparable sustainable QPS (slower; A/B with 24).
+TIMEOUT="${TIMEOUT:-10800}"     # 3h per (model,ds,ep,pd,qps-list) invocation
+MEMGB="${MEMGB:-1024}"    # fake-large isolates interconnect at EP8 (DeepSeek dense replicated
+                  # at TP=1 ~200GB). At large EP (experts shard) set MEMGB=80 for realistic
+                  # KV-admission pressure (ViBE-like).
 
 # QPS lists below are the EP=8 baseline (cluster-wide). They are SCALED by ep/8
 # inside run() so the PER-INSTANCE load stays constant across EP. Without this,
@@ -37,7 +39,7 @@ MEMGB=1024
 # ep128 stalled purely from this starvation, not prefill — ep8 did full prefill.)
 run () {
   local model="$1" tag="$2" ds="$3" pd="$4" ep="$5" qps="$6"
-  local out="outputs/slo_eval/${tag}_${ds}_${pd}_ep${ep}.csv"
+  local out="outputs/slo_eval/${tag}_${ds}_${pd}_ep${ep}_osl${MAXOSL}.csv"
   # Resumable: skip configs whose CSV already exists (header + >=1 row), so a
   # re-run only does the missing ones and never overwrites good data. ep8 params
   # are unchanged by the EP-scaling (f=1), so those CSVs stay valid. FORCE=1 to
