@@ -61,7 +61,7 @@ def _max_qps_at_target(rows):
     return max(ok) if ok else None
 
 
-def plot_qps(by_fab, ctx, path, title):
+def plot_qps(by_fab, ctx, path, title, qps_div=1.0, qps_label="QPS (cluster)"):
     pd_mode = ctx.get("pd_mode")
     has_ttft = _has(by_fab, "ttft_p50") and pd_mode != "decode"
     has_tpot = _has(by_fab, "tpot_p50") and pd_mode != "prefill"
@@ -72,7 +72,7 @@ def plot_qps(by_fab, ctx, path, title):
 
     for ax, kind in zip(axes, panels):
         for fab, rows in by_fab.items():
-            xs = [_f(r["qps"]) for r in rows]
+            xs = [(_f(r["qps"]) or 0) / qps_div for r in rows]
             c = COLOR[fab]
             if kind == "goodput":
                 ys = [(_f(r.get("goodput")) or 0) * 100 for r in rows]
@@ -91,7 +91,7 @@ def plot_qps(by_fab, ctx, path, title):
             for fab, rows in by_fab.items():
                 q = _max_qps_at_target(rows)
                 if q is not None:
-                    ax.axvline(q, color=COLOR[fab], ls=":", lw=1.0, alpha=0.6)
+                    ax.axvline(q / qps_div, color=COLOR[fab], ls=":", lw=1.0, alpha=0.6)
         else:
             slo = ctx.get(f"{kind}_slo")
             if slo:
@@ -99,7 +99,7 @@ def plot_qps(by_fab, ctx, path, title):
             ax.set_ylabel(f"{kind.upper()} [ms] (lower=better)")
             ax.set_title(f"({'b' if kind=='ttft' else 'c'}) {kind.upper()} percentiles vs QPS")
             ax.set_ylim(bottom=0)
-        ax.set_xlabel("QPS per instance")
+        ax.set_xlabel(qps_label)
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
 
@@ -148,19 +148,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--mode", choices=["qps", "pareto"], default="qps")
+    ap.add_argument("--per-gpu", action="store_true",
+                    help="divide QPS by EP to show per-GPU/per-replica rate (=cluster/EP); "
+                         "use to align the x-axis with ViBE's per-engine req/s.")
     ap.add_argument("--name", default=None)
     args = ap.parse_args()
 
     by_fab, ctx = load(args.csv)
     if not by_fab:
         raise SystemExit(f"no ok rows in {args.csv}")
+    ep = int(float(ctx.get("ep") or 1))
+    qps_div = float(ep) if args.per_gpu else 1.0
+    qps_label = f"QPS per GPU (=cluster/{ep})" if args.per_gpu else "QPS (cluster)"
     base = os.path.splitext(os.path.basename(args.csv))[0]
     title = (f"{base}  (ds={ctx.get('dataset')}, pd={ctx.get('pd_mode')}, "
              f"ep={ctx.get('ep')})  glass-FB vs NVL72")
-    name = args.name or f"slo_{args.mode}_{base}"
+    name = args.name or f"slo_{args.mode}_{base}" + ("_pergpu" if args.per_gpu else "")
     path = os.path.join(OUT, name + ".png")
     if args.mode == "qps":
-        plot_qps(by_fab, ctx, path, title)
+        plot_qps(by_fab, ctx, path, title, qps_div=qps_div, qps_label=qps_label)
     else:
         plot_pareto(by_fab, ctx, path, title)
 
