@@ -3,12 +3,12 @@ vllm_version: 0.19.0
 cuda_version: '12.8'
 gpu: NVIDIA H200
 hardware: H200
-profiled_at: '2026-06-13T03:03:30+00:00'
+profiled_at: '2026-06-19T02:13:15+00:00'
 architecture: deepseek_v3
 architecture_sha256: 43990bd02d1e36a57bfea86807d737fe767d8a4340e27ebd12758baaa51cfa11
 model: deepseek-ai/DeepSeek-V3-0324
 variant: bf16
-tp_degrees: [1, 2, 4]
+tp_degrees: [1, 8]
 engine_effective:
   load_format: dummy
   enforce_eager: true
@@ -23,19 +23,19 @@ engine_effective:
   hf_overrides:
     num_hidden_layers: 1
     first_k_dense_replace: 0
-    intermediate_size: 4608
-    num_attention_heads: 32
-    num_key_value_heads: 32
-    vocab_size: 32320
+    intermediate_size: 2304
+    num_attention_heads: 16
+    num_key_value_heads: 16
+    vocab_size: 16160
   worker_extension_cls: profiler.core.hooks.extension.Extension
-  model: /tmp/profiler_model__b079qog
+  model: /tmp/profiler_model_e72_dho7
 attention_grid:
-  max_kv: 32768
+  max_kv: 16384
   chunk_factor: 2.0
   kv_factor: 2.0
   chunks: 0, 16-2048 x2
   n_decode: 0, 1-256 x2
-  kv: 0, 16-32768 x2
+  kv: 0, 16-16384 x2
 measurement_iterations: 3
 skew_profile:
   enabled: true
@@ -48,21 +48,11 @@ skew_profile:
     n: 2-256 x2
     ratio: [0.0625, 0.125, 0.25, 0.5, 0.75, 0.9]
     pc: 0, 16-2048 x2
-    kp: 0, 512-16384 x2
-    kvs: 128-32768 x2
+    kp: 0, 512-8192 x2
+    kvs: 128-16384 x2
     skew_rep: 4.0
 skew_fit:
   enabled: true
-  bucket_axes:
-    pc: raw pc value (profiled grid point)
-    n_bins: [0, 2, 4, 8, 16, 32, 64, 128, 256, 1000000]
-    n_labels: [n<=2, n<=4, n<=8, n<=16, n<=32, n<=64, n<=128, n<=256, n>256]
-    skew_rate_bins: [-0.01, 0.05, 0.15, 0.4, 0.7, 1.01]
-    skew_rate_labels: [sr<=5%, sr<=15%, sr<=40%, sr<=70%, sr>70%]
-    kv_big_bins: [0, 1024, 4096, 16384, 32768, 1000000000]
-    kv_big_labels: [kvB<=1k, kvB<=4k, kvB<=16k, kvB<=32k, kvB>32k]
-    kp_bins: [-1, 0, 512, 1024, 2048, 4096, 8192, 16384, 1000000000]
-    kp_labels: [kp=0, kp<=512, kp<=1k, kp<=2k, kp<=4k, kp<=8k, kp<=16k, kp>16k]
   per_tp:
     1:
       method: per_bucket_wls_5axis
@@ -73,21 +63,32 @@ skew_fit:
       rel_err_p90: 0.0301
       rel_err_p99: 0.1084
       signed_mean: 0.0011
-    2:
+      bucket_axes:
+        pc: raw pc value (profiled grid point)
+        n_bins: [0, 2, 4, 8, 16, 32, 64, 128, 256, 1000000]
+        n_labels: [n<=2, n<=4, n<=8, n<=16, n<=32, n<=64, n<=128, n<=256, n>256]
+        skew_rate_bins: [-0.01, 0.05, 0.15, 0.4, 0.7, 1.01]
+        skew_rate_labels: [sr<=5%, sr<=15%, sr<=40%, sr<=70%, sr>70%]
+        kv_big_bins: [0, 1024, 4096, 16384, 32768, 1000000000]
+        kv_big_labels: [kvB<=1k, kvB<=4k, kvB<=16k, kvB<=32k, kvB>32k]
+        kp_bins: [-1, 0, 512, 1024, 2048, 4096, 8192, 16384, 1000000000]
+        kp_labels: [kp=0, kp<=512, kp<=1k, kp<=2k, kp<=4k, kp<=8k, kp<=16k, kp>16k]
+    8:
       method: per_bucket_wls_5axis
-      n_samples: 16067
-      alpha_default: 0.4255
-      bucket_table: tp2/skew_fit.csv
-      rel_err_p50: 0.0031
-      rel_err_p90: 0.0383
-      rel_err_p99: 0.1343
-      signed_mean: 0.0015
-    4:
-      method: per_bucket_wls_5axis
-      n_samples: 16133
-      alpha_default: 0.3344
-      bucket_table: tp4/skew_fit.csv
-      rel_err_p50: 0.0046
-      rel_err_p90: 0.0514
-      rel_err_p99: 0.1683
-      signed_mean: 0.002
+      n_samples: 11785
+      alpha_default: 0.2589
+      bucket_table: tp8/skew_fit.csv
+      rel_err_p50: 0.0073
+      rel_err_p90: 0.0599
+      rel_err_p99: 0.1937
+      signed_mean: 0.0029
+      bucket_axes:
+        pc: raw pc value (profiled grid point)
+        n_bins: [0, 2, 4, 8, 16, 32, 64, 128, 256, 1000000]
+        n_labels: [n<=2, n<=4, n<=8, n<=16, n<=32, n<=64, n<=128, n<=256, n>256]
+        skew_rate_bins: [-0.01, 0.05, 0.15, 0.4, 0.7, 1.01]
+        skew_rate_labels: [sr<=5%, sr<=15%, sr<=40%, sr<=70%, sr>70%]
+        kv_big_bins: [0, 1024, 4096, 16384, 1000000000]
+        kv_big_labels: [kvB<=1k, kvB<=4k, kvB<=16k, kvB>16k]
+        kp_bins: [-1, 0, 512, 1024, 2048, 4096, 8192, 1000000000]
+        kp_labels: [kp=0, kp<=512, kp<=1k, kp<=2k, kp<=4k, kp<=8k, kp>8k]
