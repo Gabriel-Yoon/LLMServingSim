@@ -32,6 +32,7 @@ OSL="${OSL:-2}"               # short decode tail (phase parser isolates the pre
 MTOK="${MTOK:-2048}"
 BPI="${BPI:-8}"               # a few requests to fill the pipeline (prefill cost is per-chunk)
 TIMEOUT="${TIMEOUT:-14400}"
+EQBW="${EQBW:-}"              # set EQBW=512 for the iso-per-link ablation (pure diameter)
 export MOE_ALLTOALL="${MOE_ALLTOALL:-1}"
 MTAG=$(echo "$MODEL" | sed 's#.*/##; s/[^A-Za-z0-9]/_/g' | tr 'A-Z' 'a-z')
 
@@ -42,11 +43,13 @@ PANELS=("${PANELS[@]//,/ }")
 
 for pc in "${PANELS[@]}"; do
   ep="${pc%%:*}"; rc="${pc#*:}"
-  out="outputs/panel_dse/topo_prefill_${MTAG}_ep${ep}.csv"
+  tag="isobudget"; eqarg=""
+  if [ -n "$EQBW" ]; then tag="isobw_${EQBW}"; eqarg="--equal-link-bw $EQBW"; fi
+  out="outputs/panel_dse/topo_prefill_${MTAG}_ep${ep}_${tag}.csv"
   if [ -s "$out" ] && [ "$(wc -l < "$out")" -gt 1 ]; then echo "SKIP $out"; continue; fi
-  echo "=== topo PREFILL EP=$ep panel ${rc} ($MTAG, chunk=$MTOK) {$TOPOS} ==="
+  echo "=== topo PREFILL EP=$ep panel ${rc} ($MTAG, chunk=$MTOK, $tag) {$TOPOS} ==="
   python scripts/sweep_panel_dse.py --sweep topo_compare \
-    --topologies $TOPOS --ep-list "$ep" --epscale-panel ${rc} --wg-budget $WGB \
+    --topologies $TOPOS --ep-list "$ep" --epscale-panel ${rc} --wg-budget $WGB $eqarg \
     --batch-per-instance $BPI --isl "$ISL" --osl "$OSL" --max-tokens "$MTOK" \
     --model "$MODEL" --hardware H100 --tp 1 --npu-mem-gb $MEM --timeout $TIMEOUT \
     --out "$out" 2>&1 | grep -iE "topo_|error|exceed|Waiting" | tail -8
@@ -55,5 +58,5 @@ done
 echo ""
 echo "=== topo PREFILL done. Plot the diameter signal (prefill exposed, all 5 topologies): ==="
 echo "  python scripts/plot_collective.py --metric prefill_exposed \\"
-echo "    outputs/panel_dse/topo_prefill_${MTAG}_ep*.csv \\"
-echo "    --title 'Topology prefill exposed comm vs scale ($MTAG)' --out outputs/paper_figures/fig_topo_prefill_${MTAG}.png"
+echo "    outputs/panel_dse/topo_prefill_${MTAG}_ep*_${tag}.csv \\"
+echo "    --title 'Topology prefill exposed comm vs scale ($MTAG, $tag)' --out outputs/paper_figures/fig_topo_prefill_${MTAG}_${tag}.png"
