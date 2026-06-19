@@ -17,20 +17,26 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-EP_LIST="8 32 64 128"
-PANEL="4 4"; WG=8; RACK=64   # --fixed-wg = TOTAL bundle (x8 = per-direction 4 = 512 GB/s, feasible 4x4 floor)
-ISL=2048          # large prompt -> large prefill MoE all-to-all
-OSL=4             # few decode steps (prefill is the focus; TTFT is the metric)
-MAXTOK=8192       # prefill chunk budget >= ISL -> one big chunk -> full 2048-token a2a
-BATCH=8
-MEM=1024
-TIMEOUT=10800
+# H100-CONSISTENT by default (compute is H100-profiled): NVLink4 450, HGX domain 8,
+# cross-island IB 50 -> cliff at EP>8. GB200 sensitivity: RACK=64 NVLBW=900.
+# METRIC: report MEASURED exposed comm (exposed_frac x step) — the prefill a2a is
+# large, so the cross-domain leg (glass optical 512 vs NVL72 IB 50) shows in the
+# comm time even though end-to-end TPOT is compute-bound parity. (TTFT is queue-
+# inflated; use exposed comm / step a2a.)
+EP_LIST="${EP_LIST:-8 16 32 64 128}"
+PANEL="${PANEL:-4 4}"; WG="${WG:-8}"; RACK="${RACK:-8}"; NVLBW="${NVLBW:-450}"
+ISL="${ISL:-2048}"          # large prompt -> large prefill MoE all-to-all
+OSL="${OSL:-4}"
+MAXTOK="${MAXTOK:-8192}"     # chunk budget >= ISL -> one big chunk -> full a2a
+BATCH="${BATCH:-8}"
+MEM="${MEM:-1024}"
+TIMEOUT="${TIMEOUT:-10800}"
 
 run_model () {
   local model="$1" tag="$2" aggflag="$3" suffix="$4"
-  echo "=== PREFILL reach ($suffix): $model ==="
+  echo "=== PREFILL reach ($suffix): $model  (rack=$RACK nvlbw=$NVLBW) ==="
   MOE_ALLTOALL=1 python scripts/sweep_panel_dse.py --sweep epscale \
-    --ep-list $EP_LIST --nvl72-rack $RACK --epscale-panel $PANEL --fixed-wg $WG \
+    --ep-list $EP_LIST --nvl72-rack $RACK --nvl72-bw $NVLBW --epscale-panel $PANEL --fixed-wg $WG \
     --batch-per-instance $BATCH --isl $ISL --osl $OSL --max-tokens $MAXTOK \
     --mode controlled $aggflag \
     --model "$model" --hardware H100 --tp 1 --npu-mem-gb $MEM \
