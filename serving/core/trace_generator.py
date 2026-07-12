@@ -1175,6 +1175,25 @@ def _emit_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batch_tag):
                         comm_type=_with_dim(comm_type, ctx.tp_dim), comm_size=comm_size)
         else:
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num)
+        if layer_name == "qkv_proj" and ctx.pd_type == 'prefill':
+            _emit_kv_send(ctx, bctx, lines, batch_tag)
+
+
+def _emit_kv_send(ctx, bctx, lines, batch_tag):
+    """Emit a zero-compute ``kv_send`` marker after qkv_proj on prefill
+    instances. The Chakra converter turns it into a point-to-point
+    COMM_SEND to the paired decode-side NPU, sized as this rank's K+V
+    bytes for the tokens computed in this chunk (layer-wise streaming
+    KV transfer). Size excludes the Q projection, unlike the qkv_proj
+    activation itself.
+    """
+    kv_bytes = 2 * ctx.kv_head * ctx.head_dim * bctx.total_len * ctx.fp // max(ctx.tp_size, 1)
+    if kv_bytes <= 0:
+        return
+    lines.append(formatter("kv_send", '0',
+                           'LOCAL', '0', 'LOCAL', '0',
+                           'LOCAL', str(kv_bytes),
+                           'NONE', '0', batch_tag))
 
 
 def _emit_pre_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_tag='NONE'):

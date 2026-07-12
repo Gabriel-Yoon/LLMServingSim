@@ -129,13 +129,48 @@ def _resolve_parallelism(instance, model_config):
     return num_npus, tp_size, pp_size, ep_size, dp_group
 
 
-def _resolve_dp_groups(all_instances):
+def _resolve_hybrid_fabric(cluster_config):
+    """Parse and validate the optional top-level ``hybrid_fabric`` section.
+
+    Schema:
+        "hybrid_fabric": {"copper_domain_size": <int>}
+
+    When present, the ASTRA-Sim topology is forced to two dimensions:
+    dim 0 = intra-domain (copper/electrical, size = copper_domain_size),
+    dim 1 = inter-domain (optical). ``link_bw`` / ``link_latency`` must
+    then be 2-element lists ([copper, optical]).
+    """
+    hybrid = cluster_config.get("hybrid_fabric")
+    if hybrid is None:
+        return None
+    if "copper_domain_size" not in hybrid:
+        raise KeyError("'hybrid_fabric' requires 'copper_domain_size'.")
+    d = int(hybrid["copper_domain_size"])
+    if d < 1:
+        raise ValueError(f"copper_domain_size must be >= 1, got {d}")
+    for key in ("link_bw", "link_latency"):
+        if not isinstance(cluster_config.get(key), list):
+            raise ValueError(
+                f"'{key}' must be a 2-element list [copper, optical] when "
+                f"'hybrid_fabric' is set."
+            )
+    return {"copper_domain_size": d}
+
+
+def _resolve_dp_groups(all_instances, hybrid=None):
     """Validate DP groups and compute dp_group_size and ep_total for each instance."""
     dp_groups = {}
     for inst in all_instances:
         dg = inst.get("dp_group")
         if dg is not None:
             dp_groups.setdefault(dg, []).append(inst)
+
+    if hybrid is not None and dp_groups:
+        raise NotImplementedError(
+            "'hybrid_fabric' with DP groups is not supported yet — the "
+            "2-dim hybrid topology would conflict with the [tp, dp] "
+            "topology used by DP groups."
+        )
 
     for group_name, members in dp_groups.items():
         # All members must have same tp_size and ep_size
@@ -175,7 +210,7 @@ def _resolve_dp_groups(all_instances):
     # Non-DP instances. Independent multi-instance configs still use a
     # multi-dimensional topology ([tp_size, num_groups]); local collectives
     # must be scoped to dim 0 so they do not cross instance/PP groups.
-    network_dims = _compute_network_dims(all_instances)
+    network_dims = _compute_network_dims(all_instances, hybrid)
     local_dim = None
     if len(network_dims) > 1:
         local_dim = [True] + [False] * (len(network_dims) - 1)
@@ -185,12 +220,48 @@ def _resolve_dp_groups(all_instances):
             inst["dp_group_size"] = 1
             inst["local_ep"] = inst["ep_size"]
             inst["ep_total"] = inst["ep_size"]
-            inst["tp_dim"] = local_dim
-            inst["ep_dim"] = local_dim if inst["ep_size"] > 1 else None
+            if hybrid is not None and len(network_dims) > 1:
+                # Hybrid fabric: a collective spans the optical dim (dim 1)
+                # iff its parallelism degree exceeds the copper domain size.
+                d = hybrid["copper_domain_size"]
+                inst["tp_dim"] = [True, True] if inst["tp_size"] > d else [True, False]
+                if inst["ep_size"] > 1:
+                    inst["ep_dim"] = [True, True] if inst["local_ep"] > d else [True, False]
+                else:
+                    inst["ep_dim"] = None
+                if inst["tp_size"] > d and inst["tp_size"] % d != 0:
+                    raise ValueError(
+                        f"tp_size ({inst['tp_size']}) spanning copper domains "
+                        f"must be a multiple of copper_domain_size ({d})."
+                    )
+            else:
+                inst["tp_dim"] = local_dim
+                inst["ep_dim"] = local_dim if inst["ep_size"] > 1 else None
 
 
-def _compute_network_dims(instances):
+def _compute_network_dims(instances, hybrid=None):
     """Infer ASTRA-Sim topology dimensions from resolved instances."""
+    if hybrid is not None:
+        # Hybrid copper-optical fabric: dim 0 = intra copper domain,
+        # dim 1 = inter-domain optical plane. NPU ids are laid out with
+        # dim 0 innermost (ASTRA-Sim translate_address), so consecutive
+        # blocks of copper_domain_size NPUs form one copper domain.
+        d = hybrid["copper_domain_size"]
+        total_npu = sum(
+            inst["num_npus"] if inst.get("pd_type") != "prefill"
+            else inst["num_npus"] * 2
+            for inst in instances
+        )
+        if total_npu % d != 0:
+            raise ValueError(
+                f"Total NPU count ({total_npu}, incl. prefill sender NPUs) "
+                f"must be a multiple of copper_domain_size ({d})."
+            )
+        dims = [d, total_npu // d]
+        while len(dims) > 1 and dims[-1] == 1:
+            dims.pop()
+        return dims
+
     dp_groups = {}
     for inst in instances:
         dg = inst.get("dp_group")
@@ -256,12 +327,12 @@ def _normalize_network_dim_values(raw_value, num_dims, field_name):
         ) from exc
 
 
-def _sync_system_collective_dims(system_config_path, instances):
+def _sync_system_collective_dims(system_config_path, instances, hybrid=None):
     """Match system collective implementation arity to final topology dims."""
     with open(system_config_path) as f:
         system_config = json.load(f)
 
-    num_dims = len(_compute_network_dims(instances))
+    num_dims = len(_compute_network_dims(instances, hybrid))
     for key in _COLLECTIVE_IMPL_KEYS:
         system_config[key] = ["ring"] * num_dims
 
@@ -625,15 +696,32 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         for inst in total_instances
     )
 
+    # Resolve the optional hybrid copper-optical fabric section.
+    hybrid = _resolve_hybrid_fabric(cluster_config)
+
     # Resolve DP groups across all instances.
-    _resolve_dp_groups(total_instances)
+    _resolve_dp_groups(total_instances, hybrid)
+
+    if hybrid is not None:
+        # Instances whose collectives span the optical dim must start on a
+        # copper-domain boundary, or the dim-0/dim-1 scoping is meaningless.
+        d = hybrid["copper_domain_size"]
+        for inst in total_instances:
+            start_npu = inst2npu_mapping[inst["instance_id"]]
+            if inst["tp_size"] > d and start_npu % d != 0:
+                logger.warning(
+                    "Instance %d starts at NPU %d, not on a copper-domain "
+                    "boundary (domain size %d) — collective dim scoping "
+                    "will not match physical domains.",
+                    inst["instance_id"], start_npu, d,
+                )
 
     # Keep collective implementation arity aligned with the final global
     # ASTRA-Sim topology, while preserving the default ring implementation.
-    _sync_system_collective_dims(system_config_path, total_instances)
+    _sync_system_collective_dims(system_config_path, total_instances, hybrid)
 
     # Generate the final ASTRA-Sim input files after all instances are known.
-    _create_network_config(network_config_path, total_instances, link_bw, link_latency)
+    _create_network_config(network_config_path, total_instances, link_bw, link_latency, hybrid)
     with open(memory_config_path, "w", encoding="utf-8") as f:
         json.dump(memory_config, f, ensure_ascii=False, indent=2)
     _validate_memory_config(memory_config_path, placement, enable_local_offloading)
@@ -669,15 +757,16 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     return cluster
 
 # generates topology according to the input arguments
-def _create_network_config(network_config_path, instances, link_bw, link_latency):
+def _create_network_config(network_config_path, instances, link_bw, link_latency, hybrid=None):
     """Create ASTRA-Sim network topology config.
 
     Topology dimensions:
       - For DP groups: [tp_size, dp_group_size] — dim 0 for TP ALLREDUCE, dim 1 for EP ALLTOALL
       - For independent instances: [tp_size, num_groups] — dim 0 for TP, dim 1 for PP/instances
       - Single GPU instances: [1]
+      - Hybrid fabric: [copper_domain_size, num_domains] — dim 0 copper, dim 1 optical
     """
-    dims = _compute_network_dims(instances)
+    dims = _compute_network_dims(instances, hybrid)
     num_dims = len(dims)
     topology_data = {
         "topology": FlowStyleList(["FullyConnected"] * num_dims),
