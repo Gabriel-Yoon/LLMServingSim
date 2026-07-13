@@ -24,7 +24,8 @@ from serving.core.trace_generator import *
 from serving.core.pim_model import *
 from serving.core.config_builder import *
 from serving.core.router import *
-from serving.core.circuit_scheduler import CircuitManager, PrefillEstimator, POLICIES as CIRCUIT_POLICIES
+from serving.core.circuit_scheduler import (CircuitManager, PrefillEstimator,
+    make_circuit_manager, ALL_POLICIES as CIRCUIT_POLICIES)
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
@@ -279,7 +280,8 @@ def main():
                         'after a successful simulation (default: enabled). Use --no-cleanup-inputs '
                         'to preserve generated trace files, Chakra workloads, and input configs for debugging')
     parser.add_argument('--circuit-policy', type=str, default=None,
-                        choices=['IDEAL', 'ROTOR', 'REACTIVE', 'PQPS'],
+                        choices=['IDEAL', 'ROTOR', 'REACTIVE', 'PQPS',
+                                 'NEGOTIATOR', 'BFF', 'QPSFIT'],
                         help='optical circuit scheduling policy for the hybrid fabric '
                         '(requires hybrid_fabric in the cluster config; default: off)')
     parser.add_argument('--optical-reconfig-ns', type=int, default=1_000_000,
@@ -288,6 +290,10 @@ def main():
                         help='PQPS reservation guard before estimated ready time (default: reconfig delay)')
     parser.add_argument('--rotor-slot-ns', type=int, default=None,
                         help='ROTOR slot length in ns (default max(10x reconfig, 100us))')
+    parser.add_argument('--circuit-slot-ns', type=int, default=None,
+                        help='slot length for NEGOTIATOR/BFF/QPSFIT (default max(15us, 2x reconfig))')
+    parser.add_argument('--circuit-slots-per-epoch', type=int, default=200,
+                        help='epoch quantization for BFF/QPSFIT (QPS-Fit default T=200)')
     parser.add_argument('--skip-prefill', action='store_true', default=False,
                         help='skip the prefill phase, running decode only')
     parser.add_argument('--num-reqs', type=int, default=0,
@@ -493,10 +499,12 @@ def main():
         domain_size = hybrid["copper_domain_size"]
         num_domains = (total_npu + domain_size - 1) // domain_size
         optical_bw = float(cluster["link_bw"][1])  # GB/s == bytes/ns
-        circuit_manager = CircuitManager(
-            num_domains, optical_bw, args.optical_reconfig_ns,
-            policy=args.circuit_policy, rotor_slot_ns=args.rotor_slot_ns,
-            resv_guard_ns=args.circuit_resv_guard_ns)
+        circuit_manager = make_circuit_manager(
+            args.circuit_policy, num_domains, optical_bw, args.optical_reconfig_ns,
+            rotor_slot_ns=args.rotor_slot_ns,
+            resv_guard_ns=args.circuit_resv_guard_ns,
+            slot_ns=args.circuit_slot_ns,
+            slots_per_epoch=args.circuit_slots_per_epoch)
         prefill_estimator = PrefillEstimator()
         inst_domain = {i: inst2npu_mapping[i] // domain_size for i in range(num_instances)}
         kv_bpt = full_cluster_kv_bytes_per_token(

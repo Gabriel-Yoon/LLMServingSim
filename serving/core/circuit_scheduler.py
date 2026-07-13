@@ -45,8 +45,18 @@ IDEAL = "IDEAL"
 ROTOR = "ROTOR"
 REACTIVE = "REACTIVE"
 PQPS = "PQPS"
+# Slotted/epoch-based baselines (QPS-Fit's own benchmark set; see
+# docs/evaluation-baselines.md and refs/papers/QPS-Fit.pdf):
+NEGOTIATOR = "NEGOTIATOR"   # NegotiaToR (SIGCOMM'24): per-slot binary
+                            # request/RR-grant, non-iterative
+BFF = "BFF"                 # Best-First-Fit (CLOUD'18): centralized epoch
+                            # batch, largest-first best-fit hole packing
+QPSFIT = "QPSFIT"           # QPS-Fit (CLOUD'25): epoch batch, QPS-sampled
+                            # request + First-Fit / Largest-Fit grant
 
 POLICIES = (IDEAL, ROTOR, REACTIVE, PQPS)
+SLOTTED_POLICIES = (NEGOTIATOR, BFF, QPSFIT)
+ALL_POLICIES = POLICIES + SLOTTED_POLICIES
 
 
 class PrefillEstimator:
@@ -340,3 +350,188 @@ class CircuitManager:
             "stall_mean_us": sum(stalls) / n / 1e3,
             "resv_hit_rate": (len(hits) / n) if self.policy == PQPS else None,
         }
+
+
+class SlottedCircuitManager:
+    """Epoch/slot-quantized circuit plane for the reactive baselines that
+    QPS-Fit itself benchmarks against (NegotiaToR, BFF) plus QPS-Fit.
+
+    Time is divided into slots of ``slot_ns``; BFF/QPSFIT batch demand
+    per epoch of ``slots_per_epoch`` slots (QPS-Fit defaults: 3 ms epoch,
+    T=200), while NEGOTIATOR grants slot-by-slot without batching but
+    pays a per-slot guardband and a scheduling-pipeline delay.
+
+    Faithfulness notes (documented approximations at domain granularity):
+    - BFF vs QPSFIT differ mainly in packing rule (best-fit, largest
+      demand first vs QPS-sampled first-fit with largest-fit fallback);
+      the original paper reports near-identical schedule quality, which
+      this abstraction reproduces. Their computational-cost difference
+      is irrelevant in simulation.
+    - Demand becomes schedulable at the first epoch boundary after it
+      arrives (the epoch-batching latency PQPS eliminates).
+    - NEGOTIATOR: non-iterative request/grant with RR arbitration is
+      approximated as FCFS port booking at slot granularity plus a
+      2-epoch scheduling-pipeline delay (paper section 5.4); each slot
+      pays the reconfiguration guardband, shrinking its usable share.
+    """
+
+    def __init__(self, num_domains, bw_bytes_per_ns, reconfig_ns,
+                 policy=QPSFIT, slot_ns=None, slots_per_epoch=200):
+        if policy not in SLOTTED_POLICIES:
+            raise ValueError(f"Unknown slotted policy '{policy}'")
+        self.n = num_domains
+        self.bw = float(bw_bytes_per_ns)
+        self.reconfig_ns = int(reconfig_ns)
+        self.policy = policy
+        # QPS-Fit quantizes a 3 ms epoch into 200 x 15 us slots and folds
+        # the reconfiguration delay into the slots an allocation needs.
+        # NegotiaToR instead needs the guardband to be a small fraction
+        # of the slot (paper: 10 ns guard per 60 ns slot), so its slot
+        # scales with the reconfiguration delay.
+        if slot_ns:
+            self.slot_ns = int(slot_ns)
+        elif policy == NEGOTIATOR:
+            self.slot_ns = max(15_000, 6 * self.reconfig_ns)
+        else:
+            self.slot_ns = 15_000
+        self.T = int(slots_per_epoch)
+        self.epoch_ns = self.slot_ns * self.T
+        self.out_slots = [set() for _ in range(num_domains)]  # occupied abs slot idx
+        self.in_slots = [set() for _ in range(num_domains)]
+        self._reservations = {}  # always empty: these baselines are reactive
+        self.stats = []
+
+    # predictive API: no-ops (these baselines are reactive by design)
+    def announce(self, *a, **k):
+        return
+
+    def reannounce(self, *a, **k):
+        return
+
+    def cancel(self, *a, **k):
+        return
+
+    def _free_runs(self, src, dst, first_slot, horizon_slots):
+        """Return (start, length) of maximal free runs in both ports'
+        slot maps within [first_slot, first_slot + horizon)."""
+        occ = self.out_slots[src] | self.in_slots[dst]
+        runs = []
+        run_start, run_len = None, 0
+        for s in range(first_slot, first_slot + horizon_slots):
+            if s in occ:
+                if run_start is not None:
+                    runs.append((run_start, run_len))
+                    run_start, run_len = None, 0
+            else:
+                if run_start is None:
+                    run_start = s
+                run_len += 1
+        if run_start is not None:
+            runs.append((run_start, run_len))
+        return runs
+
+    def _occupy_run(self, src, dst, start, length):
+        for s in range(start, start + length):
+            self.out_slots[src].add(s)
+            self.in_slots[dst].add(s)
+
+    def request_transfer(self, src, dst, nbytes, now_ns, req_id=None):
+        nbytes = int(nbytes)
+        if src == dst or nbytes <= 0:
+            self._log(req_id, src, dst, nbytes, now_ns, now_ns, 0)
+            return 0
+
+        if self.policy == NEGOTIATOR:
+            return self._negotiator(src, dst, nbytes, now_ns, req_id)
+        return self._epoch_fit(src, dst, nbytes, now_ns, req_id)
+
+    def _epoch_fit(self, src, dst, nbytes, now_ns, req_id):
+        """BFF / QPSFIT: demand joins the next epoch's batch; the grant
+        fits it into one contiguous hole of ceil((D/bw + delta)/slot)
+        slots (delta paid once), falling back to the largest hole with
+        the residual recursing into later epochs."""
+        need_ns = int(nbytes / self.bw) + self.reconfig_ns
+        need_slots = max(1, -(-need_ns // self.slot_ns))
+        # epoch batching: schedulable from the next epoch boundary
+        epoch_idx = now_ns // self.epoch_ns + 1
+        first_slot = epoch_idx * self.T
+        remaining = need_slots
+        first_alloc = None
+        guard = 0
+        while remaining > 0 and guard < 64:
+            guard += 1
+            runs = self._free_runs(src, dst, first_slot, self.T)
+            if not runs:
+                first_slot += self.T
+                continue
+            fitting = [r for r in runs if r[1] >= remaining]
+            if fitting:
+                if self.policy == BFF:
+                    # best-fit: tightest hole
+                    start, length = min(fitting, key=lambda r: r[1])
+                else:
+                    # QPS-Fit: first-fit
+                    start, length = fitting[0]
+                self._occupy_run(src, dst, start, remaining)
+                if first_alloc is None:
+                    first_alloc = start
+                remaining = 0
+            else:
+                # largest-fit: grant the biggest hole, residual re-requested
+                start, length = max(runs, key=lambda r: r[1])
+                self._occupy_run(src, dst, start, length)
+                if first_alloc is None:
+                    first_alloc = start
+                remaining -= length
+                first_slot += self.T
+        start_ns = first_alloc * self.slot_ns + self.reconfig_ns
+        self._log(req_id, src, dst, nbytes, now_ns, start_ns, self.reconfig_ns)
+        return int(start_ns - now_ns)
+
+    def _negotiator(self, src, dst, nbytes, now_ns, req_id):
+        """Slot-by-slot on-demand granting: per-slot guardband shrinks
+        the usable share; scheduling pipeline adds 2 slots (paper 5.4,
+        epochs there are slot-scale here)."""
+        usable_per_slot = max(1, self.slot_ns - self.reconfig_ns)
+        need_slots = max(1, -(-int(nbytes / self.bw) // usable_per_slot))
+        pipeline_ns = 2 * self.slot_ns
+        first_slot = (now_ns + pipeline_ns) // self.slot_ns + 1
+        occ = self.out_slots[src] | self.in_slots[dst]
+        got, s, first_alloc, guard = 0, first_slot, None, 0
+        while got < need_slots and guard < 1_000_000:
+            guard += 1
+            if s not in occ:
+                self.out_slots[src].add(s)
+                self.in_slots[dst].add(s)
+                if first_alloc is None:
+                    first_alloc = s
+                got += 1
+            s += 1
+        start_ns = first_alloc * self.slot_ns + self.reconfig_ns
+        self._log(req_id, src, dst, nbytes, now_ns, start_ns, self.reconfig_ns)
+        return int(start_ns - now_ns)
+
+    def _log(self, req_id, src, dst, nbytes, ready, start, setup_ns):
+        self.stats.append({
+            "req_id": req_id, "policy": self.policy, "src": src, "dst": dst,
+            "bytes": nbytes, "ready_ns": ready, "start_ns": start,
+            "stall_ns": start - ready, "setup_ns": setup_ns,
+            "resv_hit": None,
+        })
+
+    dump_stats = CircuitManager.dump_stats
+    summary = CircuitManager.summary
+
+
+def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
+                         rotor_slot_ns=None, resv_guard_ns=None,
+                         slot_ns=None, slots_per_epoch=200):
+    """Factory covering both the continuous-time policies (IDEAL, ROTOR,
+    REACTIVE, PQPS) and the slotted baselines (NEGOTIATOR, BFF, QPSFIT)."""
+    if policy in SLOTTED_POLICIES:
+        return SlottedCircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
+                                     policy=policy, slot_ns=slot_ns,
+                                     slots_per_epoch=slots_per_epoch)
+    return CircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
+                          policy=policy, rotor_slot_ns=rotor_slot_ns,
+                          resv_guard_ns=resv_guard_ns)
