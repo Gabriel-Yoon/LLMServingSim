@@ -24,6 +24,7 @@ from serving.core.trace_generator import *
 from serving.core.pim_model import *
 from serving.core.config_builder import *
 from serving.core.router import *
+from serving.core.circuit_scheduler import CircuitManager, PrefillEstimator, POLICIES as CIRCUIT_POLICIES
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
@@ -277,6 +278,16 @@ def main():
                         help='remove generated ASTRA-Sim inputs under astra-sim/inputs/runs/<run-id> '
                         'after a successful simulation (default: enabled). Use --no-cleanup-inputs '
                         'to preserve generated trace files, Chakra workloads, and input configs for debugging')
+    parser.add_argument('--circuit-policy', type=str, default=None,
+                        choices=['IDEAL', 'ROTOR', 'REACTIVE', 'PQPS'],
+                        help='optical circuit scheduling policy for the hybrid fabric '
+                        '(requires hybrid_fabric in the cluster config; default: off)')
+    parser.add_argument('--optical-reconfig-ns', type=int, default=1_000_000,
+                        help='OCS reconfiguration delay in ns (default 1 ms)')
+    parser.add_argument('--circuit-resv-guard-ns', type=int, default=None,
+                        help='PQPS reservation guard before estimated ready time (default: reconfig delay)')
+    parser.add_argument('--rotor-slot-ns', type=int, default=None,
+                        help='ROTOR slot length in ns (default max(10x reconfig, 100us))')
     parser.add_argument('--skip-prefill', action='store_true', default=False,
                         help='skip the prefill phase, running decode only')
     parser.add_argument('--num-reqs', type=int, default=0,
@@ -467,6 +478,34 @@ def main():
     controller = Controller(total_npu)
     # Global Request Router
     router = Router(num_instances, schedulers, num_req, request_routing_policy)
+
+    # Optical circuit plane (hybrid fabric): joint P/D placement with
+    # admission-time announcement + per-batch circuit stalls
+    circuit_manager = None
+    prefill_estimator = None
+    inst_domain = {}
+    prefill_dispatch_info = {}  # (instance_id, batch_id) -> (dispatch_ns, tokens)
+    if args.circuit_policy is not None:
+        hybrid = cluster.get("hybrid_fabric")
+        if hybrid is None:
+            raise ValueError(
+                "--circuit-policy requires a 'hybrid_fabric' section in the cluster config")
+        domain_size = hybrid["copper_domain_size"]
+        num_domains = (total_npu + domain_size - 1) // domain_size
+        optical_bw = float(cluster["link_bw"][1])  # GB/s == bytes/ns
+        circuit_manager = CircuitManager(
+            num_domains, optical_bw, args.optical_reconfig_ns,
+            policy=args.circuit_policy, rotor_slot_ns=args.rotor_slot_ns,
+            resv_guard_ns=args.circuit_resv_guard_ns)
+        prefill_estimator = PrefillEstimator()
+        inst_domain = {i: inst2npu_mapping[i] // domain_size for i in range(num_instances)}
+        kv_bpt = full_cluster_kv_bytes_per_token(
+            instances[0]['model_name'],
+            instance_runtime_configs[0]["fp"],
+            instance_runtime_configs[0]["kv_cache_dtype"])
+        router.configure_circuit(circuit_manager, prefill_estimator, inst_domain, kv_bpt)
+        logger.info("Circuit plane enabled: policy=%s domains=%d reconfig=%d ns bw=%.0f GB/s",
+                    args.circuit_policy, num_domains, args.optical_reconfig_ns, optical_bw)
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)
@@ -579,6 +618,13 @@ def main():
 
         # check request is done
         prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(id, sys, current)
+
+        # feed the prefill-throughput estimator (circuit plane)
+        if prefill_estimator is not None and instances[instance_id]["pd_type"] == "prefill":
+            dispatch_info = prefill_dispatch_info.pop((instance_id, id - 1), None)
+            if dispatch_info is not None:
+                prefill_estimator.observe_batch(
+                    instance_id, dispatch_info[1], current - dispatch_info[0])
         # add tokens in throughput
         prompt_th += prompt_t
         total_prompt += prompt_t
@@ -748,6 +794,12 @@ def main():
                 else:
                     # Independent instance: generate trace immediately
                     inst_cfg = instance_runtime_configs[instance_id]
+                    circuit_stall_ns = 0
+                    if circuit_manager is not None and instance["pd_type"] == "prefill":
+                        circuit_stall_ns = router.circuit_stall_for_batch(
+                            new_req, instance_id, current)
+                        prefill_dispatch_info[(instance_id, new_req.batch_id)] = (
+                            current, new_req.total_len)
                     generate_trace(new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
                                    instance["local_ep"], instance["ep_total"],
                                    instance["pd_type"],
@@ -760,7 +812,8 @@ def main():
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"],
-                                   inputs_root=run_paths.inputs_root)
+                                   inputs_root=run_paths.inputs_root,
+                                   circuit_stall_ns=circuit_stall_ns)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
@@ -1030,6 +1083,13 @@ def main():
         print(f"Saving each request's information to output file: {output_file}")
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
+
+    if circuit_manager is not None:
+        circuit_summary = circuit_manager.summary()
+        print(f"Circuit plane [{args.circuit_policy}]: {circuit_summary}")
+        if output_file is not None:
+            circuit_path = output_file if os.path.isabs(output_file) else f'../{output_file}'
+            circuit_manager.dump_stats(circuit_path + ".circuit.csv")
 
     if args.cleanup_inputs:
         _cleanup_inputs_root(run_paths, logger)

@@ -36,6 +36,14 @@ class Router:
         self._request_to_session = {}    # request_id -> (session_id, sub_request_index)
         self._next_request_id = 0        # monotonic counter for unique request IDs
 
+        # Joint P/D placement + optical circuit announcement (configured
+        # via configure_circuit(); inactive by default)
+        self.circuit_manager = None
+        self.prefill_estimator = None
+        self._inst_domain = {}           # instance_id -> copper domain id
+        self._kv_bytes_per_token = 0
+        self._admission_decode_choice = {}  # request index -> decode scheduler idx
+
         if self.routing_policy == "RR":
             self._select_instance = self._rr_select
         elif self.routing_policy == "RAND":
@@ -95,6 +103,73 @@ class Router:
 
     def _custom_select(self, schedulers, role):
         raise NotImplementedError("Implement custom routing policy.")
+
+    # -----------------------------------------------------------------------
+    # Joint P/D placement + circuit announcement
+    # -----------------------------------------------------------------------
+
+    def configure_circuit(self, circuit_manager, prefill_estimator,
+                          inst_domain, kv_bytes_per_token):
+        """Enable admission-time joint P/D placement with optical circuit
+        demand announcement. ``inst_domain`` maps instance_id -> copper
+        domain id; ``kv_bytes_per_token`` is the full (all-rank) KV
+        footprint per prompt token."""
+        self.circuit_manager = circuit_manager
+        self.prefill_estimator = prefill_estimator
+        self._inst_domain = inst_domain
+        self._kv_bytes_per_token = int(kv_bytes_per_token)
+
+    def _announce_admission(self, req_index, prefill_sched, input_toks, now_ns):
+        """Pick the decode instance at admission (joint placement) and
+        announce the future KV transfer to the circuit manager."""
+        if not self.decode_schedulers:
+            return
+        d_idx = self._select_instance(self.decode_schedulers, "decode")
+        self._admission_decode_choice[req_index] = d_idx
+        if self.circuit_manager is None:
+            return
+        src_inst = prefill_sched.instance_id
+        dst_inst = self.decode_schedulers[d_idx].instance_id
+        src_dom = self._inst_domain.get(src_inst)
+        dst_dom = self._inst_domain.get(dst_inst)
+        if src_dom is None or dst_dom is None or src_dom == dst_dom:
+            return
+        est_ready = self.prefill_estimator.estimate_ready(src_inst, input_toks, now_ns)
+        self.prefill_estimator.add_backlog(src_inst, input_toks)
+        self.circuit_manager.announce(
+            req_index, src_dom, dst_dom,
+            self._kv_bytes_per_token * input_toks, est_ready)
+
+    def circuit_stall_for_batch(self, batch, prefill_instance_id, now_ns):
+        """Called when a prefill batch is dispatched: requests (or
+        consumes the reservation for) the optical circuit(s) carrying
+        this batch's KV chunks — one transfer per request, to that
+        request's admission-chosen decode domain. Returns the max stall
+        in ns, gating the first kv_send of the batch's trace."""
+        if self.circuit_manager is None:
+            return 0
+        src_dom = self._inst_domain.get(prefill_instance_id)
+        if src_dom is None:
+            return 0
+        max_stall = 0
+        for req in batch.requests:
+            chunk = req.chunk_len if req.chunk_len > 0 else 0
+            if chunk <= 0:
+                continue
+            d_idx = self._admission_decode_choice.get(req.id)
+            if d_idx is None and self.decode_schedulers:
+                d_idx = 0
+            if d_idx is None:
+                continue
+            dst_dom = self._inst_domain.get(self.decode_schedulers[d_idx].instance_id)
+            if dst_dom is None or dst_dom == src_dom:
+                continue
+            resv = req.id if req.id in self.circuit_manager._reservations else None
+            stall = self.circuit_manager.request_transfer(
+                src_dom, dst_dom, self._kv_bytes_per_token * chunk,
+                now_ns, req_id=resv)
+            max_stall = max(max_stall, stall)
+        return max_stall
 
     # -----------------------------------------------------------------------
     # Request loading and real-time routing
@@ -200,6 +275,9 @@ class Router:
 
             instance_id = self._select_instance(self.prefill_schedulers, "prefill")
             sched = self.prefill_schedulers[instance_id]
+
+            self._announce_admission(req_data['index'], sched,
+                                     req_data['input_toks'], current_time_ns)
 
             if sched.enable_prefix_caching:
                 sched.add_request([
@@ -323,5 +401,13 @@ class Router:
 
     def transfer_prefill_request(self, requests):
         for req in requests:
-            instance_id = self._select_instance(self.decode_schedulers, "decode")
+            instance_id = self._admission_decode_choice.pop(req.id, None)
+            if instance_id is None:
+                instance_id = self._select_instance(self.decode_schedulers, "decode")
+            if self.circuit_manager is not None:
+                # prefill done: drop any unconsumed reservation and
+                # release the estimator backlog (req.instance_id still
+                # names the prefill instance at this point)
+                self.circuit_manager.cancel(req.id)
+                self.prefill_estimator.remove_backlog(req.instance_id, req.original_input)
             self.decode_schedulers[instance_id].add_decode(req)

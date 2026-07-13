@@ -1469,7 +1469,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None):
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
+                   circuit_stall_ns=0):
 
     model = batch.model
     config = get_config(model)
@@ -1565,7 +1566,13 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
         else:
             raise ValueError(f"Unknown instance type {pd_type}.")
 
-        f.write(f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}\n")
+        if pd_type == 'prefill' and circuit_stall_ns > 0:
+            # optical circuit setup stall, consumed by the Chakra
+            # converter as a comp node gating the first kv_send
+            f.write(f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}\t"
+                    f"kv_stall: {int(circuit_stall_ns)}\n")
+        else:
+            f.write(f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}\n")
         f.write(str(len(result))+'\n')
         f.write(header())
 
