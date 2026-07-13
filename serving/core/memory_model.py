@@ -41,10 +41,19 @@ class MemoryModel():
         self.q_dim = self.n_head * self.head_dim       # total Q projection output dim
         self.kv_dim = self.kv_head * self.head_dim     # total KV projection output dim
         self.vocab_size = self.config['vocab_size']
-        # Accept either the Mistral-style ``num_local_experts`` or the
-        # HF/Qwen-style ``num_experts`` key — profiler configs track
-        # upstream HF naming which varies per family.
-        self.is_moe = 'num_local_experts' in self.config or 'num_experts' in self.config
+        # Accept the Mistral-style ``num_local_experts``, HF/Qwen-style
+        # ``num_experts``, or DeepSeek-style ``n_routed_experts`` key —
+        # profiler configs track upstream HF naming which varies per family.
+        self.is_moe = ('num_local_experts' in self.config
+                       or 'num_experts' in self.config
+                       or 'n_routed_experts' in self.config)
+        # MLA (DeepSeek-V3 family): the KV cache stores the compressed
+        # latent (kv_lora_rank) plus the decoupled RoPE key per token,
+        # replicated across TP ranks (vLLM behavior) — not 2*kv_dim.
+        self.mla_kv_dim = None
+        if 'kv_lora_rank' in self.config:
+            self.mla_kv_dim = (self.config['kv_lora_rank']
+                               + self.config.get('qk_rope_head_dim', 0))
 
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
 
@@ -148,6 +157,9 @@ class MemoryModel():
         # (kv_head, batch_size, n_embd//n_head, seq_len) per layer
         # return batch_size = 1 to caclulate max batch_size in scheduler
 
+        if self.mla_kv_dim is not None:
+            # MLA: compressed latent + RoPE key, replicated per TP rank
+            return self.mla_kv_dim * seq * self.n_layer * self.kv_fp
         # K & V multiply 2
         return 2 * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
     
@@ -671,6 +683,11 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     kv_dim = kv_head * head_dim
     n_layer = config['num_hidden_layers']
     kv_fp = 1 if kv_cache_dtype == 'fp8' else fp // 8
+    if 'kv_lora_rank' in config:
+        # MLA: one compressed latent + RoPE key per token per layer
+        # (a single replica moves between P/D instances)
+        mla_dim = config['kv_lora_rank'] + config.get('qk_rope_head_dim', 0)
+        return mla_dim * n_layer * kv_fp
     # 2 (K + V) * kv_dim * n_layer * bytes_per_elem
     return 2 * kv_dim * n_layer * kv_fp
 
@@ -696,7 +713,8 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     # Same both-name fallback as MemoryModel.__init__ — HF / Qwen use
     # ``num_experts`` while Mistral uses ``num_local_experts``.
     num_local_experts = config.get(
-        "num_local_experts", config.get("num_experts", 1)
+        "num_local_experts",
+        config.get("num_experts", config.get("n_routed_experts", 1)),
     )
 
     p = max(int(parallel), 1)

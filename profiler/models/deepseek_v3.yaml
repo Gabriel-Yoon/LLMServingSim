@@ -1,0 +1,58 @@
+# DeepSeek-V3 family — class catalog (MLA + fine-grained-MoE decoder LLMs).
+#
+# Covers DeepSeek-V3 / V3-0324 / R1 and derivatives sharing the
+# ``deepseek_v3`` model_type (e.g. moonshotai/Kimi-K2-Instruct).
+#
+# MLA note: the ``attention`` entry measures vLLM's MLA attention
+# module as ONE unit — the low-rank Q/KV projections (q_a_proj,
+# q_b_proj, kv_a_proj_with_mqa, kv_b_proj), RoPE application, and the
+# attention core — everything in the block except ``o_proj``, which is
+# profiled separately as a dense layer. This matches the existing
+# H100/H200 profile bundles under perf/ (verified against their CSV
+# contents and FLOP estimates; see docs/profiling-guide.md).
+#
+# Known approximations when simulating with this catalog:
+#   - ``first_k_dense_replace`` layers (3 of 61 in V3) use a dense FFN
+#     in the real model but are treated as MoE here (~5% FFN-time
+#     overestimate on 3 layers, <1% end-to-end).
+#   - The shared expert is included in the ``moe`` measurement.
+#
+# Canonical names mirror vLLM's deepseek_v2.py attribute names where a
+# 1:1 mapping exists.
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, attention]
+  post_attn: [o_proj, layernorm]
+  mlp_dense: []
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2DecoderLayer
+      tp_stable: true
+    o_proj:
+      vllm: RowParallelLinear
+      within: DeepseekV2MLAAttention
+    final_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV3ForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: DeepseekV2MLAAttention
+  moe:
+    moe:
+      vllm: DeepseekV2MoE

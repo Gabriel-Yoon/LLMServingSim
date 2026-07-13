@@ -262,6 +262,8 @@ def _read_category_csv(path, key_cols):
     if not os.path.isfile(path):
         return None
     df = pd.read_csv(path, sep=",")
+    # tolerate stray blank lines in hand-transferred profile bundles
+    df = df.dropna(how="all")
     # time_us -> latency_ns (int, min 1)
     df["latency_ns"] = (df["time_us"].astype(float) * 1_000.0).round().astype(int).clip(lower=1)
     return df
@@ -1187,7 +1189,14 @@ def _emit_kv_send(ctx, bctx, lines, batch_tag):
     KV transfer). Size excludes the Q projection, unlike the qkv_proj
     activation itself.
     """
-    kv_bytes = 2 * ctx.kv_head * ctx.head_dim * bctx.total_len * ctx.fp // max(ctx.tp_size, 1)
+    if 'kv_lora_rank' in ctx.config:
+        # MLA: a single compressed replica moves to the decode side;
+        # split the wire bytes across the TP ranks' per-rank sends so
+        # the total on the wire equals one replica.
+        mla_dim = ctx.config['kv_lora_rank'] + ctx.config.get('qk_rope_head_dim', 0)
+        kv_bytes = mla_dim * bctx.total_len * ctx.fp // max(ctx.tp_size, 1)
+    else:
+        kv_bytes = 2 * ctx.kv_head * ctx.head_dim * bctx.total_len * ctx.fp // max(ctx.tp_size, 1)
     if kv_bytes <= 0:
         return
     lines.append(formatter("kv_send", '0',
