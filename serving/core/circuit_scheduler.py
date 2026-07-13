@@ -45,6 +45,7 @@ IDEAL = "IDEAL"
 ROTOR = "ROTOR"
 REACTIVE = "REACTIVE"
 PQPS = "PQPS"
+CORD = "CORD"   # Coalesced Reservation with Deadlines (ours, non-QPS lineage)
 # Slotted/epoch-based baselines (QPS-Fit's own benchmark set; see
 # docs/evaluation-baselines.md and refs/papers/QPS-Fit.pdf):
 NEGOTIATOR = "NEGOTIATOR"   # NegotiaToR (SIGCOMM'24): per-slot binary
@@ -54,7 +55,7 @@ BFF = "BFF"                 # Best-First-Fit (CLOUD'18): centralized epoch
 QPSFIT = "QPSFIT"           # QPS-Fit (CLOUD'25): epoch batch, QPS-sampled
                             # request + First-Fit / Largest-Fit grant
 
-POLICIES = (IDEAL, ROTOR, REACTIVE, PQPS)
+POLICIES = (IDEAL, ROTOR, REACTIVE, PQPS, CORD)
 SLOTTED_POLICIES = (NEGOTIATOR, BFF, QPSFIT)
 ALL_POLICIES = POLICIES + SLOTTED_POLICIES
 
@@ -165,7 +166,8 @@ class CircuitManager:
     timeline. Queried synchronously by the serving main loop."""
 
     def __init__(self, num_domains, bw_bytes_per_ns, reconfig_ns,
-                 policy=REACTIVE, rotor_slot_ns=None, resv_guard_ns=None):
+                 policy=REACTIVE, rotor_slot_ns=None, resv_guard_ns=None,
+                 cord_slack_ns=None):
         if policy not in POLICIES:
             raise ValueError(f"Unknown circuit policy '{policy}' (choose from {POLICIES})")
         self.n = num_domains
@@ -179,6 +181,10 @@ class CircuitManager:
         # estimated ready time, absorbing estimator error.
         self.resv_guard_ns = int(resv_guard_ns) if resv_guard_ns is not None \
             else self.reconfig_ns
+        # CORD: per-transfer latency budget available for coalescing holds
+        self.cord_slack_ns = int(cord_slack_ns) if cord_slack_ns is not None \
+            else 2 * self.reconfig_ns
+        self._pair_pending = {}  # (src, dst) -> list of [req_id, est_ready, nbytes]
 
         self.out_cal = [_Calendar() for _ in range(num_domains)]
         self.in_cal = [_Calendar() for _ in range(num_domains)]
@@ -197,6 +203,10 @@ class CircuitManager:
         self._reservations[req_id] = r
         if self.policy == PQPS:
             self._book(r)
+        elif self.policy == CORD:
+            self._pair_pending.setdefault((src, dst), []).append(
+                [req_id, int(est_ready_ns), int(nbytes)])
+            self._cord_book_pair(src, dst)
 
     def _book(self, r):
         """Book both ports on their calendars so the circuit becomes
@@ -256,13 +266,18 @@ class CircuitManager:
             else:
                 # booked activation still in the future (late booking or
                 # early data): waiting for it competes with starting a
-                # fresh reconfiguration right now — take the earlier.
+                # fresh reconfiguration right now — take the earlier. If
+                # the circuit already points at this pair (e.g. sticky
+                # routing), no fresh reconfiguration is needed at all.
+                redo_setup = 0 if (self.out_target[src] == dst
+                                   and self.in_source[dst] == src) \
+                    else self.reconfig_ns
                 wait_start = _earliest_free(cals, r.active_from, serve_ns,
                                             ignore_resv_after=now_ns)
                 redo_t = _earliest_free(cals, now_ns,
-                                        self.reconfig_ns + serve_ns,
+                                        redo_setup + serve_ns,
                                         ignore_resv_after=now_ns)
-                start = min(wait_start, redo_t + self.reconfig_ns)
+                start = min(wait_start, redo_t + redo_setup)
             hit = start == now_ns
             _occupy(cals, start, start + serve_ns, ("xfer", req_id))
             self._displace_overlapping(src, dst, start, start + serve_ns)
@@ -270,6 +285,9 @@ class CircuitManager:
             self.in_source[dst] = src
             self._log(req_id, src, dst, nbytes, now_ns, start, 0, hit=hit)
             return int(start - now_ns)
+
+        if self.policy == CORD:
+            return self._cord_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
 
         # REACTIVE (and PQPS without a reservation)
         setup = 0 if (self.out_target[src] == dst and self.in_source[dst] == src) \
@@ -301,6 +319,99 @@ class CircuitManager:
             self.out_cal[r.src].remove(tag)
             self.in_cal[r.dst].remove(tag)
             self._book(r)
+
+    # ---------------- CORD: Coalesced Reservation with Deadlines ----------
+    #
+    # Regime: optical bandwidth makes service time << reconfiguration
+    # delta, so scheduling degenerates to choosing WHEN to pay delta
+    # toward each destination. CORD (i) pre-books ONE pair-level
+    # activation per (src, dst) at the pair's earliest announced ready
+    # time (inheriting the delta-hiding property without QPS sampling),
+    # and (ii) on a pair flip, first drains the CURRENT pair's imminent
+    # announced demand if the new transfer's slack budget allows —
+    # sequencing flips into runs (A A A | B B) instead of interleaving
+    # (A B A B), which minimizes reconfigurations paid per byte.
+
+    def _cord_book_pair(self, src, dst):
+        """(Re)book the single pair-level activation for (src, dst) at
+        its earliest pending announced ready time."""
+        pend = self._pair_pending.get((src, dst))
+        if not pend:
+            return
+        tag = ("pair", src, dst)
+        self.out_cal[src].remove(tag)
+        self.in_cal[dst].remove(tag)
+        # book only the activation window for the EARLIEST pending
+        # transfer — the standing circuit then serves followers with no
+        # further setup; booking the full pending sum would clog the
+        # port calendar for demand that arrives spread out in time.
+        head = min(pend, key=lambda p: p[1])
+        est0 = head[1]
+        dur = self.reconfig_ns + int(head[2] / self.bw)
+        cals = (self.out_cal[src], self.in_cal[dst])
+        t = _earliest_free(cals, est0 - self.resv_guard_ns - self.reconfig_ns, dur)
+        _occupy(cals, t, t + dur, tag)
+
+    def _cord_transfer(self, src, dst, nbytes, serve_ns, now_ns, req_id):
+        pend = self._pair_pending.get((src, dst), [])
+        self._pair_pending[(src, dst)] = [p for p in pend if p[0] != req_id]
+        self._reservations.pop(req_id, None)
+        cals = (self.out_cal[src], self.in_cal[dst])
+
+        if self.out_target[src] == dst and self.in_source[dst] == src:
+            # same pair: ride the standing circuit
+            start = _earliest_free(cals, now_ns, serve_ns,
+                                   ignore_resv_after=now_ns)
+            _occupy(cals, start, start + serve_ns, ("xfer", req_id))
+            self._displace_overlapping(src, dst, start, start + serve_ns)
+            self._log(req_id, src, dst, nbytes, now_ns, start, 0,
+                      hit=(start == now_ns))
+            return int(start - now_ns)
+
+        # pair flip needed: hold to drain the current pair's imminent
+        # announced demand if this transfer's slack budget allows
+        base = now_ns
+        cur = self.out_target[src]
+        if cur is not None:
+            imminent = [p for p in self._pair_pending.get((src, cur), [])
+                        if p[1] <= now_ns + self.reconfig_ns]
+            if imminent:
+                drain_ns = int(sum(p[2] for p in imminent) / self.bw)
+                if drain_ns + self.reconfig_ns <= self.cord_slack_ns:
+                    base = now_ns + drain_ns
+
+        # anticipatory pair booking may already have the circuit up
+        tag = ("pair", src, dst)
+        booked_from = None
+        for s_, e_, t_ in self.out_cal[src].iv:
+            if t_ == tag:
+                booked_from = s_ + self.reconfig_ns
+                break
+        self.out_cal[src].remove(tag)
+        self.in_cal[dst].remove(tag)
+
+        redo_t = _earliest_free(cals, base, self.reconfig_ns + serve_ns,
+                                ignore_resv_after=now_ns)
+        start = redo_t + self.reconfig_ns
+        hit = False
+        if booked_from is not None:
+            # the pair booking's reconfiguration either completed already
+            # (ride it now) or completes sooner than a fresh one would
+            wait_start = _earliest_free(cals, max(now_ns, booked_from),
+                                        serve_ns, ignore_resv_after=now_ns)
+            if wait_start < start:
+                start = wait_start
+                hit = start == now_ns
+        _occupy(cals, start, start + serve_ns, ("xfer", req_id))
+        self._displace_overlapping(src, dst, start, start + serve_ns)
+        self.out_target[src] = dst
+        self.in_source[dst] = src
+        # re-book the pair we just left if it still has pending demand
+        if cur is not None and self._pair_pending.get((src, cur)):
+            self._cord_book_pair(src, cur)
+        self._log(req_id, src, dst, nbytes, now_ns, start,
+                  0 if hit else self.reconfig_ns, hit=hit)
+        return int(start - now_ns)
 
     def _rotor_start(self, src, dst, now_ns):
         """First instant the rotating circuit serves (src, dst)."""
@@ -528,7 +639,7 @@ class SlottedCircuitManager:
 
 def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
                          rotor_slot_ns=None, resv_guard_ns=None,
-                         slot_ns=None, slots_per_epoch=200):
+                         slot_ns=None, slots_per_epoch=200, cord_slack_ns=None):
     """Factory covering both the continuous-time policies (IDEAL, ROTOR,
     REACTIVE, PQPS) and the slotted baselines (NEGOTIATOR, BFF, QPSFIT)."""
     if policy in SLOTTED_POLICIES:
@@ -537,4 +648,4 @@ def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
                                      slots_per_epoch=slots_per_epoch)
     return CircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
                           policy=policy, rotor_slot_ns=rotor_slot_ns,
-                          resv_guard_ns=resv_guard_ns)
+                          resv_guard_ns=resv_guard_ns, cord_slack_ns=cord_slack_ns)
