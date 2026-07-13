@@ -280,7 +280,7 @@ def main():
                         'after a successful simulation (default: enabled). Use --no-cleanup-inputs '
                         'to preserve generated trace files, Chakra workloads, and input configs for debugging')
     parser.add_argument('--circuit-policy', type=str, default=None,
-                        choices=['IDEAL', 'ROTOR', 'REACTIVE', 'PQPS', 'CORD',
+                        choices=['IDEAL', 'ROTOR', 'REACTIVE', 'PQPS', 'CORD', 'STEER',
                                  'NEGOTIATOR', 'BFF', 'QPSFIT'],
                         help='optical circuit scheduling policy for the hybrid fabric '
                         '(requires hybrid_fabric in the cluster config; default: off)')
@@ -297,6 +297,9 @@ def main():
     parser.add_argument('--cord-slack-ns', type=int, default=None,
                         help='CORD per-transfer latency budget for coalescing holds '
                         '(default 2x reconfig delay)')
+    parser.add_argument('--electrical-bw-gbps', type=float, default=25.0,
+                        help='STEER: electrical (packet) plane per-flow bandwidth in GB/s '
+                        '(default 25 = 200Gb/s NIC-class)')
     parser.add_argument('--decode-affinity', type=float, default=0.0,
                         help='circuit-affinity routing weight gamma: decode candidates '
                         'requiring an optical retarget score gamma worse than the '
@@ -512,7 +515,8 @@ def main():
             resv_guard_ns=args.circuit_resv_guard_ns,
             slot_ns=args.circuit_slot_ns,
             slots_per_epoch=args.circuit_slots_per_epoch,
-            cord_slack_ns=args.cord_slack_ns)
+            cord_slack_ns=args.cord_slack_ns,
+            electrical_bw=args.electrical_bw_gbps)
         prefill_estimator = PrefillEstimator()
         inst_domain = {i: inst2npu_mapping[i] // domain_size for i in range(num_instances)}
         kv_bpt = full_cluster_kv_bytes_per_token(

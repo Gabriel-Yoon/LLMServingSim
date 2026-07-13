@@ -46,6 +46,9 @@ ROTOR = "ROTOR"
 REACTIVE = "REACTIVE"
 PQPS = "PQPS"
 CORD = "CORD"   # Coalesced Reservation with Deadlines (ours, non-QPS lineage)
+STEER = "STEER" # CORD + hybrid plane steering: bulk transfers may take the
+                # electrical (packet) plane when its predicted completion
+                # beats the optical option (announced-size breakeven)
 # Slotted/epoch-based baselines (QPS-Fit's own benchmark set; see
 # docs/evaluation-baselines.md and refs/papers/QPS-Fit.pdf):
 NEGOTIATOR = "NEGOTIATOR"   # NegotiaToR (SIGCOMM'24): per-slot binary
@@ -55,7 +58,7 @@ BFF = "BFF"                 # Best-First-Fit (CLOUD'18): centralized epoch
 QPSFIT = "QPSFIT"           # QPS-Fit (CLOUD'25): epoch batch, QPS-sampled
                             # request + First-Fit / Largest-Fit grant
 
-POLICIES = (IDEAL, ROTOR, REACTIVE, PQPS, CORD)
+POLICIES = (IDEAL, ROTOR, REACTIVE, PQPS, CORD, STEER)
 SLOTTED_POLICIES = (NEGOTIATOR, BFF, QPSFIT)
 ALL_POLICIES = POLICIES + SLOTTED_POLICIES
 
@@ -167,7 +170,7 @@ class CircuitManager:
 
     def __init__(self, num_domains, bw_bytes_per_ns, reconfig_ns,
                  policy=REACTIVE, rotor_slot_ns=None, resv_guard_ns=None,
-                 cord_slack_ns=None):
+                 cord_slack_ns=None, electrical_bw=None):
         if policy not in POLICIES:
             raise ValueError(f"Unknown circuit policy '{policy}' (choose from {POLICIES})")
         self.n = num_domains
@@ -185,6 +188,12 @@ class CircuitManager:
         self.cord_slack_ns = int(cord_slack_ns) if cord_slack_ns is not None \
             else 2 * self.reconfig_ns
         self._pair_pending = {}  # (src, dst) -> list of [req_id, est_ready, nbytes]
+        # STEER: electrical (packet) plane per-flow bandwidth and a simple
+        # per-source-domain egress serialization. The simulated wire still
+        # runs at optical rate, so the electrical route's slower service is
+        # folded into the returned stall (completion-time equivalence).
+        self.electrical_bw = float(electrical_bw) if electrical_bw else 25.0
+        self.elec_free = [0] * num_domains
 
         self.out_cal = [_Calendar() for _ in range(num_domains)]
         self.in_cal = [_Calendar() for _ in range(num_domains)]
@@ -203,7 +212,7 @@ class CircuitManager:
         self._reservations[req_id] = r
         if self.policy == PQPS:
             self._book(r)
-        elif self.policy == CORD:
+        elif self.policy in (CORD, STEER):
             self._pair_pending.setdefault((src, dst), []).append(
                 [req_id, int(est_ready_ns), int(nbytes)])
             self._cord_book_pair(src, dst)
@@ -288,6 +297,8 @@ class CircuitManager:
 
         if self.policy == CORD:
             return self._cord_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
+        if self.policy == STEER:
+            return self._steer_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
 
         # REACTIVE (and PQPS without a reservation)
         setup = 0 if (self.out_target[src] == dst and self.in_source[dst] == src) \
@@ -413,6 +424,45 @@ class CircuitManager:
                   0 if hit else self.reconfig_ns, hit=hit)
         return int(start - now_ns)
 
+    def _steer_transfer(self, src, dst, nbytes, serve_ns, now_ns, req_id):
+        """Hybrid plane steering: pick the plane with the earlier
+        predicted completion (Eq. steer in the theory draft). Electrical
+        completion folds the slower packet-plane service into the stall
+        so the ASTRA-Sim wire (which runs at optical rate) lands at the
+        equivalent instant."""
+        serve_e_ns = int(nbytes / self.electrical_bw)
+        e_start = max(now_ns, self.elec_free[src])
+        e_completion = e_start + serve_e_ns
+
+        # conservative optical estimate (no commitment yet)
+        if self.out_target[src] == dst and self.in_source[dst] == src:
+            o_start = _earliest_free((self.out_cal[src], self.in_cal[dst]),
+                                     now_ns, serve_ns, ignore_resv_after=now_ns)
+        else:
+            booked_from = None
+            tag = ("pair", src, dst)
+            for s_, e_, t_ in self.out_cal[src].iv:
+                if t_ == tag:
+                    booked_from = s_ + self.reconfig_ns
+                    break
+            base = max(now_ns, booked_from) if booked_from is not None \
+                else now_ns + self.reconfig_ns
+            o_start = _earliest_free((self.out_cal[src], self.in_cal[dst]),
+                                     base, serve_ns, ignore_resv_after=now_ns)
+        o_completion = o_start + serve_ns
+
+        if e_completion < o_completion:
+            # take the electrical plane; release optical bookkeeping
+            self.cancel(req_id)
+            pend = self._pair_pending.get((src, dst), [])
+            self._pair_pending[(src, dst)] = [p for p in pend if p[0] != req_id]
+            self.elec_free[src] = e_completion
+            start = e_completion - serve_ns  # completion-equivalent stall
+            self._log(req_id, src, dst, nbytes, now_ns, start, 0,
+                      hit=None, plane="E")
+            return int(start - now_ns)
+        return self._cord_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
+
     def _rotor_start(self, src, dst, now_ns):
         """First instant the rotating circuit serves (src, dst)."""
         offset = (dst - src) % self.n  # 1 .. n-1
@@ -431,12 +481,13 @@ class CircuitManager:
 
     # ---------------- bookkeeping ----------------
 
-    def _log(self, req_id, src, dst, nbytes, ready, start, setup_ns, hit=None):
+    def _log(self, req_id, src, dst, nbytes, ready, start, setup_ns, hit=None,
+             plane="O"):
         self.stats.append({
             "req_id": req_id, "policy": self.policy, "src": src, "dst": dst,
             "bytes": nbytes, "ready_ns": ready, "start_ns": start,
             "stall_ns": start - ready, "setup_ns": setup_ns,
-            "resv_hit": hit,
+            "resv_hit": hit, "plane": plane,
         })
 
     def dump_stats(self, path):
@@ -639,7 +690,8 @@ class SlottedCircuitManager:
 
 def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
                          rotor_slot_ns=None, resv_guard_ns=None,
-                         slot_ns=None, slots_per_epoch=200, cord_slack_ns=None):
+                         slot_ns=None, slots_per_epoch=200, cord_slack_ns=None,
+                         electrical_bw=None):
     """Factory covering both the continuous-time policies (IDEAL, ROTOR,
     REACTIVE, PQPS) and the slotted baselines (NEGOTIATOR, BFF, QPSFIT)."""
     if policy in SLOTTED_POLICIES:
@@ -648,4 +700,5 @@ def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
                                      slots_per_epoch=slots_per_epoch)
     return CircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
                           policy=policy, rotor_slot_ns=rotor_slot_ns,
-                          resv_guard_ns=resv_guard_ns, cord_slack_ns=cord_slack_ns)
+                          resv_guard_ns=resv_guard_ns, cord_slack_ns=cord_slack_ns,
+                          electrical_bw=electrical_bw)
