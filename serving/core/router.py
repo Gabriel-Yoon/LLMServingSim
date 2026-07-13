@@ -42,6 +42,7 @@ class Router:
         self.prefill_estimator = None
         self._inst_domain = {}           # instance_id -> copper domain id
         self._kv_bytes_per_token = 0
+        self.decode_affinity = 0.0
         self._admission_decode_choice = {}  # request index -> decode scheduler idx
 
         if self.routing_policy == "RR":
@@ -109,22 +110,54 @@ class Router:
     # -----------------------------------------------------------------------
 
     def configure_circuit(self, circuit_manager, prefill_estimator,
-                          inst_domain, kv_bytes_per_token):
+                          inst_domain, kv_bytes_per_token,
+                          decode_affinity=0.0):
         """Enable admission-time joint P/D placement with optical circuit
         demand announcement. ``inst_domain`` maps instance_id -> copper
         domain id; ``kv_bytes_per_token`` is the full (all-rank) KV
-        footprint per prompt token."""
+        footprint per prompt token. ``decode_affinity`` (gamma >= 0) adds
+        a retargeting penalty to decode selection: candidates whose
+        domain the prefill's optical port does NOT currently point at
+        score ``gamma`` worse than the normalized load metric —
+        circuit-affinity routing (gamma=0 disables it)."""
         self.circuit_manager = circuit_manager
         self.prefill_estimator = prefill_estimator
         self._inst_domain = inst_domain
         self._kv_bytes_per_token = int(kv_bytes_per_token)
+        self.decode_affinity = float(decode_affinity)
+
+    def _affinity_decode_select(self, prefill_sched):
+        """Least-load decode selection with a circuit-retargeting
+        penalty. Trades load balance against reconfiguration count."""
+        src_dom = self._inst_domain.get(prefill_sched.instance_id)
+        cur_target = None
+        if src_dom is not None:
+            cur_target = self.circuit_manager.out_target[src_dom]
+        best_idx, best_score = 0, float('inf')
+        for idx, sched in enumerate(self.decode_schedulers):
+            waiting = len(sched.request)
+            running = sum(len(b.requests) for b in sched.inflight)
+            load = (waiting * 4 + running)
+            capacity = sched.max_num_seqs
+            if capacity not in (0, float('inf')):
+                load = load / capacity
+            dst_dom = self._inst_domain.get(sched.instance_id)
+            retarget = 0.0 if (dst_dom is not None and dst_dom == cur_target) \
+                else 1.0
+            score = load + self.decode_affinity * retarget
+            if score < best_score:
+                best_score, best_idx = score, idx
+        return best_idx
 
     def _announce_admission(self, req_index, prefill_sched, input_toks, now_ns):
         """Pick the decode instance at admission (joint placement) and
         announce the future KV transfer to the circuit manager."""
         if not self.decode_schedulers:
             return
-        d_idx = self._select_instance(self.decode_schedulers, "decode")
+        if self.decode_affinity > 0 and self.circuit_manager is not None:
+            d_idx = self._affinity_decode_select(prefill_sched)
+        else:
+            d_idx = self._select_instance(self.decode_schedulers, "decode")
         self._admission_decode_choice[req_index] = d_idx
         if self.circuit_manager is None:
             return

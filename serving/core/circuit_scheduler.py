@@ -399,6 +399,7 @@ class SlottedCircuitManager:
         self.out_slots = [set() for _ in range(num_domains)]  # occupied abs slot idx
         self.in_slots = [set() for _ in range(num_domains)]
         self._reservations = {}  # always empty: these baselines are reactive
+        self.out_target = [None] * num_domains  # last granted circuit target
         self.stats = []
 
     # predictive API: no-ops (these baselines are reactive by design)
@@ -484,6 +485,7 @@ class SlottedCircuitManager:
                     first_alloc = start
                 remaining -= length
                 first_slot += self.T
+        self.out_target[src] = dst
         start_ns = first_alloc * self.slot_ns + self.reconfig_ns
         self._log(req_id, src, dst, nbytes, now_ns, start_ns, self.reconfig_ns)
         return int(start_ns - now_ns)
@@ -507,6 +509,7 @@ class SlottedCircuitManager:
                     first_alloc = s
                 got += 1
             s += 1
+        self.out_target[src] = dst
         start_ns = first_alloc * self.slot_ns + self.reconfig_ns
         self._log(req_id, src, dst, nbytes, now_ns, start_ns, self.reconfig_ns)
         return int(start_ns - now_ns)

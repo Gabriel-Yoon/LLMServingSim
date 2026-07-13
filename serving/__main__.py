@@ -294,6 +294,10 @@ def main():
                         help='slot length for NEGOTIATOR/BFF/QPSFIT (default max(15us, 2x reconfig))')
     parser.add_argument('--circuit-slots-per-epoch', type=int, default=200,
                         help='epoch quantization for BFF/QPSFIT (QPS-Fit default T=200)')
+    parser.add_argument('--decode-affinity', type=float, default=0.0,
+                        help='circuit-affinity routing weight gamma: decode candidates '
+                        'requiring an optical retarget score gamma worse than the '
+                        'normalized load (0 = pure load balancing)')
     parser.add_argument('--skip-prefill', action='store_true', default=False,
                         help='skip the prefill phase, running decode only')
     parser.add_argument('--num-reqs', type=int, default=0,
@@ -511,7 +515,8 @@ def main():
             instances[0]['model_name'],
             instance_runtime_configs[0]["fp"],
             instance_runtime_configs[0]["kv_cache_dtype"])
-        router.configure_circuit(circuit_manager, prefill_estimator, inst_domain, kv_bpt)
+        router.configure_circuit(circuit_manager, prefill_estimator, inst_domain, kv_bpt,
+                                 decode_affinity=args.decode_affinity)
         logger.info("Circuit plane enabled: policy=%s domains=%d reconfig=%d ns bw=%.0f GB/s",
                     args.circuit_policy, num_domains, args.optical_reconfig_ns, optical_bw)
     # Power Modeling if enabled
