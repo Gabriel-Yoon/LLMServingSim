@@ -1,0 +1,92 @@
+{
+    "num_nodes": 1,
+    "link_bw": [
+        450,
+        100.0
+    ],
+    "link_latency": [
+        500,
+        1000
+    ],
+    "hybrid_fabric": {
+        "copper_domain_size": 4
+    },
+    "nodes": [
+        {
+            "num_instances": 6,
+            "cpu_mem": {
+                "mem_size": 2048,
+                "mem_bw": 256,
+                "mem_latency": 0
+            },
+            "instances": [
+                {
+                    "model_name": "deepseek-ai/DeepSeek-V3-0324",
+                    "hardware": "H200",
+                    "npu_mem": {
+                        "mem_size": 1128,
+                        "mem_bw": 4800,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "prefill",
+                    "tp_size": 4
+                },
+                {
+                    "model_name": "deepseek-ai/DeepSeek-V3-0324",
+                    "hardware": "H200",
+                    "npu_mem": {
+                        "mem_size": 1128,
+                        "mem_bw": 4800,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "prefill",
+                    "tp_size": 4
+                },
+                {
+                    "model_name": "deepseek-ai/DeepSeek-V3-0324",
+                    "hardware": "H200",
+                    "npu_mem": {
+                        "mem_size": 1128,
+                        "mem_bw": 4800,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "decode",
+                    "tp_size": 4
+                },
+                {
+                    "model_name": "deepseek-ai/DeepSeek-V3-0324",
+                    "hardware": "H200",
+                    "npu_mem": {
+                        "mem_size": 1128,
+                        "mem_bw": 4800,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "decode",
+                    "tp_size": 4
+                },
+                {
+                    "model_name": "deepseek-ai/DeepSeek-V3-0324",
+                    "hardware": "H200",
+                    "npu_mem": {
+                        "mem_size": 1128,
+                        "mem_bw": 4800,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "decode",
+                    "tp_size": 4
+                },
+                {
+                    "model_name": "deepseek-ai/DeepSeek-V3-0324",
+                    "hardware": "H200",
+                    "npu_mem": {
+                        "mem_size": 1128,
+                        "mem_bw": 4800,
+                        "mem_latency": 0
+                    },
+                    "pd_type": "decode",
+                    "tp_size": 4
+                }
+            ]
+        }
+    ]
+}
