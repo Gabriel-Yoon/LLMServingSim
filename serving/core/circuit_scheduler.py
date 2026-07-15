@@ -424,6 +424,37 @@ class CircuitManager:
                   0 if hit else self.reconfig_ns, hit=hit)
         return int(start - now_ns)
 
+    def estimate_optical_start(self, src, dst, serve_ns, now_ns):
+        """Conservative, commitment-free estimate of when an optical
+        transfer (src->dst) could start: rides a standing circuit, else
+        uses the pair booking's activation, else pays a fresh setup.
+        Used by STEER's plane comparison and by MultiPlaneManager's
+        transceiver selection."""
+        if self.out_target[src] == dst and self.in_source[dst] == src:
+            return _earliest_free((self.out_cal[src], self.in_cal[dst]),
+                                  now_ns, serve_ns, ignore_resv_after=now_ns)
+        booked_from = None
+        tag = ("pair", src, dst)
+        for s_, e_, t_ in self.out_cal[src].iv:
+            if t_ == tag:
+                booked_from = s_ + self.reconfig_ns
+                break
+        base = max(now_ns, booked_from) if booked_from is not None \
+            else now_ns + self.reconfig_ns
+        return _earliest_free((self.out_cal[src], self.in_cal[dst]),
+                              base, serve_ns, ignore_resv_after=now_ns)
+
+    def probe_booking_activation(self, src, dst, nbytes, est_ready_ns):
+        """Where would _cord_book_pair place this pair's activation?
+        Mirrors its placement math without committing — used by
+        MultiPlaneManager to pick the least-loaded transceiver."""
+        serve_ns = int(int(nbytes) / self.bw)
+        dur = self.reconfig_ns + serve_ns
+        t = _earliest_free((self.out_cal[src], self.in_cal[dst]),
+                           int(est_ready_ns) - self.resv_guard_ns - self.reconfig_ns,
+                           dur)
+        return t + self.reconfig_ns
+
     def _steer_transfer(self, src, dst, nbytes, serve_ns, now_ns, req_id):
         """Hybrid plane steering: pick the plane with the earlier
         predicted completion (Eq. steer in the theory draft). Electrical
@@ -435,20 +466,7 @@ class CircuitManager:
         e_completion = e_start + serve_e_ns
 
         # conservative optical estimate (no commitment yet)
-        if self.out_target[src] == dst and self.in_source[dst] == src:
-            o_start = _earliest_free((self.out_cal[src], self.in_cal[dst]),
-                                     now_ns, serve_ns, ignore_resv_after=now_ns)
-        else:
-            booked_from = None
-            tag = ("pair", src, dst)
-            for s_, e_, t_ in self.out_cal[src].iv:
-                if t_ == tag:
-                    booked_from = s_ + self.reconfig_ns
-                    break
-            base = max(now_ns, booked_from) if booked_from is not None \
-                else now_ns + self.reconfig_ns
-            o_start = _earliest_free((self.out_cal[src], self.in_cal[dst]),
-                                     base, serve_ns, ignore_resv_after=now_ns)
+        o_start = self.estimate_optical_start(src, dst, serve_ns, now_ns)
         o_completion = o_start + serve_ns
 
         if e_completion < o_completion:
@@ -691,14 +709,126 @@ class SlottedCircuitManager:
 def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
                          rotor_slot_ns=None, resv_guard_ns=None,
                          slot_ns=None, slots_per_epoch=200, cord_slack_ns=None,
-                         electrical_bw=None):
+                         electrical_bw=None, transceivers=1):
     """Factory covering both the continuous-time policies (IDEAL, ROTOR,
     REACTIVE, PQPS) and the slotted baselines (NEGOTIATOR, BFF, QPSFIT)."""
     if policy in SLOTTED_POLICIES:
         return SlottedCircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
                                      policy=policy, slot_ns=slot_ns,
                                      slots_per_epoch=slots_per_epoch)
+    if int(transceivers) > 1:
+        return MultiPlaneManager(policy, transceivers, num_domains,
+                                 bw_bytes_per_ns, reconfig_ns,
+                                 resv_guard_ns=resv_guard_ns,
+                                 cord_slack_ns=cord_slack_ns,
+                                 electrical_bw=electrical_bw)
     return CircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
                           policy=policy, rotor_slot_ns=rotor_slot_ns,
                           resv_guard_ns=resv_guard_ns, cord_slack_ns=cord_slack_ns,
                           electrical_bw=electrical_bw)
+
+
+class MultiPlaneManager:
+    """CORD-k / STEER-k: k transceiver pairs per domain, modeled as k
+    parallel optical planes (SPECTRA-style: plane h's out-ports connect
+    only to plane h's in-ports, which matches CPO port structure).
+
+    Composition of k single-plane managers, untouched internally.
+    Selection is the calendar-time analog of LPT (docs/keslassy-review):
+      - announce: assign the reservation to the plane with the earliest
+        estimated optical start at the announced ready time;
+      - transfer: transfers with a reservation go to their plane;
+        unannounced ones probe all planes and take the earliest.
+    STEER-k keeps ONE shared electrical plane in this wrapper (the inner
+    managers run CORD) and applies the plane-steering comparison here.
+    Striping one transfer across planes is future work (EQUALIZE analog).
+    """
+
+    def __init__(self, policy, k, num_domains, bw_bytes_per_ns, reconfig_ns,
+                 resv_guard_ns=None, cord_slack_ns=None, electrical_bw=None):
+        if policy not in (CORD, STEER, REACTIVE):
+            raise ValueError(f"MultiPlaneManager supports CORD/STEER/REACTIVE, got {policy}")
+        self.policy = policy
+        self.k = int(k)
+        self.n = num_domains
+        self.bw = float(bw_bytes_per_ns)
+        self.reconfig_ns = int(reconfig_ns)
+        inner_policy = CORD if policy == STEER else policy
+        self.planes = [
+            CircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
+                           policy=inner_policy, resv_guard_ns=resv_guard_ns,
+                           cord_slack_ns=cord_slack_ns)
+            for _ in range(self.k)
+        ]
+        self._req_plane = {}
+        # router API compat: `req_id in manager._reservations` membership
+        # checks — reservations live per plane, keyed here by assignment
+        self._reservations = self._req_plane
+        self.electrical_bw = float(electrical_bw) if electrical_bw else 25.0
+        self.elec_free = [0] * num_domains
+        self.stats = []
+
+    # ---------------- predictive API ----------------
+
+    def announce(self, req_id, src, dst, nbytes, est_ready_ns, deadline_ns=None):
+        if src == dst:
+            return
+        h = min(range(self.k),
+                key=lambda i: self.planes[i].probe_booking_activation(
+                    src, dst, nbytes, est_ready_ns))
+        self._req_plane[req_id] = h
+        self.planes[h].announce(req_id, src, dst, nbytes, est_ready_ns, deadline_ns)
+
+    def reannounce(self, req_id, est_ready_ns):
+        h = self._req_plane.get(req_id)
+        if h is not None:
+            self.planes[h].reannounce(req_id, est_ready_ns)
+
+    def cancel(self, req_id):
+        h = self._req_plane.pop(req_id, None)
+        if h is not None:
+            self.planes[h].cancel(req_id)
+
+    # ---------------- transfer ----------------
+
+    def request_transfer(self, src, dst, nbytes, now_ns, req_id=None):
+        nbytes = int(nbytes)
+        if src == dst or nbytes <= 0:
+            self.stats.append({"req_id": req_id, "policy": self.policy,
+                               "src": src, "dst": dst, "bytes": nbytes,
+                               "ready_ns": now_ns, "start_ns": now_ns,
+                               "stall_ns": 0, "setup_ns": 0,
+                               "resv_hit": None, "plane": "O0"})
+            return 0
+        serve_ns = int(nbytes / self.bw)
+
+        h = self._req_plane.pop(req_id, None) if req_id is not None else None
+        if h is None:
+            h = min(range(self.k),
+                    key=lambda i: self.planes[i].estimate_optical_start(
+                        src, dst, serve_ns, now_ns))
+
+        if self.policy == STEER:
+            serve_e_ns = int(nbytes / self.electrical_bw)
+            e_start = max(now_ns, self.elec_free[src])
+            e_completion = e_start + serve_e_ns
+            o_start = self.planes[h].estimate_optical_start(src, dst, serve_ns, now_ns)
+            if e_completion < o_start + serve_ns:
+                self.planes[h].cancel(req_id)
+                self.elec_free[src] = e_completion
+                start = e_completion - serve_ns
+                self.stats.append({"req_id": req_id, "policy": self.policy,
+                                   "src": src, "dst": dst, "bytes": nbytes,
+                                   "ready_ns": now_ns, "start_ns": start,
+                                   "stall_ns": start - now_ns, "setup_ns": 0,
+                                   "resv_hit": None, "plane": "E"})
+                return int(start - now_ns)
+
+        stall = self.planes[h].request_transfer(src, dst, nbytes, now_ns, req_id=req_id)
+        rec = dict(self.planes[h].stats[-1])
+        rec["plane"] = f"O{h}"
+        self.stats.append(rec)
+        return stall
+
+    dump_stats = CircuitManager.dump_stats
+    summary = CircuitManager.summary

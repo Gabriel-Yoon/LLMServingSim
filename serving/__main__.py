@@ -297,6 +297,9 @@ def main():
     parser.add_argument('--cord-slack-ns', type=int, default=None,
                         help='CORD per-transfer latency budget for coalescing holds '
                         '(default 2x reconfig delay)')
+    parser.add_argument('--optical-transceivers', type=int, default=1,
+                        help='transceiver pairs per domain (k parallel optical planes; '
+                        'CORD/STEER/REACTIVE only)')
     parser.add_argument('--electrical-bw-gbps', type=float, default=25.0,
                         help='STEER: electrical (packet) plane per-flow bandwidth in GB/s '
                         '(default 25 = 200Gb/s NIC-class)')
@@ -516,7 +519,8 @@ def main():
             slot_ns=args.circuit_slot_ns,
             slots_per_epoch=args.circuit_slots_per_epoch,
             cord_slack_ns=args.cord_slack_ns,
-            electrical_bw=args.electrical_bw_gbps)
+            electrical_bw=args.electrical_bw_gbps,
+            transceivers=args.optical_transceivers)
         prefill_estimator = PrefillEstimator()
         inst_domain = {i: inst2npu_mapping[i] // domain_size for i in range(num_instances)}
         kv_bpt = full_cluster_kv_bytes_per_token(
