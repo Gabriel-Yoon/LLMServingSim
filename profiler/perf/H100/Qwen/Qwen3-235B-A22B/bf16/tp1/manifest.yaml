@@ -1,0 +1,32 @@
+model: Qwen3-235B-A22B
+gpu: H100 SXM
+tp: 1
+ep_profile_range: [1, 2, 4, 8, 16, 32, 64, 128]
+num_experts: 128
+top_k: 8
+dtype: FP8   # 필요하면 BF16으로 수정
+backend: LLMServingSim profiler
+date: 2026-06-03
+commit: 9700ad0
+
+files:
+  dense: dense.csv
+  attention: attention.csv
+  moe: moe.csv
+  per_sequence: per_sequence.csv
+  skew: skew.csv
+  skew_fit: skew_fit.csv
+
+sanity_check:
+  dense: pass
+  attention: pass_with_interpolation_caution
+  moe: pass
+  per_sequence: pass
+  skew: raw_timing_available_alpha_fit_unstable
+  skew_fit: requires_filtering
+
+notes:
+  - "Profile intended for Qwen3-235B-A22B on H100 SXM with TP=1."
+  - "CSV files do not internally store model/GPU/TP/dtype metadata; this manifest records the experiment context."
+  - "dense, attention, moe, and per_sequence profiles passed basic sanity checks."
+  - "skew and skew_fit should not be used directly without filtering negative/extreme alpha values."
