@@ -49,6 +49,11 @@ CORD = "CORD"   # Coalesced Reservation with Deadlines (ours, non-QPS lineage)
 STEER = "STEER" # CORD + hybrid plane steering: bulk transfers may take the
                 # electrical (packet) plane when its predicted completion
                 # beats the optical option (announced-size breakeven)
+STEER_NA = "STEER_NA"  # ablation: STEER without announcements — ignores
+                       # admission-time demand entirely (no reservations,
+                       # no pair bookings); steers per transfer from
+                       # observed state only, optical path is REACTIVE.
+                       # Isolates the value of prediction inside STEER.
 # Slotted/epoch-based baselines (QPS-Fit's own benchmark set; see
 # docs/evaluation-baselines.md and refs/papers/QPS-Fit.pdf):
 NEGOTIATOR = "NEGOTIATOR"   # NegotiaToR (SIGCOMM'24): per-slot binary
@@ -58,7 +63,7 @@ BFF = "BFF"                 # Best-First-Fit (CLOUD'18): centralized epoch
 QPSFIT = "QPSFIT"           # QPS-Fit (CLOUD'25): epoch batch, QPS-sampled
                             # request + First-Fit / Largest-Fit grant
 
-POLICIES = (IDEAL, ROTOR, REACTIVE, PQPS, CORD, STEER)
+POLICIES = (IDEAL, ROTOR, REACTIVE, PQPS, CORD, STEER, STEER_NA)
 SLOTTED_POLICIES = (NEGOTIATOR, BFF, QPSFIT)
 ALL_POLICIES = POLICIES + SLOTTED_POLICIES
 
@@ -206,7 +211,7 @@ class CircuitManager:
 
     def announce(self, req_id, src, dst, nbytes, est_ready_ns, deadline_ns=None):
         """Admission-time demand announcement (PQPS only acts on it)."""
-        if src == dst:
+        if src == dst or self.policy == STEER_NA:
             return
         r = _Reservation(req_id, src, dst, int(nbytes), int(est_ready_ns), deadline_ns)
         self._reservations[req_id] = r
@@ -297,10 +302,16 @@ class CircuitManager:
 
         if self.policy == CORD:
             return self._cord_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
-        if self.policy == STEER:
+        if self.policy in (STEER, STEER_NA):
             return self._steer_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
 
         # REACTIVE (and PQPS without a reservation)
+        return self._reactive_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
+
+    def _reactive_transfer(self, src, dst, nbytes, serve_ns, now_ns, req_id):
+        """Cold-path transfer: reuse a standing circuit or pay a fresh
+        setup at the ports' earliest free slot."""
+        cals = (self.out_cal[src], self.in_cal[dst])
         setup = 0 if (self.out_target[src] == dst and self.in_source[dst] == src) \
             else self.reconfig_ns
         t = _earliest_free(cals, now_ns, setup + serve_ns,
@@ -479,6 +490,11 @@ class CircuitManager:
             self._log(req_id, src, dst, nbytes, now_ns, start, 0,
                       hit=None, plane="E")
             return int(start - now_ns)
+        if self.policy == STEER_NA:
+            # no-announcement ablation: the optical side has no bookings
+            # to lean on — behave exactly like a reactive circuit.
+            return self._reactive_transfer(src, dst, nbytes, serve_ns,
+                                           now_ns, req_id)
         return self._cord_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
 
     def _rotor_start(self, src, dst, now_ns):

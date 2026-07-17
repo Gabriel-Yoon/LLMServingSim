@@ -281,7 +281,7 @@ def main():
                         'to preserve generated trace files, Chakra workloads, and input configs for debugging')
     parser.add_argument('--circuit-policy', type=str, default=None,
                         choices=['IDEAL', 'ROTOR', 'REACTIVE', 'PQPS', 'CORD', 'STEER',
-                                 'NEGOTIATOR', 'BFF', 'QPSFIT'],
+                                 'STEER_NA', 'NEGOTIATOR', 'BFF', 'QPSFIT'],
                         help='optical circuit scheduling policy for the hybrid fabric '
                         '(requires hybrid_fabric in the cluster config; default: off)')
     parser.add_argument('--optical-reconfig-ns', type=int, default=1_000_000,
