@@ -1,0 +1,18 @@
+# Synthesized minimal meta (writer's meta.yaml pending: the HPC profiling
+# run was interrupted before model completion; tp1/tp2 CSV bundles are
+# complete). Only keys the simulator consumes are provided.
+profiler_version: 1.0.0
+vllm_version: 0.19.0
+gpu: NVIDIA H100 80GB HBM3
+hardware: H100
+architecture: llama
+model: NousResearch/Meta-Llama-3.1-70B
+variant: bf16
+tp_degrees: [1, 2]
+engine_effective:
+  max_num_batched_tokens: 2048
+  max_num_seqs: 256
+skew_profile:
+  enabled: false
+skew_fit:
+  enabled: false
