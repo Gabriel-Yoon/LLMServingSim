@@ -175,7 +175,7 @@ class CircuitManager:
 
     def __init__(self, num_domains, bw_bytes_per_ns, reconfig_ns,
                  policy=REACTIVE, rotor_slot_ns=None, resv_guard_ns=None,
-                 cord_slack_ns=None, electrical_bw=None):
+                 cord_slack_ns=None, electrical_bw=None, afd_load=0.0):
         if policy not in POLICIES:
             raise ValueError(f"Unknown circuit policy '{policy}' (choose from {POLICIES})")
         self.n = num_domains
@@ -198,6 +198,14 @@ class CircuitManager:
         # runs at optical rate, so the electrical route's slower service is
         # folded into the returned stall (completion-time equivalence).
         self.electrical_bw = float(electrical_bw) if electrical_bw else 25.0
+        # AFD background contention: attention-FFN disaggregation runs
+        # per-layer A2F/F2A traffic on the same electrical/scale-up plane
+        # STEER steers onto. Modeled as a link-sharing utilization rho in
+        # [0,1): AFD occupies rho of the plane, so STEER's electrical
+        # transfer sees effective bandwidth C_e*(1-rho) (first-order
+        # link-sharing; burst-level queuing not modeled).
+        self.afd_load = min(max(float(afd_load), 0.0), 0.95)
+        self.electrical_bw_eff = self.electrical_bw * (1.0 - self.afd_load)
         self.elec_free = [0] * num_domains
 
         self.out_cal = [_Calendar() for _ in range(num_domains)]
@@ -472,7 +480,7 @@ class CircuitManager:
         completion folds the slower packet-plane service into the stall
         so the ASTRA-Sim wire (which runs at optical rate) lands at the
         equivalent instant."""
-        serve_e_ns = int(nbytes / self.electrical_bw)
+        serve_e_ns = int(nbytes / self.electrical_bw_eff)
         e_start = max(now_ns, self.elec_free[src])
         e_completion = e_start + serve_e_ns
 
@@ -725,7 +733,7 @@ class SlottedCircuitManager:
 def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
                          rotor_slot_ns=None, resv_guard_ns=None,
                          slot_ns=None, slots_per_epoch=200, cord_slack_ns=None,
-                         electrical_bw=None, transceivers=1):
+                         electrical_bw=None, transceivers=1, afd_load=0.0):
     """Factory covering both the continuous-time policies (IDEAL, ROTOR,
     REACTIVE, PQPS) and the slotted baselines (NEGOTIATOR, BFF, QPSFIT)."""
     if policy in SLOTTED_POLICIES:
@@ -741,7 +749,7 @@ def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
     return CircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
                           policy=policy, rotor_slot_ns=rotor_slot_ns,
                           resv_guard_ns=resv_guard_ns, cord_slack_ns=cord_slack_ns,
-                          electrical_bw=electrical_bw)
+                          electrical_bw=electrical_bw, afd_load=afd_load)
 
 
 class MultiPlaneManager:

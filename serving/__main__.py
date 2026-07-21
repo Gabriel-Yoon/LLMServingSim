@@ -303,6 +303,10 @@ def main():
     parser.add_argument('--electrical-bw-gbps', type=float, default=25.0,
                         help='STEER: electrical (packet) plane per-flow bandwidth in GB/s '
                         '(default 25 = 200Gb/s NIC-class)')
+    parser.add_argument('--afd-electrical-load', type=float, default=0.0,
+                        help='STEER: background utilization (0-1) of the electrical plane '
+                        'by attention-FFN-disaggregation (A2F/F2A) traffic; STEER electrical '
+                        'transfers see effective bandwidth C_e*(1-load) (default 0 = no AFD)')
     parser.add_argument('--decode-affinity', type=float, default=0.0,
                         help='circuit-affinity routing weight gamma: decode candidates '
                         'requiring an optical retarget score gamma worse than the '
@@ -520,7 +524,8 @@ def main():
             slots_per_epoch=args.circuit_slots_per_epoch,
             cord_slack_ns=args.cord_slack_ns,
             electrical_bw=args.electrical_bw_gbps,
-            transceivers=args.optical_transceivers)
+            transceivers=args.optical_transceivers,
+            afd_load=args.afd_electrical_load)
         prefill_estimator = PrefillEstimator()
         inst_domain = {i: inst2npu_mapping[i] // domain_size for i in range(num_instances)}
         kv_bpt = full_cluster_kv_bytes_per_token(
