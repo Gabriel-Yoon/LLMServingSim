@@ -337,37 +337,43 @@ class CircuitManager:
         return self._reactive_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
 
     def _electrical_peek(self, src, nbytes, now_ns):
-        """Predicted packet-plane completion without committing resources:
-        max of per-source NIC egress and the shared spine bisection (if
-        modeled). Used by STEER's plane comparison."""
-        nic_completion = max(now_ns, self.elec_free[src]) \
-            + int(nbytes / self.electrical_bw_eff)
+        """Predicted packet-plane COMPLETION (start + serve) without
+        committing, for STEER's load-aware plane comparison. Completion
+        accounts for both queuing and the (slower) serve rate so a
+        congested/slow plane is penalized in the choice."""
+        serve_nic = int(nbytes / self.electrical_bw_eff)
+        nic_start = max(now_ns, self.elec_free[src])
         if self.electrical_spine_bw is None:
-            return nic_completion
-        spine_completion = max(now_ns, self.elec_spine_free) \
-            + int(nbytes / self.electrical_spine_bw)
-        return max(nic_completion, spine_completion)
+            return nic_start + serve_nic
+        serve_spine = int(nbytes / self.electrical_spine_bw)
+        start = max(nic_start, max(now_ns, self.elec_spine_free))
+        return start + max(serve_nic, serve_spine)
 
     def _electrical_commit(self, src, nbytes, now_ns):
-        """Commit a packet-plane transfer on the NIC egress and shared spine;
-        return its completion time."""
-        nic_completion = max(now_ns, self.elec_free[src]) \
-            + int(nbytes / self.electrical_bw_eff)
-        self.elec_free[src] = nic_completion
+        """Commit a packet-plane transfer and return its START time. The
+        transfer starts after queuing on the NIC egress and shared spine;
+        its serve then STREAMS behind prefill compute (hidden, exactly as
+        the optical serve is hidden in _reactive/_cord_transfer -- both
+        planes stream layer-wise above the ~10 GB/s hiding threshold,
+        expD). Serve occupies the resources for subsequent transfers only;
+        the critical-path stall is the queuing (start - now), not the serve."""
+        serve_nic = int(nbytes / self.electrical_bw_eff)
+        nic_start = max(now_ns, self.elec_free[src])
         if self.electrical_spine_bw is None:
-            return nic_completion
-        spine_completion = max(now_ns, self.elec_spine_free) \
-            + int(nbytes / self.electrical_spine_bw)
-        self.elec_spine_free = spine_completion
-        return max(nic_completion, spine_completion)
+            self.elec_free[src] = nic_start + serve_nic
+            return nic_start
+        serve_spine = int(nbytes / self.electrical_spine_bw)
+        start = max(nic_start, max(now_ns, self.elec_spine_free))
+        self.elec_free[src] = start + serve_nic
+        self.elec_spine_free = start + serve_spine
+        return start
 
     def _electrical_transfer(self, src, dst, nbytes, now_ns, req_id):
         """All-electrical status quo: no optical circuit, no reconfiguration
         delay -- the transfer rides the packet plane (per-source NIC + shared
-        spine). The slower service folds into the returned stall
-        (completion-time equivalence), as STEER's electrical branch does."""
-        e_completion = self._electrical_commit(src, nbytes, now_ns)
-        start = e_completion - int(nbytes / self.bw)  # completion-equivalent
+        spine). Stall is the queuing before it can start; its serve streams
+        behind compute (hidden, like the optical serve)."""
+        start = self._electrical_commit(src, nbytes, now_ns)
         self._log(req_id, src, dst, nbytes, now_ns, start, 0, hit=None, plane="E")
         return int(start - now_ns)
 
@@ -543,12 +549,13 @@ class CircuitManager:
         o_completion = o_start + serve_ns
 
         if e_completion < o_completion:
-            # take the electrical plane; release optical bookkeeping
+            # take the electrical plane; release optical bookkeeping.
+            # decision uses completion (load-aware), but the stall is the
+            # queuing before start -- serve streams behind compute (hidden).
             self.cancel(req_id)
             pend = self._pair_pending.get((src, dst), [])
             self._pair_pending[(src, dst)] = [p for p in pend if p[0] != req_id]
-            e_completion = self._electrical_commit(src, nbytes, now_ns)
-            start = e_completion - serve_ns  # completion-equivalent stall
+            start = self._electrical_commit(src, nbytes, now_ns)
             self._log(req_id, src, dst, nbytes, now_ns, start, 0,
                       hit=None, plane="E")
             return int(start - now_ns)
