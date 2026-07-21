@@ -54,6 +54,12 @@ STEER_NA = "STEER_NA"  # ablation: STEER without announcements — ignores
                        # no pair bookings); steers per transfer from
                        # observed state only, optical path is REACTIVE.
                        # Isolates the value of prediction inside STEER.
+ELECTRICAL = "ELECTRICAL"  # all-electrical status quo: models a deployed
+                           # packet-switched fabric (InfiniBand/NVLink/RoCE)
+                           # with NO optical plane and NO reconfiguration
+                           # delay -- every KV transfer rides the electrical
+                           # plane at C_e with per-source serialization.
+                           # The baseline optical must beat to justify itself.
 # Slotted/epoch-based baselines (QPS-Fit's own benchmark set; see
 # docs/evaluation-baselines.md and refs/papers/QPS-Fit.pdf):
 NEGOTIATOR = "NEGOTIATOR"   # NegotiaToR (SIGCOMM'24): per-slot binary
@@ -63,7 +69,7 @@ BFF = "BFF"                 # Best-First-Fit (CLOUD'18): centralized epoch
 QPSFIT = "QPSFIT"           # QPS-Fit (CLOUD'25): epoch batch, QPS-sampled
                             # request + First-Fit / Largest-Fit grant
 
-POLICIES = (IDEAL, ROTOR, REACTIVE, PQPS, CORD, STEER, STEER_NA)
+POLICIES = (IDEAL, ROTOR, REACTIVE, PQPS, CORD, STEER, STEER_NA, ELECTRICAL)
 SLOTTED_POLICIES = (NEGOTIATOR, BFF, QPSFIT)
 ALL_POLICIES = POLICIES + SLOTTED_POLICIES
 
@@ -312,9 +318,25 @@ class CircuitManager:
             return self._cord_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
         if self.policy in (STEER, STEER_NA):
             return self._steer_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
+        if self.policy == ELECTRICAL:
+            return self._electrical_transfer(src, dst, nbytes, now_ns, req_id)
 
         # REACTIVE (and PQPS without a reservation)
         return self._reactive_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
+
+    def _electrical_transfer(self, src, dst, nbytes, now_ns, req_id):
+        """All-electrical status quo: no optical circuit, no reconfiguration
+        delay -- the transfer rides the electrical plane at C_e*(1-afd_load)
+        with per-source egress serialization. The slower packet-plane
+        service folds into the returned stall (completion-time equivalence),
+        exactly as STEER's electrical branch does."""
+        serve_e_ns = int(nbytes / self.electrical_bw_eff)
+        e_start = max(now_ns, self.elec_free[src])
+        e_completion = e_start + serve_e_ns
+        self.elec_free[src] = e_completion
+        start = e_completion - int(nbytes / self.bw)  # completion-equivalent
+        self._log(req_id, src, dst, nbytes, now_ns, start, 0, hit=None, plane="E")
+        return int(start - now_ns)
 
     def _reactive_transfer(self, src, dst, nbytes, serve_ns, now_ns, req_id):
         """Cold-path transfer: reuse a standing circuit or pay a fresh
