@@ -181,7 +181,8 @@ class CircuitManager:
 
     def __init__(self, num_domains, bw_bytes_per_ns, reconfig_ns,
                  policy=REACTIVE, rotor_slot_ns=None, resv_guard_ns=None,
-                 cord_slack_ns=None, electrical_bw=None, afd_load=0.0):
+                 cord_slack_ns=None, electrical_bw=None, afd_load=0.0,
+                 electrical_spine_bw=None):
         if policy not in POLICIES:
             raise ValueError(f"Unknown circuit policy '{policy}' (choose from {POLICIES})")
         self.n = num_domains
@@ -213,6 +214,17 @@ class CircuitManager:
         self.afd_load = min(max(float(afd_load), 0.0), 0.95)
         self.electrical_bw_eff = self.electrical_bw * (1.0 - self.afd_load)
         self.elec_free = [0] * num_domains
+        # Hyperscale spine bisection: a real electrical fat-tree routes all
+        # cross-domain packet traffic through a shared (oversubscribed) spine
+        # of aggregate bandwidth C_spine GB/s. Modeled as one shared FIFO
+        # resource every packet transfer serializes through, on top of the
+        # per-source NIC egress. Disabled (None) = full-bisection / NIC-bound.
+        # The OCS optical plane bypasses this (dedicated lightpaths), which is
+        # exactly why optical scales -- so it applies ONLY to the packet plane
+        # (ELECTRICAL policy and STEER's steered-electrical transfers).
+        self.electrical_spine_bw = (float(electrical_spine_bw)
+                                    if electrical_spine_bw else None)
+        self.elec_spine_free = 0
 
         self.out_cal = [_Calendar() for _ in range(num_domains)]
         self.in_cal = [_Calendar() for _ in range(num_domains)]
@@ -324,16 +336,37 @@ class CircuitManager:
         # REACTIVE (and PQPS without a reservation)
         return self._reactive_transfer(src, dst, nbytes, serve_ns, now_ns, req_id)
 
+    def _electrical_peek(self, src, nbytes, now_ns):
+        """Predicted packet-plane completion without committing resources:
+        max of per-source NIC egress and the shared spine bisection (if
+        modeled). Used by STEER's plane comparison."""
+        nic_completion = max(now_ns, self.elec_free[src]) \
+            + int(nbytes / self.electrical_bw_eff)
+        if self.electrical_spine_bw is None:
+            return nic_completion
+        spine_completion = max(now_ns, self.elec_spine_free) \
+            + int(nbytes / self.electrical_spine_bw)
+        return max(nic_completion, spine_completion)
+
+    def _electrical_commit(self, src, nbytes, now_ns):
+        """Commit a packet-plane transfer on the NIC egress and shared spine;
+        return its completion time."""
+        nic_completion = max(now_ns, self.elec_free[src]) \
+            + int(nbytes / self.electrical_bw_eff)
+        self.elec_free[src] = nic_completion
+        if self.electrical_spine_bw is None:
+            return nic_completion
+        spine_completion = max(now_ns, self.elec_spine_free) \
+            + int(nbytes / self.electrical_spine_bw)
+        self.elec_spine_free = spine_completion
+        return max(nic_completion, spine_completion)
+
     def _electrical_transfer(self, src, dst, nbytes, now_ns, req_id):
         """All-electrical status quo: no optical circuit, no reconfiguration
-        delay -- the transfer rides the electrical plane at C_e*(1-afd_load)
-        with per-source egress serialization. The slower packet-plane
-        service folds into the returned stall (completion-time equivalence),
-        exactly as STEER's electrical branch does."""
-        serve_e_ns = int(nbytes / self.electrical_bw_eff)
-        e_start = max(now_ns, self.elec_free[src])
-        e_completion = e_start + serve_e_ns
-        self.elec_free[src] = e_completion
+        delay -- the transfer rides the packet plane (per-source NIC + shared
+        spine). The slower service folds into the returned stall
+        (completion-time equivalence), as STEER's electrical branch does."""
+        e_completion = self._electrical_commit(src, nbytes, now_ns)
         start = e_completion - int(nbytes / self.bw)  # completion-equivalent
         self._log(req_id, src, dst, nbytes, now_ns, start, 0, hit=None, plane="E")
         return int(start - now_ns)
@@ -502,9 +535,8 @@ class CircuitManager:
         completion folds the slower packet-plane service into the stall
         so the ASTRA-Sim wire (which runs at optical rate) lands at the
         equivalent instant."""
-        serve_e_ns = int(nbytes / self.electrical_bw_eff)
-        e_start = max(now_ns, self.elec_free[src])
-        e_completion = e_start + serve_e_ns
+        # predicted packet-plane completion (NIC + shared spine), no commit
+        e_completion = self._electrical_peek(src, nbytes, now_ns)
 
         # conservative optical estimate (no commitment yet)
         o_start = self.estimate_optical_start(src, dst, serve_ns, now_ns)
@@ -515,7 +547,7 @@ class CircuitManager:
             self.cancel(req_id)
             pend = self._pair_pending.get((src, dst), [])
             self._pair_pending[(src, dst)] = [p for p in pend if p[0] != req_id]
-            self.elec_free[src] = e_completion
+            e_completion = self._electrical_commit(src, nbytes, now_ns)
             start = e_completion - serve_ns  # completion-equivalent stall
             self._log(req_id, src, dst, nbytes, now_ns, start, 0,
                       hit=None, plane="E")
@@ -755,7 +787,8 @@ class SlottedCircuitManager:
 def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
                          rotor_slot_ns=None, resv_guard_ns=None,
                          slot_ns=None, slots_per_epoch=200, cord_slack_ns=None,
-                         electrical_bw=None, transceivers=1, afd_load=0.0):
+                         electrical_bw=None, transceivers=1, afd_load=0.0,
+                         electrical_spine_bw=None):
     """Factory covering both the continuous-time policies (IDEAL, ROTOR,
     REACTIVE, PQPS) and the slotted baselines (NEGOTIATOR, BFF, QPSFIT)."""
     if policy in SLOTTED_POLICIES:
@@ -771,7 +804,8 @@ def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
     return CircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
                           policy=policy, rotor_slot_ns=rotor_slot_ns,
                           resv_guard_ns=resv_guard_ns, cord_slack_ns=cord_slack_ns,
-                          electrical_bw=electrical_bw, afd_load=afd_load)
+                          electrical_bw=electrical_bw, afd_load=afd_load,
+                          electrical_spine_bw=electrical_spine_bw)
 
 
 class MultiPlaneManager:

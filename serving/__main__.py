@@ -307,6 +307,11 @@ def main():
                         help='STEER: background utilization (0-1) of the electrical plane '
                         'by attention-FFN-disaggregation (A2F/F2A) traffic; STEER electrical '
                         'transfers see effective bandwidth C_e*(1-load) (default 0 = no AFD)')
+    parser.add_argument('--electrical-spine-gbps', type=float, default=None,
+                        help='hyperscale spine bisection: aggregate GB/s of the shared '
+                        'electrical fat-tree spine that all packet-plane KV transfers '
+                        'serialize through (on top of per-source NIC). OCS optical circuits '
+                        'bypass it. Default: None = full-bisection / NIC-bound.')
     parser.add_argument('--decode-affinity', type=float, default=0.0,
                         help='circuit-affinity routing weight gamma: decode candidates '
                         'requiring an optical retarget score gamma worse than the '
@@ -525,7 +530,8 @@ def main():
             cord_slack_ns=args.cord_slack_ns,
             electrical_bw=args.electrical_bw_gbps,
             transceivers=args.optical_transceivers,
-            afd_load=args.afd_electrical_load)
+            afd_load=args.afd_electrical_load,
+            electrical_spine_bw=args.electrical_spine_gbps)
         prefill_estimator = PrefillEstimator()
         inst_domain = {i: inst2npu_mapping[i] // domain_size for i in range(num_instances)}
         kv_bpt = full_cluster_kv_bytes_per_token(
