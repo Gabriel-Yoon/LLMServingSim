@@ -898,12 +898,15 @@ class MultiPlaneManager:
         if self.policy == STEER:
             serve_e_ns = int(nbytes / self.electrical_bw)
             e_start = max(now_ns, self.elec_free[src])
-            e_completion = e_start + serve_e_ns
+            e_completion = e_start + serve_e_ns  # for the load-aware decision
             o_start = self.planes[h].estimate_optical_start(src, dst, serve_ns, now_ns)
             if e_completion < o_start + serve_ns:
                 self.planes[h].cancel(req_id)
-                self.elec_free[src] = e_completion
-                start = e_completion - serve_ns
+                # start-based stall: serve streams behind compute (hidden),
+                # occupies the NIC for subsequent transfers only (mirrors the
+                # single-plane fix; the completion drove the choice, not the stall)
+                start = e_start
+                self.elec_free[src] = e_start + serve_e_ns
                 self.stats.append({"req_id": req_id, "policy": self.policy,
                                    "src": src, "dst": dst, "bytes": nbytes,
                                    "ready_ns": now_ns, "start_ns": start,
