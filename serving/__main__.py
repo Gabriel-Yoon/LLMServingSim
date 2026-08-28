@@ -288,6 +288,9 @@ def main():
                         help='OCS reconfiguration delay in ns (default 1 ms)')
     parser.add_argument('--circuit-resv-guard-ns', type=int, default=None,
                         help='PQPS reservation guard before estimated ready time (default: reconfig delay)')
+    parser.add_argument('--adaptive-guard', action='store_true',
+                        help='learn the reservation guard band online (newsvendor '
+                        'quantile of the estimator error) instead of a fixed guard')
     parser.add_argument('--rotor-slot-ns', type=int, default=None,
                         help='ROTOR slot length in ns (default max(10x reconfig, 100us))')
     parser.add_argument('--circuit-slot-ns', type=int, default=None,
@@ -531,7 +534,8 @@ def main():
             electrical_bw=args.electrical_bw_gbps,
             transceivers=args.optical_transceivers,
             afd_load=args.afd_electrical_load,
-            electrical_spine_bw=args.electrical_spine_gbps)
+            electrical_spine_bw=args.electrical_spine_gbps,
+            adaptive_guard=args.adaptive_guard)
         prefill_estimator = PrefillEstimator()
         inst_domain = {i: inst2npu_mapping[i] // domain_size for i in range(num_instances)}
         kv_bpt = full_cluster_kv_bytes_per_token(

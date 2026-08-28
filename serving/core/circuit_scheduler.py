@@ -182,7 +182,7 @@ class CircuitManager:
     def __init__(self, num_domains, bw_bytes_per_ns, reconfig_ns,
                  policy=REACTIVE, rotor_slot_ns=None, resv_guard_ns=None,
                  cord_slack_ns=None, electrical_bw=None, afd_load=0.0,
-                 electrical_spine_bw=None):
+                 electrical_spine_bw=None, adaptive_guard=False):
         if policy not in POLICIES:
             raise ValueError(f"Unknown circuit policy '{policy}' (choose from {POLICIES})")
         self.n = num_domains
@@ -196,6 +196,17 @@ class CircuitManager:
         # estimated ready time, absorbing estimator error.
         self.resv_guard_ns = int(resv_guard_ns) if resv_guard_ns is not None \
             else self.reconfig_ns
+        # learning-augmented guard: an online newsvendor-quantile estimate of the
+        # estimator error that replaces the fixed resv_guard_ns when enabled.
+        self.adaptive_guard = bool(adaptive_guard)
+        if self.adaptive_guard:
+            from .adaptive_guard import AdaptiveGuard
+            # g_max must be generous: with bias correction the learned lead can
+            # exceed many reconfig delays (a badly biased estimator needs it).
+            self._ag = AdaptiveGuard(g_safe=self.resv_guard_ns,
+                                     g_max=50 * self.resv_guard_ns)
+        else:
+            self._ag = None
         # CORD: per-transfer latency budget available for coalescing holds
         self.cord_slack_ns = int(cord_slack_ns) if cord_slack_ns is not None \
             else 2 * self.reconfig_ns
@@ -231,7 +242,14 @@ class CircuitManager:
         self.out_target = [None] * num_domains  # current circuit pointing
         self.in_source = [None] * num_domains
         self._reservations = {}  # req_id -> _Reservation
+        # admission-time start estimate per req_id, kept for the whole run so
+        # the transfer log can report the estimator error eta = ready - est.
+        self._announced_est = {}
         self.stats = []
+
+    def _guard(self):
+        """Reservation guard band: learned (adaptive) or fixed resv_guard_ns."""
+        return int(self._ag.guard()) if self.adaptive_guard else self.resv_guard_ns
 
     # ---------------- predictive API ----------------
 
@@ -239,6 +257,9 @@ class CircuitManager:
         """Admission-time demand announcement (PQPS only acts on it)."""
         if src == dst or self.policy == STEER_NA:
             return
+        # record the admission-time estimate for every announced transfer so
+        # the estimator error can be characterized (learning-augmented guard).
+        self._announced_est[req_id] = int(est_ready_ns)
         r = _Reservation(req_id, src, dst, int(nbytes), int(est_ready_ns), deadline_ns)
         self._reservations[req_id] = r
         if self.policy == PQPS:
@@ -253,7 +274,7 @@ class CircuitManager:
         active ``resv_guard_ns`` before the estimated ready time."""
         serve_ns = int(r.nbytes / self.bw)
         dur = self.reconfig_ns + serve_ns
-        desired_setup = r.est_ready - self.resv_guard_ns - self.reconfig_ns
+        desired_setup = r.est_ready - self._guard() - self.reconfig_ns
         cals = (self.out_cal[r.src], self.in_cal[r.dst])
         t = _earliest_free(cals, desired_setup, dur)
         _occupy(cals, t, t + dur, r.req_id)
@@ -440,7 +461,7 @@ class CircuitManager:
         est0 = head[1]
         dur = self.reconfig_ns + int(head[2] / self.bw)
         cals = (self.out_cal[src], self.in_cal[dst])
-        t = _earliest_free(cals, est0 - self.resv_guard_ns - self.reconfig_ns, dur)
+        t = _earliest_free(cals, est0 - self._guard() - self.reconfig_ns, dur)
         _occupy(cals, t, t + dur, tag)
 
     def _cord_transfer(self, src, dst, nbytes, serve_ns, now_ns, req_id):
@@ -531,7 +552,7 @@ class CircuitManager:
         serve_ns = int(int(nbytes) / self.bw)
         dur = self.reconfig_ns + serve_ns
         t = _earliest_free((self.out_cal[src], self.in_cal[dst]),
-                           int(est_ready_ns) - self.resv_guard_ns - self.reconfig_ns,
+                           int(est_ready_ns) - self._guard() - self.reconfig_ns,
                            dur)
         return t + self.reconfig_ns
 
@@ -586,11 +607,17 @@ class CircuitManager:
 
     def _log(self, req_id, src, dst, nbytes, ready, start, setup_ns, hit=None,
              plane="O"):
+        est = self._announced_est.get(req_id)
+        if self.adaptive_guard and est is not None:
+            self._ag.update(est, ready)   # online-learn the guard from realized eta
         self.stats.append({
             "req_id": req_id, "policy": self.policy, "src": src, "dst": dst,
             "bytes": nbytes, "ready_ns": ready, "start_ns": start,
             "stall_ns": start - ready, "setup_ns": setup_ns,
             "resv_hit": hit, "plane": plane,
+            # estimator error: actual data-ready minus admission-time estimate.
+            "est_ready_ns": est,
+            "est_err_ns": (ready - est) if est is not None else None,
         })
 
     def dump_stats(self, path):
@@ -795,7 +822,7 @@ def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
                          rotor_slot_ns=None, resv_guard_ns=None,
                          slot_ns=None, slots_per_epoch=200, cord_slack_ns=None,
                          electrical_bw=None, transceivers=1, afd_load=0.0,
-                         electrical_spine_bw=None):
+                         electrical_spine_bw=None, adaptive_guard=False):
     """Factory covering both the continuous-time policies (IDEAL, ROTOR,
     REACTIVE, PQPS) and the slotted baselines (NEGOTIATOR, BFF, QPSFIT)."""
     if policy in SLOTTED_POLICIES:
@@ -807,12 +834,14 @@ def make_circuit_manager(policy, num_domains, bw_bytes_per_ns, reconfig_ns,
                                  bw_bytes_per_ns, reconfig_ns,
                                  resv_guard_ns=resv_guard_ns,
                                  cord_slack_ns=cord_slack_ns,
-                                 electrical_bw=electrical_bw)
+                                 electrical_bw=electrical_bw,
+                                 adaptive_guard=adaptive_guard)
     return CircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
                           policy=policy, rotor_slot_ns=rotor_slot_ns,
                           resv_guard_ns=resv_guard_ns, cord_slack_ns=cord_slack_ns,
                           electrical_bw=electrical_bw, afd_load=afd_load,
-                          electrical_spine_bw=electrical_spine_bw)
+                          electrical_spine_bw=electrical_spine_bw,
+                          adaptive_guard=adaptive_guard)
 
 
 class MultiPlaneManager:
@@ -832,7 +861,8 @@ class MultiPlaneManager:
     """
 
     def __init__(self, policy, k, num_domains, bw_bytes_per_ns, reconfig_ns,
-                 resv_guard_ns=None, cord_slack_ns=None, electrical_bw=None):
+                 resv_guard_ns=None, cord_slack_ns=None, electrical_bw=None,
+                 adaptive_guard=False):
         if policy not in (CORD, STEER, REACTIVE):
             raise ValueError(f"MultiPlaneManager supports CORD/STEER/REACTIVE, got {policy}")
         self.policy = policy
@@ -844,7 +874,8 @@ class MultiPlaneManager:
         self.planes = [
             CircuitManager(num_domains, bw_bytes_per_ns, reconfig_ns,
                            policy=inner_policy, resv_guard_ns=resv_guard_ns,
-                           cord_slack_ns=cord_slack_ns)
+                           cord_slack_ns=cord_slack_ns,
+                           adaptive_guard=adaptive_guard)
             for _ in range(self.k)
         ]
         self._req_plane = {}
