@@ -435,7 +435,16 @@ class MemoryModel():
             
             old_node = req.npu_last_node
             # print(f"[CACHE_UNFINISHED] req={req.id} old_node_id={old_node.id if old_node else None}(lock_ref={old_node.lock_ref if old_node else 'N/A'}) -> new_node_id={new_last_node.id}(lock_ref={new_last_node.lock_ref})")
-            self.npu_prefix_cache.dec_lock_ref(req.npu_last_node)
+            # NOTE (2026-09-02): guard added -- req.npu_last_node is None for a
+            # request's first-ever cache insertion (no prior prefix match), the
+            # same case the sibling lock()/unlock() methods above already guard
+            # with "if ... req.npu_last_node is not None". This call was missing
+            # that guard, so dec_lock_ref(None) crashed with AttributeError.
+            # Surfaced 2026-09-02 testing MOE_ALLTOALL=1 on a PD-disaggregated
+            # config; not obviously PD-specific (first-cache-insertion can happen
+            # on any config), just not previously exercised.
+            if req.npu_last_node is not None:
+                self.npu_prefix_cache.dec_lock_ref(req.npu_last_node)
             self.npu_prefix_cache.inc_lock_ref(new_last_node)
             # print(f"[CACHE_UNFINISHED] req={req.id} AFTER: old_node_id={old_node.id}(lock_ref={old_node.lock_ref}) new_node_id={new_last_node.id}(lock_ref={new_last_node.lock_ref})")
             req.npu_last_node = new_last_node

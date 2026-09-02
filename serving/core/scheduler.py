@@ -670,12 +670,18 @@ class Scheduler:
             # add to done system
             batch.end.append(sys)
             # check all npus are done
-            if self.pd_type != "prefill":
-                if self.start_npu not in batch.end or (self.start_npu + self.num_npus - 1) not in batch.end:
-                    return prompt_t, gen_t, end_reqs
-            else:
-                if self.start_npu not in batch.end or (self.start_npu + self.num_npus * 2 - 1) not in batch.end:
-                    return prompt_t, gen_t, end_reqs
+            # NOTE (2026-09-02): the pd_type=="prefill" branch used to check
+            # num_npus * 2, matching config_builder.py's old "sender NPU"
+            # padding (effective_npus = num_npus * 2). That padding was removed
+            # 2026-09-01 (grep-verified dead weight -- nothing read the padded
+            # IDs), but this check was missed, so it kept waiting for an NPU ID
+            # that no longer belongs to this instance at all -- batch.end could
+            # never satisfy the condition, so a prefill instance's batch never
+            # completed. Permanent deadlock, empirically confirmed (minitest_ep2_pd
+            # froze indefinitely with the real batch stuck "running" forever).
+            # Fix: same check as the non-prefill branch -- num_npus, not num_npus*2.
+            if self.start_npu not in batch.end or (self.start_npu + self.num_npus - 1) not in batch.end:
+                return prompt_t, gen_t, end_reqs
         self.logger.info(
             "Batch #%d is done",
             batch.batch_id,

@@ -160,6 +160,38 @@ def _resolve_dp_groups(all_instances, topology_config=None):
             else:
                 tp_dim = [True, False, False]   # TP ALLREDUCE on dim 0 only
                 ep_dim = [True, True, True]     # EP ALLTOALL across all levels; trimmed later
+        elif len(dp_groups) > 1:
+            # NOTE (2026-09-02): multiple simultaneous dp_groups (e.g. a
+            # prefill pool + a decode pool, each its own EP-scaled dp_group
+            # in PD-disaggregated serving). A flat 2D [tp, dp_size] topology
+            # (the single-dp_group case below) is WRONG here: involved_dim is
+            # a per-DIMENSION flag, not per-NPU-ID, so if both pools share
+            # one physical dimension, ASTRA-Sim treats every NPU along that
+            # dimension as participating in EVERY collective marked with it
+            # -- pool P's AllToAll then waits forever for pool D's NPUs
+            # (which never join P's collective), permanent deadlock.
+            # Empirically confirmed 2026-09-02 (minitest_ep2_pd hung
+            # indefinitely; minitest_ep2_single, one dp_group, completed in
+            # 48s). Fix: give each group its OWN dimension (dim 2 = which
+            # group), and EXCLUDE that dimension from ep_dim so ASTRA scopes
+            # the collective to just the members that share both dp_size
+            # AND group coordinates -- i.e. just the one pool.
+            # 2026-09-02 EXPERIMENT: swapped dim order (group dim in the middle,
+            # not last) to test whether ASTRA-Sim's C++ collective execution
+            # has an untested-edge-case bug specifically with an active dim
+            # followed by an excluded dim of width>1 (the previous [tp,dp,grp]
+            # order hung indefinitely even after 3 independently-verified-
+            # correct Python-side fixes; empirical trace capture showed the
+            # excluded instances correctly idle while the active dim's
+            # instances never even get revisited by ASTRA -- pointing at the
+            # C++ execution layer, not config). This tries [tp,grp,dp] with
+            # grp excluded in the middle instead, to see if that's the
+            # working shape.
+            tp_dim = [True, False, False]
+            if ep_total <= tp0:
+                ep_dim = [True, False, False]
+            else:
+                ep_dim = [True, False, True] if tp0 > 1 else [False, False, True]
         else:
             tp_dim = [True, False]
             if ep_total <= tp0:
@@ -506,10 +538,22 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             instance_id = instance.get("instance_id")
             inst2npu_mapping[instance_id] = current_npu_start
             start_npu_ids += str(current_npu_start) + ","       # npus to check start condition
-            # Add sender NPUs in prefill instance
+            # NOTE (2026-09-01): previously doubled effective_npus for prefill
+            # instances ("sender NPU" slot) to reserve NPU-ID address space for
+            # an eventual network-level KV-transfer simulation. That padding is
+            # dead weight: nothing on the Python side or the ASTRA-Sim C++ side
+            # ever reads the padded IDs (grep-verified) -- the actual KV-cache
+            # transfer cost is modeled analytically in router.py's
+            # transfer_prefill_request() (transfer_ns = kv_bytes/bw + latency),
+            # added independently on 2026-06-14, which never used this ID space
+            # either. The padding only caused network.yml's npus_count to
+            # under-count real NPU IDs once dp_group-scaled EP pools were
+            # combined with pd_type (multi-dp_group PD disaggregation), crashing
+            # ASTRA-Sim on startup (BrokenPipeError, ID out of declared range).
+            # Removed; instance_id bookkeeping in prefill_instance/decode_instance
+            # (consumed only by __main__.py's completion tracking) is unaffected.
             effective_npus = num_npus
             if pd_type == "prefill":
-                effective_npus = num_npus * 2
                 prefill_instance.append(instance_id)
             elif pd_type == "decode":
                 decode_instance.append(instance_id)
@@ -958,6 +1002,36 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
             if elec_bandwidths is not None:
                 elec_bandwidths = [elec_bandwidths[0]] + list(elec_bandwidths)
                 elec_latencies = [elec_latencies[0]] + list(elec_latencies)
+    elif dp_groups and len(dp_groups) > 1:
+        # NOTE (2026-09-02): superseded the 2026-09-01 flat-merge fix (summing
+        # every dp_group into one shared dimension) after confirming
+        # empirically that it deadlocks -- involved_dim is a per-DIMENSION
+        # flag, so a shared dimension makes ASTRA-Sim wait for every NPU along
+        # it in every collective marked with that dimension, not just the
+        # NPUs that share the group's own instance IDs. Each dp_group (pool)
+        # now gets its own dedicated dimension (dim 2); _resolve_dp_groups
+        # excludes dim 2 from ep_dim so each pool's AllToAll is correctly
+        # scoped to just its own dp_size members.
+        group_sizes = [len(g) for g in dp_groups.values()]
+        assert all(s == group_sizes[0] for s in group_sizes), (
+            "_create_network_config: mixed dp_group sizes across pools not yet supported"
+        )
+        first_group = next(iter(dp_groups.values()))
+        tp_size = first_group[0]["tp_size"]
+        assert all(g[0]["tp_size"] == tp_size for g in dp_groups.values()), (
+            "_create_network_config: mixed tp_size across dp_groups is not supported"
+        )
+        dp_size = group_sizes[0]
+        num_groups = len(dp_groups)
+        # 2026-09-02 EXPERIMENT: [tp, group, dp] instead of [tp, dp, group] --
+        # see matching NOTE in _resolve_dp_groups.
+        dims = [tp_size, num_groups, dp_size]
+        bandwidths = [float(link_bw)] * 3
+        latencies  = [float(link_latency)] * 3
+        topology_names = None
+        fb_rows_list = None
+        while len(dims) > 1 and dims[-1] == 1:
+            dims.pop(); bandwidths.pop(); latencies.pop()
     elif dp_groups:
         first_group = next(iter(dp_groups.values()))
         tp_size = first_group[0]["tp_size"]
